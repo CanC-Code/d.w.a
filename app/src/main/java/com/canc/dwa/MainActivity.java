@@ -8,6 +8,7 @@ import android.graphics.Canvas;
 import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Bundle;
+import android.view.Choreographer;
 import android.view.MotionEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -22,7 +23,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 
-public class MainActivity extends AppCompatActivity implements SurfaceHolder.Callback {
+public class MainActivity extends AppCompatActivity implements SurfaceHolder.Callback, Choreographer.FrameCallback {
 
     static {
         System.loadLibrary("dwa");
@@ -45,7 +46,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     private SurfaceView gameSurface;
     private Bitmap screenBitmap;
     private boolean isEngineRunning = false;
-    private Thread graphicsThread;
+    private final Rect destRect = new Rect();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -55,8 +56,8 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         setupContainer = findViewById(R.id.setup_layout);
         gameContainer = findViewById(R.id.game_layout);
         gameSurface = findViewById(R.id.game_surface);
-        
-        // Initialize the 256x240 buffer for the Native PPU
+
+        // 256x240 is the native NES resolution
         screenBitmap = Bitmap.createBitmap(256, 240, Bitmap.Config.ARGB_8888);
         gameSurface.getHolder().addCallback(this);
 
@@ -68,7 +69,101 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         }
     }
 
-    // --- SAF Picker & Extraction Logic ---
+    // --- High-Performance Rendering Loop (V-Sync) ---
+
+    @Override
+    public void doFrame(long frameTimeNanos) {
+        if (!isEngineRunning) return;
+
+        SurfaceHolder holder = gameSurface.getHolder();
+        // 1. Update the Bitmap from C++ Screen Buffer via JNI
+        nativeUpdateSurface(screenBitmap);
+
+        // 2. Lock and Draw
+        Canvas canvas = holder.lockCanvas();
+        if (canvas != null) {
+            int viewWidth = gameSurface.getWidth();
+            int viewHeight = gameSurface.getHeight();
+            float scale = Math.min((float)viewWidth / 256, (float)viewHeight / 240);
+            int w = (int)(256 * scale);
+            int h = (int)(240 * scale);
+            destRect.set((viewWidth-w)/2, (viewHeight-h)/2, (viewWidth+w)/2, (viewHeight+h)/2);
+
+            canvas.drawColor(0xFF000000); // Letterboxing
+            canvas.drawBitmap(screenBitmap, null, destRect, null);
+            holder.unlockCanvasAndPost(canvas);
+        }
+
+        // Request next frame synced to V-Sync
+        Choreographer.getInstance().postFrameCallback(this);
+    }
+
+    // --- Engine Control ---
+
+    private void startNativeEngine() {
+        setupContainer.setVisibility(View.GONE);
+        gameContainer.setVisibility(View.VISIBLE);
+
+        applyImmersiveMode();
+        setupTouchControls();
+
+        // Pass the internal path to C++ for Mapper/Save initialization
+        nativeInitEngine(getFilesDir().getAbsolutePath());
+        isEngineRunning = true;
+        
+        // Begin the rendering loop
+        Choreographer.getInstance().postFrameCallback(this);
+    }
+
+    // --- SurfaceView Lifecycle ---
+
+    @Override
+    public void surfaceCreated(@NonNull SurfaceHolder holder) {
+        // Handled by Choreographer
+    }
+
+    @Override public void surfaceChanged(@NonNull SurfaceHolder h, int f, int w, int h1) {}
+    @Override public void surfaceDestroyed(@NonNull SurfaceHolder h) { 
+        isEngineRunning = false; 
+        Choreographer.getInstance().removeFrameCallback(this);
+    }
+
+    // --- Optimized Touch Handling ---
+
+    @SuppressLint("ClickableViewAccessibility")
+    private void setupTouchControls() {
+        bindButton(R.id.btn_up, BUTTON_UP);
+        bindButton(R.id.btn_down, BUTTON_DOWN);
+        bindButton(R.id.btn_left, BUTTON_LEFT);
+        bindButton(R.id.btn_right, BUTTON_RIGHT);
+        bindButton(R.id.btn_a, BUTTON_A);
+        bindButton(R.id.btn_b, BUTTON_B);
+        // Bind Start/Select if they exist in your layout
+        bindButton(R.id.btn_start, BUTTON_START);
+        bindButton(R.id.btn_select, BUTTON_SELECT);
+    }
+
+    private void bindButton(int viewId, int bitmask) {
+        View btn = findViewById(viewId);
+        if (btn == null) return;
+        
+        btn.setOnTouchListener((v, event) -> {
+            switch (event.getAction()) {
+                case MotionEvent.ACTION_DOWN:
+                    injectInput(bitmask, true);
+                    v.setPressed(true);
+                    break;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    injectInput(bitmask, false);
+                    v.setPressed(false);
+                    break;
+            }
+            return true;
+        });
+    }
+
+    // --- SAF ROM Picker & Extraction ---
 
     private void openFilePicker() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -92,15 +187,16 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             File internalRom = new File(getFilesDir(), "base.nes");
             FileOutputStream os = new FileOutputStream(internalRom);
 
-            byte[] buffer = new byte[1024];
+            byte[] buffer = new byte[8192]; // Larger buffer for speed
             int length;
             while ((length = is.read(buffer)) > 0) os.write(buffer, 0, length);
             os.close(); is.close();
 
+            // Native C++ logic extracts the banks into individual files
             String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
             if (result.startsWith("Success")) startNativeEngine();
             else Toast.makeText(this, result, Toast.LENGTH_LONG).show();
-            
+
         } catch (Exception e) {
             Toast.makeText(this, "IO Error: " + e.getMessage(), Toast.LENGTH_SHORT).show();
         }
@@ -108,20 +204,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     private boolean isRomExtracted() {
         return new File(getFilesDir(), "prg_bank_0.bin").exists();
-    }
-
-    // --- Native Engine Control ---
-
-    private void startNativeEngine() {
-        setupContainer.setVisibility(View.GONE);
-        gameContainer.setVisibility(View.VISIBLE);
-
-        applyImmersiveMode();
-        setupTouchControls();
-
-        // Start C++ Master Clock
-        nativeInitEngine(getFilesDir().getAbsolutePath());
-        isEngineRunning = true;
     }
 
     private void applyImmersiveMode() {
@@ -134,70 +216,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         }
     }
 
-    // --- SurfaceView Callback (Rendering) ---
-
-    @Override
-    public void surfaceCreated(@NonNull SurfaceHolder holder) {
-        graphicsThread = new Thread(() -> {
-            Rect destRect = new Rect();
-            while (isEngineRunning) {
-                // 1. Update the Bitmap from C++ Screen Buffer
-                nativeUpdateSurface(screenBitmap);
-
-                // 2. Draw to Surface
-                Canvas canvas = holder.lockCanvas();
-                if (canvas != null) {
-                    // Maintain aspect ratio: Scale 256x240 to fit screen
-                    int viewWidth = gameSurface.getWidth();
-                    int viewHeight = gameSurface.getHeight();
-                    float scale = Math.min((float)viewWidth / 256, (float)viewHeight / 240);
-                    int w = (int)(256 * scale);
-                    int h = (int)(240 * scale);
-                    destRect.set((viewWidth-w)/2, (viewHeight-h)/2, (viewWidth+w)/2, (viewHeight+h)/2);
-                    
-                    canvas.drawColor(0xFF000000); // Black Bars
-                    canvas.drawBitmap(screenBitmap, null, destRect, null);
-                    holder.unlockCanvasAndPost(canvas);
-                }
-                
-                try { Thread.sleep(16); } catch (InterruptedException ignored) {}
-            }
-        });
-        graphicsThread.start();
-    }
-
-    @Override public void surfaceChanged(@NonNull SurfaceHolder h, int f, int w, int h1) {}
-    @Override public void surfaceDestroyed(@NonNull SurfaceHolder h) { isEngineRunning = false; }
-
-    // --- Input & JNI ---
-
-    @SuppressLint("ClickableViewAccessibility")
-    private void setupTouchControls() {
-        bindButton(R.id.btn_up, BUTTON_UP);
-        bindButton(R.id.btn_down, BUTTON_DOWN);
-        bindButton(R.id.btn_left, BUTTON_LEFT);
-        bindButton(R.id.btn_right, BUTTON_RIGHT);
-        bindButton(R.id.btn_a, BUTTON_A);
-        bindButton(R.id.btn_b, BUTTON_B);
-    }
-
-    @SuppressLint("ClickableViewAccessibility")
-    private void bindButton(int viewId, int bitmask) {
-        View btn = findViewById(viewId);
-        if (btn != null) {
-            btn.setOnTouchListener((v, event) -> {
-                if (event.getAction() == MotionEvent.ACTION_DOWN) {
-                    injectInput(bitmask, true);
-                    v.setPressed(true);
-                } else if (event.getAction() == MotionEvent.ACTION_UP || event.getAction() == MotionEvent.ACTION_CANCEL) {
-                    injectInput(bitmask, false);
-                    v.setPressed(false);
-                }
-                return true;
-            });
-        }
-    }
-
+    // --- JNI Signatures ---
     public native String nativeExtractRom(String romPath, String outDir);
     public native void nativeInitEngine(String filesDir);
     public native void nativeUpdateSurface(Bitmap bitmap);
