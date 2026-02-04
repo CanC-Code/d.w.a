@@ -9,25 +9,21 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:gravity="center"
-        android:orientation="vertical"
-        android:visibility="visible">
+        android:orientation="vertical">
 
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="DWA EMULATOR"
+            android:text="DRAGON WARRIOR NATIVE"
             android:textColor="#FFFFFF"
-            android:textSize="28sp"
-            android:textStyle="bold"
-            android:layout_marginBottom="24dp" />
+            android:textSize="24sp"
+            android:layout_marginBottom="20dp" />
 
         <Button
             android:id="@+id/btn_select_rom"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:padding="16dp"
-            android:text="Select Dragon Warrior ROM (.nes)"
-            android:textColor="#FFFFFF" />
+            android:text="Select ROM" />
     </LinearLayout>
 
     <RelativeLayout
@@ -39,107 +35,37 @@
         <SurfaceView
             android:id="@+id/game_surface"
             android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:layout_centerInParent="true" />
+            android:layout_height="match_parent" />
 
         <RelativeLayout
             android:layout_width="180dp"
             android:layout_height="180dp"
             android:layout_alignParentBottom="true"
-            android:layout_alignParentStart="true"
-            android:layout_margin="16dp">
-
-            <ImageButton
-                android:id="@+id/btn_up"
-                android:layout_width="60dp"
-                android:layout_height="60dp"
-                android:layout_centerHorizontal="true"
-                android:background="?attr/selectableItemBackgroundBorderless"
-                android:src="@android:drawable/arrow_up_float"
-                android:contentDescription="Up" />
-
-            <ImageButton
-                android:id="@+id/btn_down"
-                android:layout_width="60dp"
-                android:layout_height="60dp"
-                android:layout_alignParentBottom="true"
-                android:layout_centerHorizontal="true"
-                android:background="?attr/selectableItemBackgroundBorderless"
-                android:src="@android:drawable/arrow_down_float"
-                android:contentDescription="Down" />
-
-            <ImageButton
-                android:id="@+id/btn_left"
-                android:layout_width="60dp"
-                android:layout_height="60dp"
-                android:layout_centerVertical="true"
-                android:background="?attr/selectableItemBackgroundBorderless"
-                android:src="@android:drawable/ic_media_previous"
-                android:contentDescription="Left" />
-
-            <ImageButton
-                android:id="@+id/btn_right"
-                android:layout_width="60dp"
-                android:layout_height="60dp"
-                android:layout_alignParentEnd="true"
-                android:layout_centerVertical="true"
-                android:background="?attr/selectableItemBackgroundBorderless"
-                android:src="@android:drawable/ic_media_next"
-                android:contentDescription="Right" />
+            android:layout_margin="20dp">
+            <ImageButton android:id="@+id/btn_up" android:layout_width="60dp" android:layout_height="60dp" android:layout_centerHorizontal="true" android:background="@android:color/transparent" android:src="@drawable/dpad_up" android:scaleType="fitCenter" />
+            <ImageButton android:id="@+id/btn_down" android:layout_width="60dp" android:layout_height="60dp" android:layout_alignParentBottom="true" android:layout_centerHorizontal="true" android:background="@android:color/transparent" android:src="@drawable/dpad_down" android:scaleType="fitCenter" />
+            <ImageButton android:id="@+id/btn_left" android:layout_width="60dp" android:layout_height="60dp" android:layout_centerVertical="true" android:background="@android:color/transparent" android:src="@drawable/dpad_left" android:scaleType="fitCenter" />
+            <ImageButton android:id="@+id/btn_right" android:layout_width="60dp" android:layout_height="60dp" android:layout_alignParentEnd="true" android:layout_centerVertical="true" android:background="@android:color/transparent" android:src="@drawable/dpad_right" android:scaleType="fitCenter" />
         </RelativeLayout>
 
         <LinearLayout
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_alignParentBottom="true"
-            android:layout_centerHorizontal="true"
-            android:layout_marginBottom="32dp"
-            android:orientation="horizontal">
-
-            <Button
-                android:id="@+id/btn_select"
-                android:layout_width="70dp"
-                android:layout_height="40dp"
-                android:layout_marginEnd="12dp"
-                android:text="SEL"
-                android:textSize="10sp"
-                android:backgroundTint="#444444" />
-
-            <Button
-                android:id="@+id/btn_start"
-                android:layout_width="70dp"
-                android:layout_height="40dp"
-                android:text="START"
-                android:textSize="10sp"
-                android:backgroundTint="#444444" />
+            android:layout_alignParentEnd="true"
+            android:layout_margin="40dp">
+            <ImageButton android:id="@+id/btn_b" android:layout_width="70dp" android:layout_height="70dp" android:background="@android:color/transparent" android:src="@drawable/button_b" android:scaleType="fitCenter" android:layout_marginEnd="10dp"/>
+            <ImageButton android:id="@+id/btn_a" android:layout_width="80dp" android:layout_height="80dp" android:background="@android:color/transparent" android:src="@drawable/button_a" android:scaleType="fitCenter" />
         </LinearLayout>
 
         <LinearLayout
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_alignParentBottom="true"
-            android:layout_alignParentEnd="true"
-            android:layout_margin="32dp"
-            android:gravity="bottom"
-            android:orientation="horizontal">
-
-            <Button
-                android:id="@+id/btn_b"
-                android:layout_width="64dp"
-                android:layout_height="64dp"
-                android:layout_marginEnd="16dp"
-                android:text="B"
-                android:textColor="#FFFFFF"
-                android:backgroundTint="#AA0000" />
-
-            <Button
-                android:id="@+id/btn_a"
-                android:layout_width="72dp"
-                android:layout_height="72dp"
-                android:text="A"
-                android:textColor="#FFFFFF"
-                android:backgroundTint="#AA0000" />
+            android:layout_centerHorizontal="true"
+            android:layout_marginBottom="20dp">
+            <ImageButton android:id="@+id/btn_select" android:layout_width="80dp" android:layout_height="40dp" android:background="@android:color/transparent" android:src="@drawable/button_select" android:scaleType="fitCenter" android:layout_marginEnd="10dp" />
+            <ImageButton android:id="@+id/btn_start" android:layout_width="80dp" android:layout_height="40dp" android:background="@android:color/transparent" android:src="@drawable/button_start" android:scaleType="fitCenter" />
         </LinearLayout>
-
     </RelativeLayout>
 </FrameLayout>
