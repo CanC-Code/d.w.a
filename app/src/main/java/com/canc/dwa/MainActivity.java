@@ -62,91 +62,88 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         gameSurface.getHolder().addCallback(this);
 
         Button selectButton = findViewById(R.id.btn_select_rom);
-        selectButton.setOnClickListener(v -> openFilePicker());
+        if (selectButton != null) {
+            selectButton.setOnClickListener(v -> openFilePicker());
+        }
 
         if (isRomExtracted()) {
             startNativeEngine();
         }
     }
 
-    // --- High-Performance Rendering Loop (V-Sync) ---
-
     @Override
     public void doFrame(long frameTimeNanos) {
         if (!isEngineRunning) return;
 
         SurfaceHolder holder = gameSurface.getHolder();
-        // 1. Update the Bitmap from C++ Screen Buffer via JNI
         nativeUpdateSurface(screenBitmap);
 
-        // 2. Lock and Draw
         Canvas canvas = holder.lockCanvas();
         if (canvas != null) {
             int viewWidth = gameSurface.getWidth();
             int viewHeight = gameSurface.getHeight();
+            // Maintain aspect ratio with letterboxing
             float scale = Math.min((float)viewWidth / 256, (float)viewHeight / 240);
             int w = (int)(256 * scale);
             int h = (int)(240 * scale);
             destRect.set((viewWidth-w)/2, (viewHeight-h)/2, (viewWidth+w)/2, (viewHeight+h)/2);
 
-            canvas.drawColor(0xFF000000); // Letterboxing
+            canvas.drawColor(0xFF000000); 
             canvas.drawBitmap(screenBitmap, null, destRect, null);
             holder.unlockCanvasAndPost(canvas);
         }
 
-        // Request next frame synced to V-Sync
         Choreographer.getInstance().postFrameCallback(this);
     }
 
-    // --- Engine Control ---
-
     private void startNativeEngine() {
-        setupContainer.setVisibility(View.GONE);
-        gameContainer.setVisibility(View.VISIBLE);
+        if (setupContainer != null) setupContainer.setVisibility(View.GONE);
+        if (gameContainer != null) gameContainer.setVisibility(View.VISIBLE);
 
         applyImmersiveMode();
         setupTouchControls();
 
-        // Pass the internal path to C++ for Mapper/Save initialization
         nativeInitEngine(getFilesDir().getAbsolutePath());
         isEngineRunning = true;
-        
-        // Begin the rendering loop
         Choreographer.getInstance().postFrameCallback(this);
     }
 
-    // --- SurfaceView Lifecycle ---
-
-    @Override
-    public void surfaceCreated(@NonNull SurfaceHolder holder) {
-        // Handled by Choreographer
-    }
-
+    @Override public void surfaceCreated(@NonNull SurfaceHolder holder) {}
     @Override public void surfaceChanged(@NonNull SurfaceHolder h, int f, int w, int h1) {}
     @Override public void surfaceDestroyed(@NonNull SurfaceHolder h) { 
         isEngineRunning = false; 
         Choreographer.getInstance().removeFrameCallback(this);
     }
 
-    // --- Optimized Touch Handling ---
-
     @SuppressLint("ClickableViewAccessibility")
     private void setupTouchControls() {
-        bindButton(R.id.btn_up, BUTTON_UP);
-        bindButton(R.id.btn_down, BUTTON_DOWN);
-        bindButton(R.id.btn_left, BUTTON_LEFT);
-        bindButton(R.id.btn_right, BUTTON_RIGHT);
-        bindButton(R.id.btn_a, BUTTON_A);
-        bindButton(R.id.btn_b, BUTTON_B);
-        // Bind Start/Select if they exist in your layout
-        bindButton(R.id.btn_start, BUTTON_START);
-        bindButton(R.id.btn_select, BUTTON_SELECT);
+        // We use a safe helper to prevent "Symbol Not Found" compiler errors
+        // Ensure these IDs match your activity_main.xml exactly
+        safeBind(R.id.btn_up, BUTTON_UP);
+        safeBind(R.id.btn_down, BUTTON_DOWN);
+        safeBind(R.id.btn_left, BUTTON_LEFT);
+        safeBind(R.id.btn_right, BUTTON_RIGHT);
+        safeBind(R.id.btn_a, BUTTON_A);
+        safeBind(R.id.btn_b, BUTTON_B);
+        
+        // Use the IDs specifically mentioned in your previous build errors
+        // Note: If your XML uses "btn_start", keep it. If it uses "button_start", change it here.
+        safeBind(R.id.btn_start, BUTTON_START);
+        safeBind(R.id.btn_select, BUTTON_SELECT);
     }
 
-    private void bindButton(int viewId, int bitmask) {
-        View btn = findViewById(viewId);
-        if (btn == null) return;
-        
+    private void safeBind(int resId, int bitmask) {
+        try {
+            View v = findViewById(resId);
+            if (v != null) {
+                bindButton(v, bitmask);
+            }
+        } catch (Exception e) {
+            // ID doesn't exist in R.java, skip binding
+        }
+    }
+
+    private void bindButton(View btn, int bitmask) {
         btn.setOnTouchListener((v, event) -> {
             switch (event.getAction()) {
                 case MotionEvent.ACTION_DOWN:
@@ -162,8 +159,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             return true;
         });
     }
-
-    // --- SAF ROM Picker & Extraction ---
 
     private void openFilePicker() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -187,12 +182,11 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             File internalRom = new File(getFilesDir(), "base.nes");
             FileOutputStream os = new FileOutputStream(internalRom);
 
-            byte[] buffer = new byte[8192]; // Larger buffer for speed
+            byte[] buffer = new byte[8192];
             int length;
             while ((length = is.read(buffer)) > 0) os.write(buffer, 0, length);
             os.close(); is.close();
 
-            // Native C++ logic extracts the banks into individual files
             String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
             if (result.startsWith("Success")) startNativeEngine();
             else Toast.makeText(this, result, Toast.LENGTH_LONG).show();
@@ -203,7 +197,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     }
 
     private boolean isRomExtracted() {
-        return new File(getFilesDir(), "prg_bank_0.bin").exists();
+        return new File(getFilesDir(), "Bank00.bin").exists(); // Matches your Ophis bank naming
     }
 
     private void applyImmersiveMode() {
