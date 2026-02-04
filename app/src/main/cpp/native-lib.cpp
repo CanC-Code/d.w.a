@@ -17,6 +17,7 @@ uint8_t cpu_ram[0x0800] = {0};
 uint8_t ppu_vram[2048] = {0};      
 uint8_t palette_ram[32] = {0}; 
 uint32_t screen_buffer[256 * 240] = {0};
+uint8_t controller_state = 0;
 std::mutex buffer_mutex;
 MapperMMC1 mapper;
 
@@ -34,7 +35,7 @@ uint32_t nes_palette[64] = {
     0xFF6B6D00, 0xFF388700, 0xFF0C9300, 0xFF008F32, 0xFF007C8D, 0xFF000000, 0xFF000000, 0xFF000000
 };
 
-// --- Memory Access ---
+// --- Bus Access ---
 uint8_t bus_read(uint16_t addr) {
     if (addr < 0x2000) return cpu_ram[addr % 0x0800];
     if (addr == 0x2002) { uint8_t s = ppu_status; ppu_status &= ~0x80; ppu_addr_latch = 0; return s; }
@@ -62,7 +63,7 @@ void update_nz(uint8_t val) {
     reg_P = (reg_P & 0x7D) | (val & 0x80) | ((val == 0) << 1);
 }
 
-// --- BOOT-CRITICAL CPU CORE ---
+// --- CPU Core ---
 void execute_instruction() {
     uint8_t opcode = bus_read(reg_PC++);
     switch (opcode) {
@@ -72,13 +73,13 @@ void execute_instruction() {
         case 0x85: bus_write(bus_read(reg_PC++), reg_A); break;         // STA ZP
         case 0x86: bus_write(bus_read(reg_PC++), reg_X); break;         // STX ZP
         case 0x9A: reg_S = reg_X; break;                                // TXS
-        case 0x4C: {                                                    // JMP Abs
+        case 0x4C: { // JMP Abs
             uint16_t l = bus_read(reg_PC++);
             uint16_t h = bus_read(reg_PC++);
             reg_PC = (h << 8) | l; 
             break; 
         }
-        case 0x20: {                                                    // JSR
+        case 0x20: { // JSR
             uint16_t l = bus_read(reg_PC++);
             uint16_t h = bus_read(reg_PC++);
             uint16_t ret = reg_PC - 1;
@@ -87,7 +88,7 @@ void execute_instruction() {
             reg_PC = (h << 8) | l;
             break;
         }
-        case 0x60: {                                                    // RTS
+        case 0x60: { // RTS
             uint16_t l = bus_read(0x0100 + ++reg_S);
             uint16_t h = bus_read(0x0100 + ++reg_S);
             reg_PC = ((h << 8) | l) + 1;
@@ -96,26 +97,39 @@ void execute_instruction() {
         case 0x78: reg_P |= 0x04; break;  // SEI
         case 0xD8: reg_P &= ~0x08; break; // CLD
         case 0xEA: break;                 // NOP
-        default: 
-            __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "Unknown Opcode: %02X at %04X", opcode, reg_PC-1);
-            break; 
+        default: break; 
     }
 }
 
-// ... draw_frame and engine_loop remain the same ...
-
-// --- MISSING JNI EXPORTS ---
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv* env, jobject thiz, jobject bitmap) {
-    void* pixels;
-    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
-    {
-        std::lock_guard<std::mutex> lock(buffer_mutex);
-        memcpy(pixels, screen_buffer, 256 * 240 * 4);
+void draw_frame() {
+    std::lock_guard<std::mutex> lock(buffer_mutex);
+    for (int ty = 0; ty < 30; ty++) {
+        for (int tx = 0; tx < 32; tx++) {
+            uint8_t tile_id = ppu_vram[ty * 32 + tx];
+            for (int y = 0; y < 8; y++) {
+                uint8_t p1 = mapper.read_chr(tile_id * 16 + y);
+                uint8_t p2 = mapper.read_chr(tile_id * 16 + y + 8);
+                for (int x = 0; x < 8; x++) {
+                    uint8_t pix = ((p1 >> (7-x)) & 0x01) | (((p2 >> (7-x)) & 0x01) << 1);
+                    uint32_t color = pix ? nes_palette[palette_ram[pix] & 0x1F] : 0xFF000000;
+                    screen_buffer[(ty*8+y)*256 + (tx*8+x)] = color;
+                }
+            }
+        }
     }
-    AndroidBitmap_unlockPixels(env, bitmap);
 }
+
+void engine_loop() {
+    while (is_running) {
+        auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < 29780; i++) execute_instruction();
+        ppu_status |= 0x80; 
+        draw_frame();
+        std::this_thread::sleep_until(start + std::chrono::milliseconds(16));
+    }
+}
+
+// --- JNI Interface ---
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstring romPath, jstring outDir) {
@@ -123,7 +137,6 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstri
     const char* cOut = env->GetStringUTFChars(outDir, 0);
     std::string outDirStr(cOut);
     std::ifstream nes(cPath, std::ios::binary);
-    
     if (!nes) return env->NewStringUTF("File Error");
     
     nes.seekg(16); // Skip iNES Header
@@ -142,4 +155,39 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstri
     env->ReleaseStringUTFChars(romPath, cPath);
     env->ReleaseStringUTFChars(outDir, cOut);
     return env->NewStringUTF("Success");
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv* env, jobject thiz, jstring filesDir) {
+    if (is_running) return;
+    const char* cPath = env->GetStringUTFChars(filesDir, 0);
+    std::string pathStr(cPath);
+    for(int i = 0; i < 4; i++) {
+        std::ifstream in(pathStr + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
+        if (in) in.read((char*)mapper.prg_rom[i], 16384);
+    }
+    std::ifstream c_in(pathStr + "/chr_rom.bin", std::ios::binary);
+    if (c_in) c_in.read((char*)mapper.chr_rom, 16384);
+    
+    reg_PC = (mapper.read_prg(0xFFFD) << 8) | mapper.read_prg(0xFFFC);
+    is_running = true;
+    std::thread(engine_loop).detach();
+    env->ReleaseStringUTFChars(filesDir, cPath);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv* env, jobject thiz, jobject bitmap) {
+    void* pixels;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
+    {
+        std::lock_guard<std::mutex> lock(buffer_mutex);
+        memcpy(pixels, screen_buffer, 256 * 240 * 4);
+    }
+    AndroidBitmap_unlockPixels(env, bitmap);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_injectInput(JNIEnv* env, jobject thiz, jint bit, jboolean pressed) {
+    if (pressed) controller_state |= bit;
+    else controller_state &= ~bit;
 }
