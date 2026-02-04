@@ -1,222 +1,216 @@
-package com.canc.dwa;
+#include <jni.h>
+#include <string>
+#include <vector>
+#include <fstream>
+#include <android/log.h>
+#include <android/bitmap.h>
+#include <aaudio/AAudio.h>
+#include <thread>
+#include <chrono>
+#include <math.h>
 
-import android.annotation.SuppressLint;
-import android.app.Activity;
-import android.content.Intent;
-import android.graphics.Bitmap;
-import android.graphics.Canvas;
-import android.graphics.Rect;
-import android.net.Uri;
-import android.os.Bundle;
-import android.view.Choreographer;
-import android.view.MotionEvent;
-import android.view.SurfaceHolder;
-import android.view.SurfaceView;
-import android.view.View;
-import android.view.WindowInsets;
-import android.view.WindowInsetsController;
-import android.widget.Button;
-import android.widget.Toast;
-import androidx.annotation.NonNull;
-import androidx.appcompat.app.AppCompatActivity;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.InputStream;
+#define LOG_TAG "DWA_NATIVE"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
-public class MainActivity extends AppCompatActivity implements SurfaceHolder.Callback, Choreographer.FrameCallback {
+// --- NES Hardware State ---
+uint8_t cpu_ram[0x0800];
+uint8_t prg_rom[4][16384];             
+uint8_t chr_rom[8192];                 
+uint8_t sram[0x2000];                  
+std::string global_save_path;
 
-    static {
-        System.loadLibrary("dwa");
+// --- Video State ---
+uint32_t screen_buffer[256 * 240];
+uint32_t nes_palette[64] = {
+    0xFF666666, 0xFF002A88, 0xFF1412A7, 0xFF3B00A4, 0xFF5C007E, 0xFF6E0040, 0xFF6C0600, 0xFF561D00,
+    0xFF333500, 0xFF0B4800, 0xFF005200, 0xFF004F08, 0xFF00404D, 0xFF000000, 0xFF000000, 0xFF000000,
+    0xFFADADAD, 0xFF155FD9, 0xFF4142FF, 0xFF7C1AFF, 0xFFB513F9, 0xFFD210BE, 0xFFD42C44, 0xFFB84B00,
+    0xFF816D00, 0xFF458800, 0xFF129800, 0xFF009923, 0xFF008985, 0xFF000000, 0xFF000000, 0xFF000000,
+    0xFFFFFFFF, 0xFF64B0FF, 0xFF9290FF, 0xFFC676FF, 0xFFF35AFF, 0xFFFE66CC, 0xFFFE7373, 0xFFF38913,
+    0xFFD3AB00, 0xFFA1D000, 0xFF7FDE00, 0xFF72E248, 0xFF72D1AF, 0xFF000000, 0xFF000000, 0xFF000000,
+    0xFFFFFFFF, 0xFFC0DFFF, 0xFFD3D2FF, 0xFFE8C8FF, 0xFFFBC2FF, 0xFFFEC4EA, 0xFFFECCC5, 0xFFF7D8A5,
+    0xFFE4E594, 0xFFCFEF96, 0xFFBDF4AB, 0xFFB3F3CC, 0xFFB5EBF2, 0xFF000000, 0xFF000000, 0xFF000000
+};
+
+// --- Audio Engine ---
+float audio_phase = 0, audio_frequency = 0, audio_amplitude = 0;
+AAudioStream *audio_stream = nullptr;
+
+aaudio_data_callback_result_t audio_callback(AAudioStream *stream, void *user_data, void *audio_data, int32_t num_frames) {
+    float *buffer = (float *)audio_data;
+    for (int i = 0; i < num_frames; i++) {
+        buffer[i] = (sinf(audio_phase) > 0) ? audio_amplitude : -audio_amplitude;
+        audio_phase += (2.0f * M_PI * audio_frequency) / 48000.0f;
+        if (audio_phase > 2.0f * M_PI) audio_phase -= 2.0f * M_PI;
     }
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
 
-    private static final int PICK_ROM_REQUEST = 1;
+// --- CPU State ---
+uint16_t reg_PC;
+uint8_t  reg_A, reg_X, reg_Y, reg_S, reg_P;
+bool is_running = false;
 
-    // NES Controller Bitmask values
-    private static final int BUTTON_A      = 0x80;
-    private static final int BUTTON_B      = 0x40;
-    private static final int BUTTON_SELECT = 0x20;
-    private static final int BUTTON_START  = 0x10;
-    private static final int BUTTON_UP     = 0x08;
-    private static final int BUTTON_DOWN   = 0x04;
-    private static final int BUTTON_LEFT   = 0x02;
-    private static final int BUTTON_RIGHT  = 0x01;
+#define FLAG_Z (1 << 1)
+#define FLAG_I (1 << 2)
+#define FLAG_D (1 << 3)
+#define FLAG_U (1 << 5)
+#define FLAG_N (1 << 7)
 
-    private View gameContainer;
-    private View setupContainer;
-    private SurfaceView gameSurface;
-    private Bitmap screenBitmap;
-    private boolean isEngineRunning = false;
-    private final Rect destRect = new Rect();
+uint8_t current_prg_bank = 0;
+uint8_t mmc1_shift_reg = 0x10;
 
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-        setContentView(R.layout.activity_main);
+void save_sram_to_disk() {
+    std::ofstream out(global_save_path, std::ios::binary);
+    if (out.is_open()) { out.write((char*)sram, 0x2000); out.close(); }
+}
 
-        setupContainer = findViewById(R.id.setup_layout);
-        gameContainer = findViewById(R.id.game_layout);
-        gameSurface = findViewById(R.id.game_surface);
+void load_sram_from_disk() {
+    std::ifstream in(global_save_path, std::ios::binary);
+    if (in.is_open()) { in.read((char*)sram, 0x2000); in.close(); }
+}
 
-        screenBitmap = Bitmap.createBitmap(256, 240, Bitmap.Config.ARGB_8888);
-        gameSurface.getHolder().addCallback(this);
+uint8_t read_byte(uint16_t addr) {
+    if (addr < 0x2000) return cpu_ram[addr % 0x0800];
+    if (addr >= 0x6000 && addr < 0x8000) return sram[addr - 0x6000];
+    if (addr >= 0x8000 && addr < 0xC000) return prg_rom[current_prg_bank][addr - 0x8000];
+    if (addr >= 0xC000) return prg_rom[3][addr - 0xC000];
+    return 0;
+}
 
-        Button selectButton = findViewById(R.id.btn_select_rom);
-        if (selectButton != null) {
-            selectButton.setOnClickListener(v -> openFilePicker());
-        }
-
-        if (isRomExtracted()) {
-            startNativeEngine();
-        }
+void write_byte(uint16_t addr, uint8_t val) {
+    if (addr < 0x2000) { cpu_ram[addr % 0x0800] = val; }
+    else if (addr >= 0x6000 && addr < 0x8000) { sram[addr - 0x6000] = val; }
+    else if (addr == 0x4002 || addr == 0x4003) {
+        uint16_t timer = (read_byte(0x4003) & 0x07) << 8 | read_byte(0x4002);
+        audio_frequency = 1789773.0f / (16.0f * (timer + 1));
+        audio_amplitude = (timer > 5) ? 0.1f : 0.0f;
     }
-
-    @Override
-    public void doFrame(long frameTimeNanos) {
-        if (!isEngineRunning) return;
-
-        SurfaceHolder holder = gameSurface.getHolder();
-        nativeUpdateSurface(screenBitmap);
-
-        Canvas canvas = holder.lockCanvas();
-        if (canvas != null) {
-            int viewWidth = gameSurface.getWidth();
-            int viewHeight = gameSurface.getHeight();
-            
-            float scale = Math.min((float)viewWidth / 256, (float)viewHeight / 240);
-            int w = (int)(256 * scale);
-            int h = (int)(240 * scale);
-            destRect.set((viewWidth - w) / 2, (viewHeight - h) / 2, (viewWidth + w) / 2, (viewHeight + h) / 2);
-
-            canvas.drawColor(0xFF000000); 
-            canvas.drawBitmap(screenBitmap, null, destRect, null);
-            holder.unlockCanvasAndPost(canvas);
-        }
-
-        Choreographer.getInstance().postFrameCallback(this);
-    }
-
-    private void startNativeEngine() {
-        if (setupContainer != null) setupContainer.setVisibility(View.GONE);
-        if (gameContainer != null) gameContainer.setVisibility(View.VISIBLE);
-
-        applyImmersiveMode();
-        setupTouchControls();
-
-        // Pass files directory for bank loading and save states
-        nativeInitEngine(getFilesDir().getAbsolutePath());
-        isEngineRunning = true;
-        Choreographer.getInstance().postFrameCallback(this);
-    }
-
-    @Override
-    protected void onResume() {
-        super.onResume();
-        if (isEngineRunning) {
-            Choreographer.getInstance().postFrameCallback(this);
-        }
-    }
-
-    @Override
-    protected void onPause() {
-        super.onPause();
-        // Stop the UI loop but keep the engine ready
-        Choreographer.getInstance().removeFrameCallback(this);
-    }
-
-    @Override public void surfaceCreated(@NonNull SurfaceHolder holder) {}
-    @Override public void surfaceChanged(@NonNull SurfaceHolder h, int f, int w, int h1) {}
-    @Override public void surfaceDestroyed(@NonNull SurfaceHolder h) {}
-
-    @SuppressLint("ClickableViewAccessibility")
-    private void setupTouchControls() {
-        safeBind(R.id.btn_up, BUTTON_UP);
-        safeBind(R.id.btn_down, BUTTON_DOWN);
-        safeBind(R.id.btn_left, BUTTON_LEFT);
-        safeBind(R.id.btn_right, BUTTON_RIGHT);
-        safeBind(R.id.btn_a, BUTTON_A);
-        safeBind(R.id.btn_b, BUTTON_B);
-        safeBind(R.id.btn_start, BUTTON_START);
-        safeBind(R.id.btn_select, BUTTON_SELECT);
-    }
-
-    private void safeBind(int resId, int bitmask) {
-        View v = findViewById(resId);
-        if (v != null) {
-            bindButton(v, bitmask);
-        }
-    }
-
-    private void bindButton(View btn, int bitmask) {
-        btn.setOnTouchListener((v, event) -> {
-            switch (event.getAction()) {
-                case MotionEvent.ACTION_DOWN:
-                    injectInput(bitmask, true);
-                    v.setPressed(true);
-                    break;
-                case MotionEvent.ACTION_UP:
-                case MotionEvent.ACTION_CANCEL:
-                    injectInput(bitmask, false);
-                    v.setPressed(false);
-                    break;
-            }
-            return true;
-        });
-    }
-
-    private void openFilePicker() {
-        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("*/*"); 
-        startActivityForResult(intent, PICK_ROM_REQUEST);
-    }
-
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == PICK_ROM_REQUEST && resultCode == Activity.RESULT_OK && data != null) {
-            Uri uri = data.getData();
-            if (uri != null) copyAndExtract(uri);
-        }
-    }
-
-    private void copyAndExtract(Uri uri) {
-        try {
-            InputStream is = getContentResolver().openInputStream(uri);
-            File internalRom = new File(getFilesDir(), "base.nes");
-            FileOutputStream os = new FileOutputStream(internalRom);
-
-            byte[] buffer = new byte[8192];
-            int length;
-            while ((length = is.read(buffer)) > 0) os.write(buffer, 0, length);
-            os.close(); is.close();
-
-            String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
-            if (result.startsWith("Success")) {
-                startNativeEngine();
-            } else {
-                Toast.makeText(this, result, Toast.LENGTH_LONG).show();
-            }
-        } catch (Exception e) {
-            Toast.makeText(this, "IO Error: " + e.getMessage(), Toast.LENGTH_SHORT).show();
-        }
-    }
-
-    private boolean isRomExtracted() {
-        return new File(getFilesDir(), "Bank00.bin").exists();
-    }
-
-    private void applyImmersiveMode() {
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
-            final WindowInsetsController controller = getWindow().getInsetsController();
-            if (controller != null) {
-                controller.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
-                controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+    else if (addr >= 0x8000) {
+        if (val & 0x80) { mmc1_shift_reg = 0x10; }
+        else {
+            bool complete = (mmc1_shift_reg & 0x01);
+            mmc1_shift_reg >>= 1; mmc1_shift_reg |= ((val & 0x01) << 4);
+            if (complete) {
+                if (addr >= 0xE000) current_prg_bank = mmc1_shift_reg & 0x03;
+                mmc1_shift_reg = 0x10;
             }
         }
     }
+}
 
-    public native String nativeExtractRom(String romPath, String outDir);
-    public native void nativeInitEngine(String filesDir);
-    public native void nativeUpdateSurface(Bitmap bitmap);
-    public native void injectInput(int buttonBit, boolean isPressed);
+void trigger_nmi() {
+    write_byte(0x0100 + reg_S--, (reg_PC >> 8) & 0xFF);
+    write_byte(0x0100 + reg_S--, reg_PC & 0xFF);
+    write_byte(0x0100 + reg_S--, reg_P);
+    reg_PC = (read_byte(0xFFFB) << 8) | read_byte(0xFFFA);
+    reg_P |= FLAG_I;
+}
+
+void render_frame() {
+    for (int t = 0; t < 960; t++) {
+        int tile_id = cpu_ram[0x0400 + t];
+        int xb = (t % 32) * 8, yb = (t / 32) * 8;
+        for (int row = 0; row < 8; row++) {
+            uint8_t p1 = chr_rom[tile_id * 16 + row], p2 = chr_rom[tile_id * 16 + row + 8];
+            for (int col = 0; col < 8; col++) {
+                int pix = ((p1 >> (7 - col)) & 1) | (((p2 >> (7 - col)) & 1) << 1);
+                screen_buffer[(yb + row) * 256 + (xb + col)] = nes_palette[pix + 10];
+            }
+        }
+    }
+}
+
+int step_cpu() {
+    uint8_t op = read_byte(reg_PC++);
+    switch (op) {
+        case 0x78: reg_P |= FLAG_I; return 2;
+        case 0xD8: reg_P &= ~FLAG_D; return 2;
+        case 0xA9: reg_A = read_byte(reg_PC++); if(!reg_A) reg_P |= FLAG_Z; else reg_P &= ~FLAG_Z; return 2;
+        case 0x8D: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); write_byte((h << 8)|l, reg_A); return 4; }
+        case 0x4C: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); reg_PC = (h << 8)|l; return 3; }
+        default: return 1; 
+    }
+}
+
+void master_clock() {
+    auto next = std::chrono::steady_clock::now();
+    while (is_running) {
+        int cycles = 0;
+        while (cycles < 29780) { cycles += step_cpu(); }
+        trigger_nmi();
+        render_frame();
+        save_sram_to_disk();
+        next += std::chrono::microseconds(16666); 
+        std::this_thread::sleep_until(next);
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv* env, jobject thiz, jstring filesDir) {
+    const char* cPath = env->GetStringUTFChars(filesDir, nullptr);
+    std::string pathStr(cPath);
+    global_save_path = pathStr + "/hero.sav";
+
+    for(int i = 0; i < 4; i++) {
+        std::ifstream in(pathStr + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
+        if (in.is_open()) { in.read((char*)prg_rom[i], 16384); in.close(); }
+    }
+    load_sram_from_disk();
+
+    AAudioStreamBuilder *builder;
+    AAudio_createStreamBuilder(&builder);
+    AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
+    AAudioStreamBuilder_setChannelCount(builder, 1);
+    AAudioStreamBuilder_setDataCallback(builder, audio_callback, nullptr);
+    AAudioStreamBuilder_openStream(builder, &audio_stream);
+    AAudioStream_requestStart(audio_stream);
+    AAudioStreamBuilder_delete(builder);
+
+    reg_PC = (read_byte(0xFFFD) << 8) | read_byte(0xFFFC);
+    reg_S = 0xFD; 
+    reg_P = FLAG_I | FLAG_U;
+
+    is_running = true;
+    std::thread(master_clock).detach();
+    env->ReleaseStringUTFChars(filesDir, cPath);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv* env, jobject thiz, jobject bitmap) {
+    void* pixels;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
+    memcpy(pixels, screen_buffer, 256 * 240 * 4);
+    AndroidBitmap_unlockPixels(env, bitmap);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstring romPath, jstring outDir) {
+    const char* cRomPath = env->GetStringUTFChars(romPath, nullptr);
+    const char* cOutDir = env->GetStringUTFChars(outDir, nullptr);
+    std::string outDirStr(cOutDir);
+
+    std::ifstream in(cRomPath, std::ios::binary);
+    if (!in.is_open()) return env->NewStringUTF("Error: Could not open ROM");
+
+    char header[16];
+    in.read(header, 16);
+
+    for (int i = 0; i < 4; i++) {
+        std::ofstream out(outDirStr + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
+        char bankData[16384];
+        in.read(bankData, 16384);
+        out.write(bankData, 16384);
+        out.close();
+    }
+
+    env->ReleaseStringUTFChars(romPath, cRomPath);
+    env->ReleaseStringUTFChars(outDir, cOutDir);
+    return env->NewStringUTF("Success: Banks extracted");
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_injectInput(JNIEnv* env, jobject thiz, jint buttonBit, jboolean isPressed) {
+    // Simple input stub: button states would be mapped to $4016/$4017 registers
+    LOGI("Input: %d, Pressed: %d", buttonBit, isPressed);
 }
