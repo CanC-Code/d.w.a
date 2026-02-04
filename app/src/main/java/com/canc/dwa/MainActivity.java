@@ -1,13 +1,16 @@
 package com.canc.dwa;
 
+import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.widget.Button;
+import android.widget.ImageButton;
 import android.widget.Toast;
 import androidx.appcompat.app.AppCompatActivity;
 import java.io.File;
@@ -17,26 +20,35 @@ import java.io.InputStream;
 public class MainActivity extends AppCompatActivity {
 
     static {
-        // This loads the 'dwa' library which includes our updated nativeExtractRom
         System.loadLibrary("dwa");
     }
 
     private static final int PICK_ROM_REQUEST = 1;
+    
+    // NES Controller Bitmask
+    private static final int BUTTON_A      = 0x80;
+    private static final int BUTTON_B      = 0x40;
+    private static final int BUTTON_SELECT = 0x20;
+    private static final int BUTTON_START  = 0x10;
+    private static final int BUTTON_UP     = 0x08;
+    private static final int BUTTON_DOWN   = 0x04;
+    private static final int BUTTON_LEFT   = 0x02;
+    private static final int BUTTON_RIGHT  = 0x01;
+
     private View gameContainer;
     private View setupContainer;
 
     @Override
-    protected void onCreate(Bundle savedInstanceState) { // Fixed syntax error here
+    protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        setupContainer = findViewById(R.id.setup_layout); // Container for the Select Button
-        gameContainer = findViewById(R.id.game_layout);   // Container for SurfaceView/Buttons
+        setupContainer = findViewById(R.id.setup_layout);
+        gameContainer = findViewById(R.id.game_layout);
 
         Button selectButton = findViewById(R.id.btn_select_rom);
         selectButton.setOnClickListener(v -> openFilePicker());
 
-        // Check if ROM was already extracted previously
         if (isRomExtracted()) {
             startNativeEngine();
         }
@@ -75,30 +87,27 @@ public class MainActivity extends AppCompatActivity {
             os.close();
             is.close();
 
-            // Native extraction: Returns "Success" or Error message
             String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
-            
+
             if (result.startsWith("Success")) {
                 startNativeEngine();
             } else {
                 Toast.makeText(this, result, Toast.LENGTH_LONG).show();
             }
-
         } catch (Exception e) {
             Toast.makeText(this, "IO Error: " + e.getMessage(), Toast.LENGTH_SHORT).show();
         }
     }
 
     private boolean isRomExtracted() {
-        File check = new File(getFilesDir(), "prg_bank_0.bin");
-        return check.exists();
+        return new File(getFilesDir(), "prg_bank_0.bin").exists();
     }
 
     private void startNativeEngine() {
         setupContainer.setVisibility(View.GONE);
         gameContainer.setVisibility(View.VISIBLE);
-        
-        // Enter Immersive Fullscreen Mode for a "Perfect" feel
+
+        // Enter Fullscreen
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
             final WindowInsetsController controller = getWindow().getInsetsController();
             if (controller != null) {
@@ -106,11 +115,43 @@ public class MainActivity extends AppCompatActivity {
                 controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
             }
         }
-        
-        Toast.makeText(this, "Initializing Dragon Warrior Engine...", Toast.LENGTH_SHORT).show();
+
+        // Initialize Native Input Listeners
+        setupTouchControls();
+
+        // Start the native emulation loop
+        nativeInitEngine(getFilesDir().getAbsolutePath());
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private void setupTouchControls() {
+        bindButton(R.id.btn_up, BUTTON_UP);
+        bindButton(R.id.btn_down, BUTTON_DOWN);
+        bindButton(R.id.btn_left, BUTTON_LEFT);
+        bindButton(R.id.btn_right, BUTTON_RIGHT);
+        bindButton(R.id.btn_a, BUTTON_A);
+        bindButton(R.id.btn_b, BUTTON_B);
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private void bindButton(int viewId, int bitmask) {
+        View btn = findViewById(viewId);
+        if (btn != null) {
+            btn.setOnTouchListener((v, event) -> {
+                if (event.getAction() == MotionEvent.ACTION_DOWN) {
+                    injectInput(bitmask, true);
+                    v.setPressed(true);
+                } else if (event.getAction() == MotionEvent.ACTION_UP || event.getAction() == MotionEvent.ACTION_CANCEL) {
+                    injectInput(bitmask, false);
+                    v.setPressed(false);
+                }
+                return true;
+            });
+        }
     }
 
     // JNI Declarations
     public native String nativeExtractRom(String romPath, String outDir);
+    public native void nativeInitEngine(String filesDir);
     public native void injectInput(int buttonBit, boolean isPressed);
 }
