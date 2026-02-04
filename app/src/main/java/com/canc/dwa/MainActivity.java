@@ -26,7 +26,6 @@ import java.io.InputStream;
 public class MainActivity extends AppCompatActivity implements SurfaceHolder.Callback, Choreographer.FrameCallback {
 
     static {
-        // Load the native library compiled via CMake
         System.loadLibrary("dwa");
     }
 
@@ -58,7 +57,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         gameContainer = findViewById(R.id.game_layout);
         gameSurface = findViewById(R.id.game_surface);
 
-        // Initialize 256x240 bitmap for native NES resolution
         screenBitmap = Bitmap.createBitmap(256, 240, Bitmap.Config.ARGB_8888);
         gameSurface.getHolder().addCallback(this);
 
@@ -67,7 +65,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             selectButton.setOnClickListener(v -> openFilePicker());
         }
 
-        // Auto-start if ROM is already present in internal storage
         if (isRomExtracted()) {
             startNativeEngine();
         }
@@ -78,14 +75,13 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         if (!isEngineRunning) return;
 
         SurfaceHolder holder = gameSurface.getHolder();
-        // Fetch current NES frame pixels from C++ buffer
         nativeUpdateSurface(screenBitmap);
 
         Canvas canvas = holder.lockCanvas();
         if (canvas != null) {
             int viewWidth = gameSurface.getWidth();
             int viewHeight = gameSurface.getHeight();
-            
+
             float scale = Math.min((float)viewWidth / 256, (float)viewHeight / 240);
             int w = (int)(256 * scale);
             int h = (int)(240 * scale);
@@ -193,7 +189,8 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     }
 
     private boolean isRomExtracted() {
-        return new File(getFilesDir(), "Bank00.bin").exists();
+        // Aligned with C++ prg_bank_X.bin naming
+        return new File(getFilesDir(), "prg_bank_0.bin").exists();
     }
 
     private void applyImmersiveMode() {
@@ -206,7 +203,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         }
     }
 
-    // --- JNI Signatures ---
     public native String nativeExtractRom(String romPath, String outDir);
     public native void nativeInitEngine(String filesDir);
     public native void nativeUpdateSurface(Bitmap bitmap);
