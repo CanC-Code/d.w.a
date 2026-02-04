@@ -7,6 +7,7 @@
 #include <thread>
 #include <chrono>
 #include <mutex>
+#include <cstring>
 
 #define LOG_TAG "DWA_NATIVE"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -15,15 +16,14 @@
 uint8_t cpu_ram[0x0800];
 uint8_t prg_rom[4][16384];             
 uint8_t chr_rom[8192];
-uint8_t sram[0x2000];
 uint8_t controller_state = 0, controller_shift = 0;
 
 // --- PPU State ---
 uint8_t ppu_vram[2048]; 
 uint8_t palette_ram[32]; 
 uint16_t ppu_addr_reg;    
-bool ppu_addr_latch;
-uint8_t ppu_ctrl, ppu_mask, ppu_status, ppu_data_buffer; 
+bool ppu_addr_latch = false;
+uint8_t ppu_ctrl, ppu_status, ppu_data_buffer; 
 
 // --- Video & Sync ---
 uint32_t screen_buffer[256 * 240];
@@ -79,7 +79,9 @@ uint8_t read_byte(uint16_t addr) {
         }
     }
     if (addr == 0x4016) { uint8_t res = (controller_shift & 0x80) ? 1 : 0; controller_shift <<= 1; return res | 0x40; }
-    if (addr >= 0x8000) return (addr < 0xC000) ? prg_rom[current_prg_bank][addr - 0x8000] : prg_rom[3][addr - 0xC000];
+    // Mapping: $8000-$BFFF = current_prg_bank | $C000-$FFFF = last bank (bank 3)
+    if (addr >= 0x8000 && addr < 0xC000) return prg_rom[current_prg_bank][addr - 0x8000];
+    if (addr >= 0xC000) return prg_rom[3][addr - 0xC000];
     return 0;
 }
 
@@ -123,7 +125,7 @@ int step_cpu() {
     switch (op) {
         case 0x90: val = read_byte(reg_PC++); if(!(reg_P & FLAG_C)) reg_PC += (int8_t)val; return 2;
         case 0xB0: val = read_byte(reg_PC++); if(reg_P & FLAG_C) reg_PC += (int8_t)val; return 2;
-        case 0x24: { val = read_byte(read_byte(reg_PC++)); reg_P = (reg_P & 0x3F) | (val & 0xC0); 
+        case 0x24: { uint16_t addr = read_byte(reg_PC++); val = read_byte(addr); reg_P = (reg_P & 0x3F) | (val & 0xC0); 
                      if (!(val & reg_A)) reg_P |= FLAG_Z; else reg_P &= ~FLAG_Z; return 3; }
         case 0xE6: { uint8_t zp = read_byte(reg_PC++); val = read_byte(zp) + 1; write_byte(zp, val); SET_ZN(val); return 5; }
         case 0xC6: { uint8_t zp = read_byte(reg_PC++); val = read_byte(zp) - 1; write_byte(zp, val); SET_ZN(val); return 5; }
@@ -161,8 +163,10 @@ void render_frame() {
             uint8_t p1 = chr_rom[tile_id * 16 + row], p2 = chr_rom[tile_id * 16 + row + 8];
             for (int col = 0; col < 8; col++) {
                 int pix = ((p1 >> (7-col)) & 1) | (((p2 >> (7-col)) & 1) << 1);
-                uint32_t color = (pix != 0) ? nes_palette[palette_ram[palette_idx * 4 + pix] & 0x3F] : 0xFF000000;
-                screen_buffer[(yb + row) * 256 + (xb + col)] = color;
+                if (yb + row < 240 && xb + col < 256) {
+                    uint32_t color = (pix != 0) ? nes_palette[palette_ram[palette_idx * 4 + pix] & 0x3F] : 0xFF000000;
+                    screen_buffer[(yb + row) * 256 + (xb + col)] = color;
+                }
             }
         }
     }
@@ -185,7 +189,6 @@ void master_clock() {
     }
 }
 
-// RESTORED ROM EXTRACTOR
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstring romPath, jstring outDir) {
     const char* cPath = env->GetStringUTFChars(romPath, nullptr);
@@ -193,18 +196,18 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstri
     std::string outDirStr(cOut);
     std::ifstream nes(cPath, std::ios::binary);
     if (!nes.is_open()) return env->NewStringUTF("File Error");
-    char header[16]; nes.read(header, 16);
-    if (header[0] != 'N') return env->NewStringUTF("Invalid ROM");
     
-    // Simple extraction for NROM/MMC1
+    char header[16]; nes.read(header, 16);
+    if (header[0] != 'N') return env->NewStringUTF("Invalid Header");
+    
     for (int i = 0; i < 4; i++) {
         std::vector<char> buffer(16384, 0);
-        if (i < header[4]) nes.read(buffer.data(), 16384);
+        if (i < (unsigned char)header[4]) nes.read(buffer.data(), 16384);
         std::ofstream out(outDirStr + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
         out.write(buffer.data(), 16384);
     }
     std::vector<char> chr(8192, 0);
-    nes.read(chr.data(), 8192);
+    if (header[5] > 0) nes.read(chr.data(), 8192);
     std::ofstream chrOut(outDirStr + "/chr_rom.bin", std::ios::binary);
     chrOut.write(chr.data(), 8192);
 
@@ -217,13 +220,19 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv* env, jobject thiz, jstring filesDir) {
     const char* cPath = env->GetStringUTFChars(filesDir, nullptr);
     std::string pathStr(cPath);
+    memset(cpu_ram, 0, 0x0800);
     for(int i = 0; i < 4; i++) {
         std::ifstream in(pathStr + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
         if (in.is_open()) in.read((char*)prg_rom[i], 16384);
     }
     std::ifstream chr_in(pathStr + "/chr_rom.bin", std::ios::binary);
     if (chr_in.is_open()) chr_in.read((char*)chr_rom, 8192);
-    reg_PC = (read_byte(0xFFFD) << 8) | read_byte(0xFFFC);
+
+    // FIX: Set reset vector AFTER ROMs are loaded into memory
+    uint16_t lo = read_byte(0xFFFC);
+    uint16_t hi = read_byte(0xFFFD);
+    reg_PC = (hi << 8) | lo;
+    
     reg_S = 0xFD; reg_P = 0x24;
     is_running = true;
     std::thread(master_clock).detach();
