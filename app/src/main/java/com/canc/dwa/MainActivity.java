@@ -4,6 +4,9 @@ import android.app.Activity;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
+import android.view.View;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.widget.Button;
 import android.widget.Toast;
 import androidx.appcompat.app.AppCompatActivity;
@@ -14,25 +17,35 @@ import java.io.InputStream;
 public class MainActivity extends AppCompatActivity {
 
     static {
+        // This loads the 'dwa' library which includes our updated nativeExtractRom
         System.loadLibrary("dwa");
     }
 
     private static final int PICK_ROM_REQUEST = 1;
+    private View gameContainer;
+    private View setupContainer;
 
     @Override
-    protected void Bundle savedInstanceState) {
+    protected void onCreate(Bundle savedInstanceState) { // Fixed syntax error here
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
-        // A button to trigger the ROM picker
+        setupContainer = findViewById(R.id.setup_layout); // Container for the Select Button
+        gameContainer = findViewById(R.id.game_layout);   // Container for SurfaceView/Buttons
+
         Button selectButton = findViewById(R.id.btn_select_rom);
         selectButton.setOnClickListener(v -> openFilePicker());
+
+        // Check if ROM was already extracted previously
+        if (isRomExtracted()) {
+            startNativeEngine();
+        }
     }
 
     private void openFilePicker() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("*/*"); // You can narrow this to .nes if needed
+        intent.setType("*/*"); 
         startActivityForResult(intent, PICK_ROM_REQUEST);
     }
 
@@ -42,12 +55,12 @@ public class MainActivity extends AppCompatActivity {
         if (requestCode == PICK_ROM_REQUEST && resultCode == Activity.RESULT_OK && data != null) {
             Uri uri = data.getData();
             if (uri != null) {
-                copyRomToInternal(uri);
+                copyAndExtract(uri);
             }
         }
     }
 
-    private void copyRomToInternal(Uri uri) {
+    private void copyAndExtract(Uri uri) {
         try {
             InputStream is = getContentResolver().openInputStream(uri);
             File internalRom = new File(getFilesDir(), "base.nes");
@@ -62,15 +75,42 @@ public class MainActivity extends AppCompatActivity {
             os.close();
             is.close();
 
-            // Notify C++ to extract
+            // Native extraction: Returns "Success" or Error message
             String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
-            Toast.makeText(this, result, Toast.LENGTH_LONG).show();
+            
+            if (result.startsWith("Success")) {
+                startNativeEngine();
+            } else {
+                Toast.makeText(this, result, Toast.LENGTH_LONG).show();
+            }
 
         } catch (Exception e) {
-            e.printStackTrace();
-            Toast.makeText(this, "Failed to copy ROM", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "IO Error: " + e.getMessage(), Toast.LENGTH_SHORT).show();
         }
     }
 
+    private boolean isRomExtracted() {
+        File check = new File(getFilesDir(), "prg_bank_0.bin");
+        return check.exists();
+    }
+
+    private void startNativeEngine() {
+        setupContainer.setVisibility(View.GONE);
+        gameContainer.setVisibility(View.VISIBLE);
+        
+        // Enter Immersive Fullscreen Mode for a "Perfect" feel
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            final WindowInsetsController controller = getWindow().getInsetsController();
+            if (controller != null) {
+                controller.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+                controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            }
+        }
+        
+        Toast.makeText(this, "Initializing Dragon Warrior Engine...", Toast.LENGTH_SHORT).show();
+    }
+
+    // JNI Declarations
     public native String nativeExtractRom(String romPath, String outDir);
+    public native void injectInput(int buttonBit, boolean isPressed);
 }
