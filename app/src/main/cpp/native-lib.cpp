@@ -1,163 +1,104 @@
-#include <jni.h>
-#include <string>
-#include <vector>
-#include <fstream>
-#include <android/log.h>
-#include <android/bitmap.h>
-#include <aaudio/AAudio.h>
-#include <thread>
-#include <chrono>
-#include <math.h>
+// Helper macros for flag management
+#define SET_ZN(val) reg_P = (reg_P & ~(FLAG_Z | FLAG_N)) | ((val == 0) ? FLAG_Z : 0) | (val & 0x80)
 
-#define LOG_TAG "DWA_NATIVE"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-
-// --- Hardware State ---
-[span_64](start_span)uint8_t cpu_ram[0x0800];[span_64](end_span)
-[span_65](start_span)uint8_t prg_rom[4][16384];[span_65](end_span)
-[span_66](start_span)uint8_t chr_rom[8192];[span_66](end_span)
-[span_67](start_span)uint8_t sram[0x2000];[span_67](end_span)
-[span_68](start_span)uint32_t screen_buffer[256 * 240];[span_68](end_span)
-[span_69](start_span)uint32_t nes_palette[64] = {[span_69](end_span)
-    0xFF666666, 0xFF002A88, 0xFF1412A7, 0xFF3B00A4, 0xFF5C007E, 0xFF6E0040, 0xFF6C0600, 0xFF561D00,
-    0xFF333500, 0xFF0B4800, 0xFF005200, 0xFF004F08, 0xFF00404D, 0xFF000000, 0xFF000000, 0xFF000000,
-    0xFFADADAD, 0xFF155FD9, 0xFF4142FF, 0xFF7C1AFF, 0xFFB513F9, 0xFFD210BE, 0xFFD42C44, 0xFFB84B00,
-    0xFF816D00, 0xFF458800, 0xFF129800, 0xFF009923, 0xFF008985, 0xFF000000, 0xFF000000, 0xFF000000,
-    0xFFFFFFFF, 0xFF64B0FF, 0xFF9290FF, 0xFFC676FF, 0xFFF35AFF, 0xFFFE66CC, 0xFFFE7373, 0xFFF38913,
-    0xFFD3AB00, 0xFFA1D000, 0xFF7FDE00, 0xFF72E248, 0xFF72D1AF, 0xFF000000, 0xFF000000, 0xFF000000,
-    0xFFFFFFFF, 0xFFC0DFFF, 0xFFD3D2FF, 0xFFE8C8FF, 0xFFFBC2FF, 0xFFFEC4EA, 0xFFFECCC5, 0xFFF7D8A5,
-    0xFFE4E594, 0xFFCFEF96, 0xFFBDF4AB, 0xFFB3F3CC, 0xFFB5EBF2, 0xFF000000, 0xFF000000, 0xFF000000
-};
-
-// --- CPU Registers & Flags ---
-[span_70](start_span)uint16_t reg_PC;[span_70](end_span)
-[span_71](start_span)uint8_t  reg_A, reg_X, reg_Y, reg_S, reg_P;[span_71](end_span)
-[span_72](start_span)bool is_running = false;[span_72](end_span)
-[span_73](start_span)#define FLAG_Z (1 << 1)[span_73](end_span)
-[span_74](start_span)#define FLAG_I (1 << 2)[span_74](end_span)
-[span_75](start_span)#define FLAG_D (1 << 3)[span_75](end_span)
-[span_76](start_span)#define FLAG_U (1 << 5)[span_76](end_span)
-[span_77](start_span)#define FLAG_N (1 << 7)[span_77](end_span)
-
-[span_78](start_span)uint8_t current_prg_bank = 0;[span_78](end_span)
-
-// --- Memory Access ---
-uint8_t read_byte(uint16_t addr) {
-    [span_79](start_span)if (addr < 0x2000) return cpu_ram[addr % 0x0800];[span_79](end_span)
-    [span_80](start_span)if (addr >= 0x8000 && addr < 0xC000) return prg_rom[current_prg_bank][addr - 0x8000];[span_80](end_span)
-    [span_81](start_span)if (addr >= 0xC000) return prg_rom[3][addr - 0xC000];[span_81](end_span)
-    return 0;
-}
-
-void write_byte(uint16_t addr, uint8_t val) {
-    [span_82](start_span)if (addr < 0x2000) cpu_ram[addr % 0x0800] = val;[span_82](end_span)
-}
-
-// --- CPU Execution Step ---
 int step_cpu() {
-    [span_83](start_span)uint8_t op = read_byte(reg_PC++);[span_83](end_span)
+    uint8_t op = read_byte(reg_PC++);
+    uint16_t addr = 0;
+    uint8_t temp = 0;
+
     switch (op) {
-        case 0x78: reg_P |= FLAG_I; return 2; [span_84](start_span)// SEI[span_84](end_span)
-        case 0xD8: reg_P &= ~FLAG_D; return 2; [span_85](start_span)// CLD[span_85](end_span)
-        [span_86](start_span)case 0xA9: // LDA Immediate[span_86](end_span)
-            reg_A = read_byte(reg_PC++);
-            reg_P = (reg_A == 0) ? (reg_P | FLAG_Z) : (reg_P & ~FLAG_Z);
-            reg_P = (reg_A & 0x80) ? (reg_P | FLAG_N) : (reg_P & ~FLAG_N);
-            return 2;
-        [span_87](start_span)case 0x8D: { // STA Absolute[span_87](end_span)
-            uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++);
-            write_byte((h << 8) | l, reg_A);
-            return 4;
+        // --- DATA TRANSFER ---
+        case 0xA9: reg_A = read_byte(reg_PC++); SET_ZN(reg_A); return 2; // LDA Imm
+        case 0xA5: reg_A = read_byte(read_byte(reg_PC++)); SET_ZN(reg_A); return 3; // LDA ZP
+        case 0xAD: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); reg_A = read_byte((h<<8)|l); SET_ZN(reg_A); return 4; } // LDA Abs
+        case 0xA2: reg_X = read_byte(reg_PC++); SET_ZN(reg_X); return 2; // LDX Imm
+        case 0xA6: reg_X = read_byte(read_byte(reg_PC++)); SET_ZN(reg_X); return 3; // LDX ZP
+        case 0xA0: reg_Y = read_byte(reg_PC++); SET_ZN(reg_Y); return 2; // LDY Imm
+        case 0x85: write_byte(read_byte(reg_PC++), reg_A); return 3; // STA ZP
+        case 0x8D: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); write_byte((h<<8)|l, reg_A); return 4; } // STA Abs
+        case 0x86: write_byte(read_byte(reg_PC++), reg_X); return 3; // STX ZP
+        case 0x84: write_byte(read_byte(reg_PC++), reg_Y); return 3; // STY ZP
+
+        // --- STACK OPERATIONS ---
+        case 0x9A: reg_S = reg_X; return 2; // TXS
+        case 0xBA: reg_X = reg_S; SET_ZN(reg_X); return 2; // TSX
+        case 0x48: write_byte(0x0100 + reg_S--, reg_A); return 3; // PHA
+        case 0x68: reg_A = read_byte(0x0100 + ++reg_S); SET_ZN(reg_A); return 4; // PLA
+        case 0x08: write_byte(0x0100 + reg_S--, reg_P | 0x30); return 3; // PHP
+        case 0x28: reg_P = read_byte(0x0100 + ++reg_S) | FLAG_U; return 4; // PLP
+
+        // --- ARITHMETIC & LOGIC ---
+        case 0xE9: { // SBC Imm
+            uint8_t val = read_byte(reg_PC++);
+            uint16_t res = (uint16_t)reg_A - (uint16_t)val - ((reg_P & 0x01) ? 0 : 1);
+            if (!(res & 0xFF00)) reg_P |= 0x01; else reg_P &= ~0x01;
+            if (((reg_A ^ val) & 0x80) && ((reg_A ^ res) & 0x80)) reg_P |= 0x40; else reg_P &= ~0x40;
+            reg_A = (uint8_t)res; SET_ZN(reg_A); return 2;
         }
-        case 0x20: { // JSR (Jump to Subroutine) - Critical for Booting
+        case 0x69: { // ADC Imm
+            uint8_t val = read_byte(reg_PC++);
+            uint16_t res = (uint16_t)reg_A + (uint16_t)val + (reg_P & 0x01);
+            if (res > 0xFF) reg_P |= 0x01; else reg_P &= ~0x01;
+            if (!((reg_A ^ val) & 0x80) && ((reg_A ^ res) & 0x80)) reg_P |= 0x40; else reg_P &= ~0x40;
+            reg_A = (uint8_t)res; SET_ZN(reg_A); return 2;
+        }
+        case 0xC9: temp = read_byte(reg_PC++); if(reg_A >= temp) reg_P |= 0x01; else reg_P &= ~0x01; SET_ZN(reg_A - temp); return 2; // CMP Imm
+        case 0xE0: temp = read_byte(reg_PC++); if(reg_X >= temp) reg_P |= 0x01; else reg_P &= ~0x01; SET_ZN(reg_X - temp); return 2; // CPX Imm
+        case 0xC0: temp = read_byte(reg_PC++); if(reg_Y >= temp) reg_P |= 0x01; else reg_P &= ~0x01; SET_ZN(reg_Y - temp); return 2; // CPY Imm
+        case 0x29: reg_A &= read_byte(reg_PC++); SET_ZN(reg_A); return 2; // AND Imm
+        case 0x09: reg_A |= read_byte(reg_PC++); SET_ZN(reg_A); return 2; // ORA Imm
+        case 0x49: reg_A ^= read_byte(reg_PC++); SET_ZN(reg_A); return 2; // EOR Imm
+
+        // --- INCREMENT / DECREMENT ---
+        case 0xE8: reg_X++; SET_ZN(reg_X); return 2; // INX
+        case 0xC8: reg_Y++; SET_ZN(reg_Y); return 2; // INY
+        case 0xCA: reg_X--; SET_ZN(reg_X); return 2; // DEX
+        case 0x88: reg_Y--; SET_ZN(reg_Y); return 2; // DEY
+        case 0xE6: { uint8_t a = read_byte(reg_PC++); temp = read_byte(a) + 1; write_byte(a, temp); SET_ZN(temp); return 5; } // INC ZP
+
+        // --- CONTROL FLOW ---
+        case 0x4C: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); reg_PC = (h<<8)|l; return 3; } // JMP Abs
+        case 0x20: { // JSR
             uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++);
             uint16_t ret = reg_PC - 1;
             write_byte(0x0100 + reg_S--, (ret >> 8) & 0xFF);
             write_byte(0x0100 + reg_S--, ret & 0xFF);
-            reg_PC = (h << 8) | l;
-            return 6;
+            reg_PC = (h << 8) | l; return 6;
         }
-        case 0x60: { // RTS (Return from Subroutine)
+        case 0x60: { // RTS
             uint16_t l = read_byte(0x0100 + ++reg_S);
             uint16_t h = read_byte(0x0100 + ++reg_S);
-            reg_PC = ((h << 8) | l) + 1;
-            return 6;
+            reg_PC = ((h << 8) | l) + 1; return 6;
         }
-        [span_88](start_span)case 0x4C: { // JMP Absolute[span_88](end_span)
-            uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++);
-            reg_PC = (h << 8) | l;
-            return 3;
+        case 0x40: { // RTI
+            reg_P = read_byte(0x0100 + ++reg_S) | FLAG_U;
+            uint16_t l = read_byte(0x0100 + ++reg_S);
+            uint16_t h = read_byte(0x0100 + ++reg_S);
+            reg_PC = (h << 8) | l; return 6;
         }
-        default: return 1; 
+
+        // --- BRANCHES ---
+        case 0x90: temp = read_byte(reg_PC++); if(!(reg_P & 0x01)) reg_PC += (int8_t)temp; return 2; // BCC
+        case 0xB0: temp = read_byte(reg_PC++); if(reg_P & 0x01) reg_PC += (int8_t)temp; return 2; // BCS
+        case 0xF0: temp = read_byte(reg_PC++); if(reg_P & FLAG_Z) reg_PC += (int8_t)temp; return 2; // BEQ
+        case 0xD0: temp = read_byte(reg_PC++); if(!(reg_P & FLAG_Z)) reg_PC += (int8_t)temp; return 2; // BNE
+        case 0x10: temp = read_byte(reg_PC++); if(!(reg_P & FLAG_N)) reg_PC += (int8_t)temp; return 2; // BPL
+        case 0x30: temp = read_byte(reg_PC++); if(reg_P & FLAG_N) reg_PC += (int8_t)temp; return 2; // BMI
+
+        // --- FLAG MODIFICATION ---
+        case 0x18: reg_P &= ~0x01; return 2; // CLC
+        case 0x38: reg_P |= 0x01; return 2; // SEC
+        case 0x58: reg_P &= ~FLAG_I; return 2; // CLI
+        case 0x78: reg_P |= FLAG_I; return 2; // SEI
+        case 0xD8: reg_P &= ~FLAG_D; return 2; // CLD
+        case 0xF8: reg_P |= FLAG_D; return 2; // SED
+
+        // --- MISC ---
+        case 0xEA: return 2; // NOP
+        case 0x00: return 7; // BRK (Stub)
+
+        default: 
+            __android_log_print(ANDROID_LOG_ERROR, "DWA_NATIVE", "Unknown Opcode: %02X at %04X", op, reg_PC-1);
+            return 1;
     }
 }
-
-void master_clock() {
-    [span_89](start_span)auto next = std::chrono::steady_clock::now();[span_89](end_span)
-    [span_90](start_span)while (is_running) {[span_90](end_span)
-        int cycles = 0;
-        while (cycles < 29780) { cycles += step_cpu(); [span_91](start_span)}
-        
-        // --- Visual Test Pattern ---
-        // If the CPU is ticking, you'll see a changing color pattern
-        for (int i = 0; i < 256 * 240; i++) screen_buffer[i] = nes_palette[rand() % 64];[span_91](end_span)
-        
-        next += std::chrono::microseconds(16666); 
-        [span_92](start_span)std::this_thread::sleep_until(next);[span_92](end_span)
-    }
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv* env, jobject thiz, jstring filesDir) {
-    [span_93](start_span)const char* cPath = env->GetStringUTFChars(filesDir, nullptr);[span_93](end_span)
-    std::string pathStr(cPath);
-    
-    [span_94](start_span)// Load extracted Banks[span_94](end_span)
-    for(int i = 0; i < 4; i++) {
-        std::ifstream in(pathStr + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
-        if (in.is_open()) in.read((char*)prg_rom[i], 16384);
-    }
-
-    [span_95](start_span)// Set CPU Reset Vector[span_95](end_span)
-    reg_PC = (read_byte(0xFFFD) << 8) | read_byte(0xFFFC);
-    reg_S = 0xFD; 
-    reg_P = FLAG_I | FLAG_U;
-
-    is_running = true;
-    [span_96](start_span)std::thread(master_clock).detach();[span_96](end_span)
-    env->ReleaseStringUTFChars(filesDir, cPath);
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv* env, jobject thiz, jobject bitmap) {
-    void* pixels;
-    [span_97](start_span)if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;[span_97](end_span)
-    [span_98](start_span)memcpy(pixels, screen_buffer, 256 * 240 * 4);[span_98](end_span)
-    [span_99](start_span)AndroidBitmap_unlockPixels(env, bitmap);[span_99](end_span)
-}
-
-extern "C" JNIEXPORT jstring JNICALL
-Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstring romPath, jstring outDir) {
-    const char* cRomPath = env->GetStringUTFChars(romPath, nullptr);
-    const char* cOutDir = env->GetStringUTFChars(outDir, nullptr);
-    std::string outDirStr(cOutDir);
-
-    std::ifstream in(cRomPath, std::ios::binary);
-    if (!in.is_open()) return env->NewStringUTF("Error: Could not open ROM");
-
-    in.seekg(16); // Skip iNES Header
-    for (int i = 0; i < 4; i++) {
-        std::ofstream out(outDirStr + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
-        char bankData[16384];
-        in.read(bankData, 16384);
-        out.write(bankData, 16384);
-        out.close();
-    }
-
-    env->ReleaseStringUTFChars(romPath, cRomPath);
-    env->ReleaseStringUTFChars(outDir, cOutDir);
-    return env->NewStringUTF("Success: Banks extracted");
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_canc_dwa_MainActivity_injectInput(JNIEnv* env, jobject thiz, jint buttonBit, jboolean isPressed) {}
