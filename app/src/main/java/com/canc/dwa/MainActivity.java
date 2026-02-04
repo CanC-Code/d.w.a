@@ -3,28 +3,33 @@ package com.canc.dwa;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Bundle;
 import android.view.MotionEvent;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.widget.Button;
-import android.widget.ImageButton;
 import android.widget.Toast;
+import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 
-public class MainActivity extends AppCompatActivity {
+public class MainActivity extends AppCompatActivity implements SurfaceHolder.Callback {
 
     static {
         System.loadLibrary("dwa");
     }
 
     private static final int PICK_ROM_REQUEST = 1;
-    
+
     // NES Controller Bitmask
     private static final int BUTTON_A      = 0x80;
     private static final int BUTTON_B      = 0x40;
@@ -37,6 +42,10 @@ public class MainActivity extends AppCompatActivity {
 
     private View gameContainer;
     private View setupContainer;
+    private SurfaceView gameSurface;
+    private Bitmap screenBitmap;
+    private boolean isEngineRunning = false;
+    private Thread graphicsThread;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -45,6 +54,11 @@ public class MainActivity extends AppCompatActivity {
 
         setupContainer = findViewById(R.id.setup_layout);
         gameContainer = findViewById(R.id.game_layout);
+        gameSurface = findViewById(R.id.game_surface);
+        
+        // Initialize the 256x240 buffer for the Native PPU
+        screenBitmap = Bitmap.createBitmap(256, 240, Bitmap.Config.ARGB_8888);
+        gameSurface.getHolder().addCallback(this);
 
         Button selectButton = findViewById(R.id.btn_select_rom);
         selectButton.setOnClickListener(v -> openFilePicker());
@@ -53,6 +67,8 @@ public class MainActivity extends AppCompatActivity {
             startNativeEngine();
         }
     }
+
+    // --- SAF Picker & Extraction Logic ---
 
     private void openFilePicker() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -66,9 +82,7 @@ public class MainActivity extends AppCompatActivity {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == PICK_ROM_REQUEST && resultCode == Activity.RESULT_OK && data != null) {
             Uri uri = data.getData();
-            if (uri != null) {
-                copyAndExtract(uri);
-            }
+            if (uri != null) copyAndExtract(uri);
         }
     }
 
@@ -80,20 +94,13 @@ public class MainActivity extends AppCompatActivity {
 
             byte[] buffer = new byte[1024];
             int length;
-            while ((length = is.read(buffer)) > 0) {
-                os.write(buffer, 0, length);
-            }
-            os.flush();
-            os.close();
-            is.close();
+            while ((length = is.read(buffer)) > 0) os.write(buffer, 0, length);
+            os.close(); is.close();
 
             String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
-
-            if (result.startsWith("Success")) {
-                startNativeEngine();
-            } else {
-                Toast.makeText(this, result, Toast.LENGTH_LONG).show();
-            }
+            if (result.startsWith("Success")) startNativeEngine();
+            else Toast.makeText(this, result, Toast.LENGTH_LONG).show();
+            
         } catch (Exception e) {
             Toast.makeText(this, "IO Error: " + e.getMessage(), Toast.LENGTH_SHORT).show();
         }
@@ -103,11 +110,21 @@ public class MainActivity extends AppCompatActivity {
         return new File(getFilesDir(), "prg_bank_0.bin").exists();
     }
 
+    // --- Native Engine Control ---
+
     private void startNativeEngine() {
         setupContainer.setVisibility(View.GONE);
         gameContainer.setVisibility(View.VISIBLE);
 
-        // Enter Fullscreen
+        applyImmersiveMode();
+        setupTouchControls();
+
+        // Start C++ Master Clock
+        nativeInitEngine(getFilesDir().getAbsolutePath());
+        isEngineRunning = true;
+    }
+
+    private void applyImmersiveMode() {
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
             final WindowInsetsController controller = getWindow().getInsetsController();
             if (controller != null) {
@@ -115,13 +132,44 @@ public class MainActivity extends AppCompatActivity {
                 controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
             }
         }
-
-        // Initialize Native Input Listeners
-        setupTouchControls();
-
-        // Start the native emulation loop
-        nativeInitEngine(getFilesDir().getAbsolutePath());
     }
+
+    // --- SurfaceView Callback (Rendering) ---
+
+    @Override
+    public void surfaceCreated(@NonNull SurfaceHolder holder) {
+        graphicsThread = new Thread(() -> {
+            Rect destRect = new Rect();
+            while (isEngineRunning) {
+                // 1. Update the Bitmap from C++ Screen Buffer
+                nativeUpdateSurface(screenBitmap);
+
+                // 2. Draw to Surface
+                Canvas canvas = holder.lockCanvas();
+                if (canvas != null) {
+                    // Maintain aspect ratio: Scale 256x240 to fit screen
+                    int viewWidth = gameSurface.getWidth();
+                    int viewHeight = gameSurface.getHeight();
+                    float scale = Math.min((float)viewWidth / 256, (float)viewHeight / 240);
+                    int w = (int)(256 * scale);
+                    int h = (int)(240 * scale);
+                    destRect.set((viewWidth-w)/2, (viewHeight-h)/2, (viewWidth+w)/2, (viewHeight+h)/2);
+                    
+                    canvas.drawColor(0xFF000000); // Black Bars
+                    canvas.drawBitmap(screenBitmap, null, destRect, null);
+                    holder.unlockCanvasAndPost(canvas);
+                }
+                
+                try { Thread.sleep(16); } catch (InterruptedException ignored) {}
+            }
+        });
+        graphicsThread.start();
+    }
+
+    @Override public void surfaceChanged(@NonNull SurfaceHolder h, int f, int w, int h1) {}
+    @Override public void surfaceDestroyed(@NonNull SurfaceHolder h) { isEngineRunning = false; }
+
+    // --- Input & JNI ---
 
     @SuppressLint("ClickableViewAccessibility")
     private void setupTouchControls() {
@@ -150,8 +198,8 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // JNI Declarations
     public native String nativeExtractRom(String romPath, String outDir);
     public native void nativeInitEngine(String filesDir);
+    public native void nativeUpdateSurface(Bitmap bitmap);
     public native void injectInput(int buttonBit, boolean isPressed);
 }
