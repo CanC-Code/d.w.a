@@ -1,5 +1,11 @@
 name: Android CI
-on: [push, pull_request]
+on: 
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  # This enables the manual trigger button in the GitHub Actions UI
+  workflow_dispatch:
 
 jobs:
   build:
@@ -18,17 +24,24 @@ jobs:
 
       - name: Execute Runtime Asset Generation
         run: |
+          # Ensure directories exist for ImageMagick output
+          mkdir -p app/src/main/res/drawable
+          mkdir -p app/src/main/res/mipmap-xxxhdpi
+          
           chmod +x runtime/*.sh
           for script in runtime/*.sh; do
             echo "Running $script..."
             ./"$script"
           done
 
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
       - name: Build with Gradle
         run: ./gradlew assembleDebug
 
       - name: Upload APK
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4 # Updated to v4 for better performance/reliability
         with:
           name: dw-native-port
           path: app/build/outputs/apk/debug/app-debug.apk
