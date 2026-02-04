@@ -17,11 +17,10 @@ uint8_t chr_rom[8192];
 uint8_t sram[0x2000];
 
 // --- PPU State ---
-uint8_t ppu_vram[0x2000]; 
+uint8_t ppu_vram[0x4000]; // Increased to full range
 uint16_t ppu_addr_reg;    
 bool ppu_addr_latch;
-uint8_t ppu_ctrl, ppu_mask, ppu_status;         
-uint8_t ppu_data_buffer; 
+uint8_t ppu_ctrl, ppu_mask, ppu_status, ppu_data_buffer; 
 
 // --- Video State ---
 uint32_t screen_buffer[256 * 240];
@@ -61,14 +60,15 @@ uint8_t read_byte(uint16_t addr) {
         uint16_t reg = 0x2000 + (addr % 8);
         if (reg == 0x2002) { 
             uint8_t res = ppu_status;
-            ppu_status &= ~0x80; // Clear VBlank on read
+            ppu_status &= ~0x80;
             ppu_addr_latch = false; 
             return res; 
         }
         if (reg == 0x2007) {
             uint8_t data = ppu_data_buffer;
             uint16_t target = ppu_addr_reg & 0x3FFF;
-            if (target < 0x3F00) ppu_data_buffer = ppu_vram[target % 0x2000];
+            ppu_data_buffer = ppu_vram[target];
+            if (target >= 0x3F00) data = ppu_vram[target]; // Palette reads are immediate
             ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
             return data;
         }
@@ -92,7 +92,10 @@ void write_byte(uint16_t addr, uint8_t val) {
         }
         else if (reg == 0x2007) {
             uint16_t target = ppu_addr_reg & 0x3FFF;
-            ppu_vram[target % 0x2000] = val;
+            ppu_vram[target] = val;
+            if (target >= 0x3F00) { // Palette Mirroring
+                 if ((target & 0x000F) == 0) ppu_vram[0x3F00 ^ (target & 0x0010)] = val;
+            }
             ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
         }
     }
@@ -120,14 +123,30 @@ void trigger_nmi() {
 int step_cpu() {
     uint8_t op = read_byte(reg_PC++);
     uint16_t addr = 0;
-    uint8_t temp = 0;
+    uint8_t val = 0;
 
     switch (op) {
-        // --- Core Instructions ---
+        // --- Core Math ---
+        case 0x69: { // ADC Immediate
+            val = read_byte(reg_PC++);
+            uint16_t sum = reg_A + val + (reg_P & FLAG_C);
+            reg_P = (reg_P & ~(FLAG_C | FLAG_V)) | (sum > 0xFF ? FLAG_C : 0);
+            if (~(reg_A ^ val) & (reg_A ^ sum) & 0x80) reg_P |= FLAG_V;
+            reg_A = sum & 0xFF; SET_ZN(reg_A); return 2;
+        }
+        case 0xE9: { // SBC Immediate
+            val = read_byte(reg_PC++);
+            uint16_t sub = reg_A - val - (~reg_P & FLAG_C);
+            reg_P = (reg_P & ~(FLAG_C | FLAG_V)) | (!(sub & 0x100) ? FLAG_C : 0);
+            if ((reg_A ^ val) & (reg_A ^ sub) & 0x80) reg_P |= FLAG_V;
+            reg_A = sub & 0xFF; SET_ZN(reg_A); return 2;
+        }
+        // --- Core Ops ---
         case 0xA9: reg_A = read_byte(reg_PC++); SET_ZN(reg_A); return 2;
         case 0xAD: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); reg_A = read_byte((h<<8)|l); SET_ZN(reg_A); return 4; }
         case 0x85: write_byte(read_byte(reg_PC++), reg_A); return 3;
         case 0x8D: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); write_byte((h<<8)|l, reg_A); return 4; }
+        case 0x9D: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); write_byte(((h<<8)|l) + reg_X, reg_A); return 5; }
         case 0xB1: { 
             uint8_t zp = read_byte(reg_PC++);
             uint16_t base = read_byte(zp) | (read_byte((zp + 1) & 0xFF) << 8);
@@ -138,46 +157,48 @@ int step_cpu() {
         case 0x8E: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); write_byte((h<<8)|l, reg_X); return 4; }
         case 0xCA: reg_X--; SET_ZN(reg_X); return 2;
         case 0x88: reg_Y--; SET_ZN(reg_Y); return 2;
+        case 0xAA: reg_X = reg_A; SET_ZN(reg_X); return 2; // TAX
+        case 0xA8: reg_Y = reg_A; SET_ZN(reg_Y); return 2; // TAY
         case 0x9A: reg_S = reg_X; return 2;
-        
-        // --- Added Stack/Flag Ops for DW1 ---
         case 0x48: write_byte(0x0100 + reg_S--, reg_A); return 3; // PHA
         case 0x68: reg_A = read_byte(0x0100 + ++reg_S); SET_ZN(reg_A); return 4; // PLA
-        case 0x08: write_byte(0x0100 + reg_S--, reg_P | 0x30); return 3; // PHP
-        case 0x28: reg_P = (read_byte(0x0100 + ++reg_S) & 0xEF) | 0x20; return 4; // PLP
-
-        case 0x24: { temp = read_byte(read_byte(reg_PC++)); reg_P = (reg_P & 0x3F) | (temp & 0xC0); if ((temp & reg_A) == 0) reg_P |= FLAG_Z; else reg_P &= ~FLAG_Z; return 3; }
-        case 0xC9: temp = read_byte(reg_PC++); if(reg_A >= temp) reg_P |= FLAG_C; else reg_P &= ~FLAG_C; SET_ZN(reg_A - temp); return 2;
-        case 0xD0: temp = read_byte(reg_PC++); if(!(reg_P & FLAG_Z)) reg_PC += (int8_t)temp; return 2;
-        case 0xF0: temp = read_byte(reg_PC++); if(reg_P & FLAG_Z) reg_PC += (int8_t)temp; return 2;
-        case 0x10: temp = read_byte(reg_PC++); if(!(reg_P & FLAG_N)) reg_PC += (int8_t)temp; return 2;
-        case 0x30: temp = read_byte(reg_PC++); if(reg_P & FLAG_N) reg_PC += (int8_t)temp; return 2;
-
+        case 0x24: { val = read_byte(read_byte(reg_PC++)); reg_P = (reg_P & 0x3F) | (val & 0xC0); if ((val & reg_A) == 0) reg_P |= FLAG_Z; else reg_P &= ~FLAG_Z; return 3; }
+        case 0xC9: val = read_byte(reg_PC++); if(reg_A >= val) reg_P |= FLAG_C; else reg_P &= ~FLAG_C; SET_ZN(reg_A - val); return 2;
+        case 0xD0: val = read_byte(reg_PC++); if(!(reg_P & FLAG_Z)) reg_PC += (int8_t)val; return 2;
+        case 0xF0: val = read_byte(reg_PC++); if(reg_P & FLAG_Z) reg_PC += (int8_t)val; return 2;
+        case 0x10: val = read_byte(reg_PC++); if(!(reg_P & FLAG_N)) reg_PC += (int8_t)val; return 2;
         case 0x4C: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); reg_PC = (h<<8)|l; return 3; }
         case 0x20: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); uint16_t ret = reg_PC - 1; write_byte(0x0100 + reg_S--, (ret >> 8) & 0xFF); write_byte(0x0100 + reg_S--, ret & 0xFF); reg_PC = (h << 8) | l; return 6; }
         case 0x60: { uint16_t l = read_byte(0x0100 + ++reg_S); uint16_t h = read_byte(0x0100 + ++reg_S); reg_PC = ((h << 8) | l) + 1; return 6; }
-        case 0x40: { reg_P = (read_byte(0x0100 + ++reg_S) & 0xEF) | 0x20; uint16_t l = read_byte(0x0100 + ++reg_S); uint16_t h = read_byte(0x0100 + ++reg_S); reg_PC = (h << 8) | l; return 6; }
-        
         case 0x38: reg_P |= FLAG_C; return 2;
         case 0x18: reg_P &= ~FLAG_C; return 2;
         case 0x78: reg_P |= FLAG_I; return 2;
-        case 0x58: reg_P &= ~FLAG_I; return 2;
         case 0xD8: reg_P &= ~FLAG_D; return 2;
-        case 0xEA: return 2;
         default: return 1;
     }
 }
 
+
 void render_frame() {
+    uint16_t nt_base = 0x2000; // Standard Name Table 0
+    int chr_offset = (ppu_ctrl & 0x10) ? 4096 : 0; // Pattern Table selection
+
     for (int t = 0; t < 960; t++) {
-        int tile_id = ppu_vram[t]; 
+        int tile_id = ppu_vram[nt_base + t]; 
         int xb = (t % 32) * 8, yb = (t / 32) * 8;
+        
         for (int row = 0; row < 8; row++) {
-            uint8_t p1 = chr_rom[tile_id * 16 + row];
-            uint8_t p2 = chr_rom[tile_id * 16 + row + 8];
+            uint8_t p1 = chr_rom[chr_offset + tile_id * 16 + row];
+            uint8_t p2 = chr_rom[chr_offset + tile_id * 16 + row + 8];
             for (int col = 0; col < 8; col++) {
-                int pix = ((p1 >> (7 - col)) & 1) | (((p2 >> (7 - col)) & 1) << 1);
-                uint32_t color = (pix == 0) ? 0xFF000000 : nes_palette[pix + 0x0E];
+                int bit1 = (p1 >> (7 - col)) & 1;
+                int bit2 = (p2 >> (7 - col)) & 1;
+                int color_idx = bit1 | (bit2 << 1);
+                
+                // Read from actual VRAM Palette (simplified attribute handling)
+                uint32_t color = nes_palette[ppu_vram[0x3F00 + color_idx] & 0x3F];
+                if (color_idx == 0) color = 0xFF000000; // Background transparency
+                
                 screen_buffer[(yb + row) * 256 + (xb + col)] = color;
             }
         }
@@ -187,17 +208,11 @@ void render_frame() {
 void master_clock() {
     auto next = std::chrono::steady_clock::now();
     while (is_running) {
-        // 1. Set VBlank off at start of frame
         ppu_status &= ~0x80;
-
         int cycles = 0;
-        // Run frame cycles (CPU logic)
         while (cycles < 29780) { cycles += step_cpu(); }
-        
-        // 2. Set VBlank on and trigger NMI
         ppu_status |= 0x80;
         if (ppu_ctrl & 0x80) trigger_nmi(); 
-        
         render_frame();
         next += std::chrono::microseconds(16666); 
         std::this_thread::sleep_until(next);
@@ -216,9 +231,7 @@ Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv* env, jobject thiz, jstri
     if (chr_in.is_open()) chr_in.read((char*)chr_rom, 8192);
 
     reg_PC = (read_byte(0xFFFD) << 8) | read_byte(0xFFFC);
-    reg_S = 0xFD; reg_P = 0x24; // Standard initial flags
-    ppu_status = 0; ppu_addr_latch = false;
-    
+    reg_S = 0xFD; reg_P = 0x24;
     is_running = true;
     std::thread(master_clock).detach();
     env->ReleaseStringUTFChars(filesDir, cPath);
