@@ -1,20 +1,24 @@
 #!/bin/bash
-# Define colors for NES-style (Dark Grey/Black with transparency)
+# Define colors for NES-style
 BTN_COLOR="rgba(30,30,30,0.7)"
-ACTION_COLOR="rgba(180,0,0,0.8)" # Classic NES Red-ish
+ACTION_COLOR="rgba(180,0,0,0.8)"
 TEXT_COLOR="rgba(255,255,255,0.9)"
 
 # Ensure the output directory exists
 mkdir -p app/src/main/res/drawable
 
-# 1. Create D-PAD Buttons (matching your XML's expected names)
+# 1. Create D-PAD Buttons (Generates BOTH button_up and dpad_up)
 create_arrow() {
     local name=$1
     local rotation=$2
+    # This creates a square button with a rotating arrow inside
     magick -size 200x200 canvas:none \
         -fill "$BTN_COLOR" -draw "roundrectangle 10,10 190,190 20,20" \
         -fill "$TEXT_COLOR" -draw "push graphic-context translate 100,100 rotate $rotation polygon 0,-60 60,40 -60,40 pop" \
-        "app/src/main/res/drawable/button_$name.png"
+        "app/src/main/res/drawable/dpad_$name.png"
+    
+    # Create a symlink or copy to satisfy both naming styles
+    cp "app/src/main/res/drawable/dpad_$name.png" "app/src/main/res/drawable/button_$name.png"
 }
 
 create_arrow "up" 0
@@ -38,4 +42,4 @@ for btn in start select; do
         "app/src/main/res/drawable/button_$btn.png"
 done
 
-echo "GUI Assets generated successfully."
+echo "GUI Assets generated: dpad_up, dpad_down, dpad_left, dpad_right, button_a, button_b."
