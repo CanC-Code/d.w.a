@@ -6,21 +6,19 @@ project("dwa")
 # Add the main native library
 add_library(dwa SHARED native-lib.cpp)
 
-# Set C++ standard to 17 for thread, chrono, and advanced math support
+# Set C++ standard to 17 for thread, chrono, and math
 set_target_properties(dwa PROPERTIES CXX_STANDARD 17)
 
-# Locate the NDK log library for __android_log_print
+# Locate standard NDK libraries
+# We keep find_library for log and graphics as they are universally stable
 find_library(log-lib log)
-
-# Locate the jnigraphics library for direct Bitmap manipulation
 find_library(graphics-lib jnigraphics)
 
-# Locate the aaudio library for low-latency 8-bit sound synthesis
-find_library(aaudio-lib aaudio)
-
-# Link all required libraries to our "dwa" target
+# Link all required libraries
+# We link 'aaudio' directly to prevent the "NOTFOUND" error in CI
 target_link_libraries(dwa 
     ${log-lib} 
     ${graphics-lib}
-    ${aaudio-lib}
+    aaudio
+    android # Added for AAssetManager support
 )
