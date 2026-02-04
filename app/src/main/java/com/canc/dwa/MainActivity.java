@@ -30,6 +30,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     private SurfaceView gameSurface;
     private Bitmap screenBitmap;
     private boolean isEngineRunning = false;
+    private boolean isSurfaceReady = false; // Lifecycle guard
     private final Rect destRect = new Rect();
 
     @Override
@@ -45,20 +46,16 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         gameSurface.getHolder().addCallback(this);
 
         findViewById(R.id.btn_select_rom).setOnClickListener(v -> openFilePicker());
-
-        // Auto-start only if valid files exist
-        if (isRomExtracted()) {
-            startNativeEngine();
-        }
     }
 
     @Override
     public void doFrame(long frameTimeNanos) {
-        if (!isEngineRunning) return;
+        if (!isEngineRunning || !isSurfaceReady) return;
 
         nativeUpdateSurface(screenBitmap);
 
-        Canvas canvas = gameSurface.getHolder().lockCanvas();
+        SurfaceHolder holder = gameSurface.getHolder();
+        Canvas canvas = holder.lockCanvas();
         if (canvas != null) {
             try {
                 float scale = Math.min((float)gameSurface.getWidth() / 256, (float)gameSurface.getHeight() / 240);
@@ -72,7 +69,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
                 canvas.drawColor(0xFF000000); 
                 canvas.drawBitmap(screenBitmap, null, destRect, null);
             } finally {
-                gameSurface.getHolder().unlockCanvasAndPost(canvas);
+                holder.unlockCanvasAndPost(canvas);
             }
         }
         Choreographer.getInstance().postFrameCallback(this);
@@ -86,17 +83,18 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
         setupTouchControls();
         
-        // Pass the absolute path to ensure C++ fstream doesn't fail
         String filesPath = getFilesDir().getAbsolutePath();
         nativeInitEngine(filesPath);
 
         isEngineRunning = true;
-        Choreographer.getInstance().postFrameCallback(this);
+        // Only start the frame callback if the surface is already visible
+        if (isSurfaceReady) {
+            Choreographer.getInstance().postFrameCallback(this);
+        }
     }
 
     private boolean isRomExtracted() {
         File chrFile = new File(getFilesDir(), "chr_rom.bin");
-        // Verify 16KB (2 banks) as per source Header.asm
         return chrFile.exists() && chrFile.length() >= 16384;
     }
 
@@ -134,7 +132,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             os.close();
             is.close();
 
-            // Perform extraction
             String outPath = getFilesDir().getAbsolutePath();
             String result = nativeExtractRom(internalRom.getAbsolutePath(), outPath);
 
@@ -142,7 +139,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
                 startNativeEngine();
             } else {
                 Toast.makeText(this, "Extraction failed: " + result, Toast.LENGTH_LONG).show();
-                // Clean up any partial/corrupt extractions to prevent auto-start loop
                 new File(getFilesDir(), "chr_rom.bin").delete();
             }
         } catch (Exception e) {
@@ -180,9 +176,23 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         }
     }
 
-    @Override public void surfaceCreated(@NonNull SurfaceHolder h) {}
+    @Override 
+    public void surfaceCreated(@NonNull SurfaceHolder h) {
+        isSurfaceReady = true;
+        // If engine was already initialized (e.g., auto-start), start the loop now
+        if (isEngineRunning) {
+            Choreographer.getInstance().postFrameCallback(this);
+        } else if (isRomExtracted()) {
+            // Auto-start only once surface is valid
+            startNativeEngine();
+        }
+    }
+
     @Override public void surfaceChanged(@NonNull SurfaceHolder h, int f, int w, int h1) {}
-    @Override public void surfaceDestroyed(@NonNull SurfaceHolder h) {
+    
+    @Override 
+    public void surfaceDestroyed(@NonNull SurfaceHolder h) {
+        isSurfaceReady = false;
         isEngineRunning = false; 
     }
 
