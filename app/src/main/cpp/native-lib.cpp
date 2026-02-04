@@ -56,12 +56,12 @@ bool is_running = false;
 uint8_t current_prg_bank = 0;
 uint8_t mmc1_shift_reg = 0x10;
 
-// Correct PPU Mapping logic to prevent crashes
+// Correct PPU Mapping logic to prevent memory access crashes
 uint8_t& map_ppu(uint16_t addr) {
     addr &= 0x3FFF;
-    if (addr < 0x2000) return chr_rom[addr]; // Simplified: assume no CHR-RAM for now
-    if (addr < 0x3F00) return ppu_vram[(addr - 0x2000) % 2048]; // Mirrored Name Tables
-    return palette_ram[addr & 0x1F]; // Palette mapping
+    if (addr < 0x2000) return chr_rom[addr]; 
+    if (addr < 0x3F00) return ppu_vram[(addr - 0x2000) % 2048]; 
+    return palette_ram[addr & 0x1F];
 }
 
 uint8_t read_byte(uint16_t addr) {
@@ -108,25 +108,26 @@ void write_byte(uint16_t addr, uint8_t val) {
     }
 }
 
+// RESTORED: This was missing in the previous build
+void trigger_nmi() {
+    write_byte(0x0100 + reg_S--, (reg_PC >> 8) & 0xFF);
+    write_byte(0x0100 + reg_S--, reg_PC & 0xFF);
+    write_byte(0x0100 + reg_S--, reg_P);
+    reg_PC = (read_byte(0xFFFB) << 8) | read_byte(0xFFFA);
+    reg_P |= FLAG_I;
+}
+
 int step_cpu() {
     uint8_t op = read_byte(reg_PC++);
     uint8_t val = 0;
-    uint16_t addr_bus;
 
     switch (op) {
-        // --- Critical Missing Branching ---
         case 0x90: val = read_byte(reg_PC++); if(!(reg_P & FLAG_C)) reg_PC += (int8_t)val; return 2; // BCC
         case 0xB0: val = read_byte(reg_PC++); if(reg_P & FLAG_C) reg_PC += (int8_t)val; return 2;    // BCS
-        
-        // --- Logical Tests ---
         case 0x24: { val = read_byte(read_byte(reg_PC++)); reg_P = (reg_P & 0x3F) | (val & 0xC0); 
-                     if (!(val & reg_A)) reg_P |= FLAG_Z; else reg_P &= ~FLAG_Z; return 3; } // BIT ZP
-
-        // --- Increments/Decrements ---
-        case 0xE6: { uint8_t zp = read_byte(reg_PC++); val = read_byte(zp) + 1; write_byte(zp, val); SET_ZN(val); return 5; } // INC ZP
-        case 0xC6: { uint8_t zp = read_byte(reg_PC++); val = read_byte(zp) - 1; write_byte(zp, val); SET_ZN(val); return 5; } // DEC ZP
-        
-        // --- Essential Math & Logic (Grouped) ---
+                     if (!(val & reg_A)) reg_P |= FLAG_Z; else reg_P &= ~FLAG_Z; return 3; } // BIT
+        case 0xE6: { uint8_t zp = read_byte(reg_PC++); val = read_byte(zp) + 1; write_byte(zp, val); SET_ZN(val); return 5; } // INC
+        case 0xC6: { uint8_t zp = read_byte(reg_PC++); val = read_byte(zp) - 1; write_byte(zp, val); SET_ZN(val); return 5; } // DEC
         case 0x29: reg_A &= read_byte(reg_PC++); SET_ZN(reg_A); return 2;
         case 0x09: reg_A |= read_byte(reg_PC++); SET_ZN(reg_A); return 2;
         case 0x4A: reg_P = (reg_P & ~FLAG_C) | (reg_A & 0x01); reg_A >>= 1; SET_ZN(reg_A); return 2;
@@ -143,18 +144,17 @@ int step_cpu() {
         case 0x60: { uint16_t l = read_byte(0x0100 + ++reg_S); uint16_t h = read_byte(0x0100 + ++reg_S); reg_PC = ((h << 8) | l) + 1; return 6; }
         case 0xD0: val = read_byte(reg_PC++); if(!(reg_P & FLAG_Z)) reg_PC += (int8_t)val; return 2;
         case 0xF0: val = read_byte(reg_PC++); if(reg_P & FLAG_Z) reg_PC += (int8_t)val; return 2;
-        case 0x78: reg_P |= FLAG_I; return 2; // SEI
-        case 0x18: reg_P &= ~FLAG_C; return 2; // CLC
-        case 0x38: reg_P |= FLAG_C; return 2; // SEC
-        case 0xEA: return 2; // NOP
-        
-        default: return 1; // Unimplemented - will lead to desync
+        case 0x78: reg_P |= FLAG_I; return 2; 
+        case 0x18: reg_P &= ~FLAG_C; return 2; 
+        case 0x38: reg_P |= FLAG_C; return 2; 
+        case 0xEA: return 2; 
+        default: return 1;
     }
 }
 
 void render_frame() {
     for (int t = 0; t < 960; t++) {
-        int tile_id = ppu_vram[t]; // Simplified addressing
+        int tile_id = ppu_vram[t]; 
         int xb = (t % 32) * 8, yb = (t / 32) * 8;
         uint8_t attr_byte = ppu_vram[960 + ((yb/32)*8) + (xb/32)];
         int palette_idx = (attr_byte >> (((xb%32)/16)*2 + ((yb%32)/16)*4)) & 0x03;
