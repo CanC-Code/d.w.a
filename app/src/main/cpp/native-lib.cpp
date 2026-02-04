@@ -17,10 +17,10 @@ uint8_t chr_rom[8192];
 uint8_t sram[0x2000];
 
 // --- PPU State ---
-uint8_t ppu_vram[0x2000]; // Includes Name Tables and Palettes
-uint16_t ppu_addr_reg;    // $2006 register
+uint8_t ppu_vram[0x2000]; 
+uint16_t ppu_addr_reg;    
 bool ppu_addr_latch;
-uint8_t ppu_ctrl;         // $2000 register
+uint8_t ppu_ctrl;         
 
 // --- Video State ---
 uint32_t screen_buffer[256 * 240];
@@ -56,6 +56,12 @@ uint8_t mmc1_shift_reg = 0x10;
 
 uint8_t read_byte(uint16_t addr) {
     if (addr < 0x2000) return cpu_ram[addr % 0x0800];
+    if (addr >= 0x2000 && addr < 0x4000) {
+        if ((0x2000 + (addr % 8)) == 0x2002) {
+            ppu_addr_latch = false; 
+            return 0x80; // Fake VBlank bit to unstick game loops
+        }
+    }
     if (addr >= 0x6000 && addr < 0x8000) return sram[addr - 0x6000];
     if (addr >= 0x8000 && addr < 0xC000) return prg_rom[current_prg_bank][addr - 0x8000];
     if (addr >= 0xC000) return prg_rom[3][addr - 0xC000];
@@ -65,7 +71,6 @@ uint8_t read_byte(uint16_t addr) {
 void write_byte(uint16_t addr, uint8_t val) {
     if (addr < 0x2000) { cpu_ram[addr % 0x0800] = val; }
     else if (addr >= 0x2000 && addr < 0x4000) {
-        // PPU Registers
         uint16_t reg = 0x2000 + (addr % 8);
         if (reg == 0x2000) ppu_ctrl = val;
         else if (reg == 0x2006) {
@@ -93,24 +98,44 @@ void write_byte(uint16_t addr, uint8_t val) {
     }
 }
 
-// 6502 CPU Implementation (Essential set for boot)
 int step_cpu() {
     uint8_t op = read_byte(reg_PC++);
     uint16_t addr = 0;
     uint8_t temp = 0;
 
     switch (op) {
+        // --- Transfer ---
         case 0xA9: reg_A = read_byte(reg_PC++); SET_ZN(reg_A); return 2;
-        case 0x8D: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); write_byte((h<<8)|l, reg_A); return 4; }
-        case 0xAD: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); reg_A = read_byte((h<<8)|l); SET_ZN(reg_A); return 4; }
         case 0xA2: reg_X = read_byte(reg_PC++); SET_ZN(reg_X); return 2;
+        case 0xA0: reg_Y = read_byte(reg_PC++); SET_ZN(reg_Y); return 2;
+        case 0x8D: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); write_byte((h<<8)|l, reg_A); return 4; }
+        case 0x8E: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); write_byte((h<<8)|l, reg_X); return 4; }
+        case 0xAD: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); reg_A = read_byte((h<<8)|l); SET_ZN(reg_A); return 4; }
         case 0x9A: reg_S = reg_X; return 2;
+
+        // --- Logic/Math ---
+        case 0x29: reg_A &= read_byte(reg_PC++); SET_ZN(reg_A); return 2;
+        case 0xC9: temp = read_byte(reg_PC++); if(reg_A >= temp) reg_P |= FLAG_C; else reg_P &= ~FLAG_C; SET_ZN(reg_A - temp); return 2;
+        case 0xE0: temp = read_byte(reg_PC++); if(reg_X >= temp) reg_P |= FLAG_C; else reg_P &= ~FLAG_C; SET_ZN(reg_X - temp); return 2;
+        case 0xC0: temp = read_byte(reg_PC++); if(reg_Y >= temp) reg_P |= FLAG_C; else reg_P &= ~FLAG_C; SET_ZN(reg_Y - temp); return 2;
+        case 0x24: { temp = read_byte(read_byte(reg_PC++)); reg_P = (reg_P & 0x3F) | (temp & 0xC0); if ((temp & reg_A) == 0) reg_P |= FLAG_Z; else reg_P &= ~FLAG_Z; return 3; }
+        case 0xE6: { uint8_t a = read_byte(reg_PC++); temp = read_byte(a) + 1; write_byte(a, temp); SET_ZN(temp); return 5; }
+        case 0xCA: reg_X--; SET_ZN(reg_X); return 2;
+        case 0x88: reg_Y--; SET_ZN(reg_Y); return 2;
+
+        // --- Branch/Jump ---
         case 0x4C: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); reg_PC = (h<<8)|l; return 3; }
         case 0x20: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); uint16_t ret = reg_PC - 1; write_byte(0x0100 + reg_S--, (ret >> 8) & 0xFF); write_byte(0x0100 + reg_S--, ret & 0xFF); reg_PC = (h << 8) | l; return 6; }
         case 0x60: { uint16_t l = read_byte(0x0100 + ++reg_S); uint16_t h = read_byte(0x0100 + ++reg_S); reg_PC = ((h << 8) | l) + 1; return 6; }
-        case 0xEA: return 2;
+        case 0xD0: temp = read_byte(reg_PC++); if(!(reg_P & FLAG_Z)) reg_PC += (int8_t)temp; return 2;
+        case 0xF0: temp = read_byte(reg_PC++); if(reg_P & FLAG_Z) reg_PC += (int8_t)temp; return 2;
+        case 0x10: temp = read_byte(reg_PC++); if(!(reg_P & FLAG_N)) reg_PC += (int8_t)temp; return 2;
+        case 0x30: temp = read_byte(reg_PC++); if(reg_P & FLAG_N) reg_PC += (int8_t)temp; return 2;
+
+        // --- System ---
         case 0x78: reg_P |= FLAG_I; return 2;
         case 0xD8: reg_P &= ~FLAG_D; return 2;
+        case 0xEA: return 2;
         default: return 1;
     }
 }
@@ -118,20 +143,16 @@ int step_cpu() {
 
 
 void render_frame() {
-    // Render Background Name Table 0 (at VRAM $0000 - $03BF)
     for (int t = 0; t < 960; t++) {
         int tile_id = ppu_vram[t]; 
         int xb = (t % 32) * 8, yb = (t / 32) * 8;
-        
         for (int row = 0; row < 8; row++) {
-            // Read planes from CHR-ROM (Graphics Data)
             uint8_t p1 = chr_rom[tile_id * 16 + row];
             uint8_t p2 = chr_rom[tile_id * 16 + row + 8];
-            
             for (int col = 0; col < 8; col++) {
                 int pix = ((p1 >> (7 - col)) & 1) | (((p2 >> (7 - col)) & 1) << 1);
-                // Simple Palette Mapping
-                uint32_t color = (pix == 0) ? 0xFF000000 : nes_palette[pix + 0x11];
+                // Use background palette 0 (indices 0x01-0x03)
+                uint32_t color = (pix == 0) ? 0xFF000000 : nes_palette[pix + 0x01];
                 screen_buffer[(yb + row) * 256 + (xb + col)] = color;
             }
         }
@@ -142,7 +163,6 @@ void master_clock() {
     auto next = std::chrono::steady_clock::now();
     while (is_running) {
         int cycles = 0;
-        // Running ~30,000 cycles per frame to simulate NES speed
         while (cycles < 29780) { cycles += step_cpu(); }
         render_frame();
         next += std::chrono::microseconds(16666); 
@@ -154,22 +174,16 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv* env, jobject thiz, jstring filesDir) {
     const char* cPath = env->GetStringUTFChars(filesDir, nullptr);
     std::string pathStr(cPath);
-
     for(int i = 0; i < 4; i++) {
         std::ifstream in(pathStr + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
         if (in.is_open()) in.read((char*)prg_rom[i], 16384);
     }
-
     std::ifstream chr_in(pathStr + "/chr_rom.bin", std::ios::binary);
     if (chr_in.is_open()) chr_in.read((char*)chr_rom, 8192);
 
     reg_PC = (read_byte(0xFFFD) << 8) | read_byte(0xFFFC);
-    reg_S = 0xFD; 
-    reg_P = FLAG_I | FLAG_U;
-    
-    // Reset PPU State
-    ppu_addr_latch = false;
-    ppu_addr_reg = 0;
+    reg_S = 0xFD; reg_P = FLAG_I | FLAG_U;
+    ppu_addr_latch = false; ppu_addr_reg = 0;
     
     is_running = true;
     std::thread(master_clock).detach();
@@ -189,21 +203,13 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstri
     const char* cRomPath = env->GetStringUTFChars(romPath, nullptr);
     const char* cOutDir = env->GetStringUTFChars(outDir, nullptr);
     std::ifstream in(cRomPath, std::ios::binary);
-
-    in.seekg(16); // Skip iNES Header
-
+    in.seekg(16);
     for (int i = 0; i < 4; i++) {
         std::ofstream out(std::string(cOutDir) + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
-        char bankData[16384];
-        in.read(bankData, 16384);
-        out.write(bankData, 16384);
+        char bankData[16384]; in.read(bankData, 16384); out.write(bankData, 16384);
     }
-
     std::ofstream chr_out(std::string(cOutDir) + "/chr_rom.bin", std::ios::binary);
-    char chrData[8192];
-    in.read(chrData, 8192);
-    chr_out.write(chrData, 8192);
-
+    char chrData[8192]; in.read(chrData, 8192); chr_out.write(chrData, 8192);
     env->ReleaseStringUTFChars(romPath, cRomPath);
     env->ReleaseStringUTFChars(outDir, cOutDir);
     return env->NewStringUTF("Success");
