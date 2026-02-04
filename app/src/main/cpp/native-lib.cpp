@@ -6,6 +6,7 @@
 #include <android/bitmap.h>
 #include <thread>
 #include <chrono>
+#include <mutex>
 
 #define LOG_TAG "DWA_NATIVE"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -18,14 +19,15 @@ uint8_t sram[0x2000];
 uint8_t controller_state = 0, controller_shift = 0;
 
 // --- PPU State ---
-uint8_t ppu_vram[2048]; // Physical Name Table RAM
-uint8_t palette_ram[32]; // Physical Palette RAM
+uint8_t ppu_vram[2048]; 
+uint8_t palette_ram[32]; 
 uint16_t ppu_addr_reg;    
 bool ppu_addr_latch;
 uint8_t ppu_ctrl, ppu_mask, ppu_status, ppu_data_buffer; 
 
-// --- Video State ---
+// --- Video & Sync ---
 uint32_t screen_buffer[256 * 240];
+std::mutex buffer_mutex; 
 uint32_t nes_palette[64] = {
     0xFF666666, 0xFF002A88, 0xFF1412A7, 0xFF3B00A4, 0xFF5C007E, 0xFF6E0040, 0xFF6C0600, 0xFF561D00,
     0xFF333500, 0xFF0B4800, 0xFF005200, 0xFF004F08, 0xFF00404D, 0xFF000000, 0xFF000000, 0xFF000000,
@@ -56,7 +58,6 @@ bool is_running = false;
 uint8_t current_prg_bank = 0;
 uint8_t mmc1_shift_reg = 0x10;
 
-// Correct PPU Mapping logic to prevent memory access crashes
 uint8_t& map_ppu(uint16_t addr) {
     addr &= 0x3FFF;
     if (addr < 0x2000) return chr_rom[addr]; 
@@ -108,7 +109,6 @@ void write_byte(uint16_t addr, uint8_t val) {
     }
 }
 
-// RESTORED: This was missing in the previous build
 void trigger_nmi() {
     write_byte(0x0100 + reg_S--, (reg_PC >> 8) & 0xFF);
     write_byte(0x0100 + reg_S--, reg_PC & 0xFF);
@@ -120,14 +120,13 @@ void trigger_nmi() {
 int step_cpu() {
     uint8_t op = read_byte(reg_PC++);
     uint8_t val = 0;
-
     switch (op) {
-        case 0x90: val = read_byte(reg_PC++); if(!(reg_P & FLAG_C)) reg_PC += (int8_t)val; return 2; // BCC
-        case 0xB0: val = read_byte(reg_PC++); if(reg_P & FLAG_C) reg_PC += (int8_t)val; return 2;    // BCS
+        case 0x90: val = read_byte(reg_PC++); if(!(reg_P & FLAG_C)) reg_PC += (int8_t)val; return 2;
+        case 0xB0: val = read_byte(reg_PC++); if(reg_P & FLAG_C) reg_PC += (int8_t)val; return 2;
         case 0x24: { val = read_byte(read_byte(reg_PC++)); reg_P = (reg_P & 0x3F) | (val & 0xC0); 
-                     if (!(val & reg_A)) reg_P |= FLAG_Z; else reg_P &= ~FLAG_Z; return 3; } // BIT
-        case 0xE6: { uint8_t zp = read_byte(reg_PC++); val = read_byte(zp) + 1; write_byte(zp, val); SET_ZN(val); return 5; } // INC
-        case 0xC6: { uint8_t zp = read_byte(reg_PC++); val = read_byte(zp) - 1; write_byte(zp, val); SET_ZN(val); return 5; } // DEC
+                     if (!(val & reg_A)) reg_P |= FLAG_Z; else reg_P &= ~FLAG_Z; return 3; }
+        case 0xE6: { uint8_t zp = read_byte(reg_PC++); val = read_byte(zp) + 1; write_byte(zp, val); SET_ZN(val); return 5; }
+        case 0xC6: { uint8_t zp = read_byte(reg_PC++); val = read_byte(zp) - 1; write_byte(zp, val); SET_ZN(val); return 5; }
         case 0x29: reg_A &= read_byte(reg_PC++); SET_ZN(reg_A); return 2;
         case 0x09: reg_A |= read_byte(reg_PC++); SET_ZN(reg_A); return 2;
         case 0x4A: reg_P = (reg_P & ~FLAG_C) | (reg_A & 0x01); reg_A >>= 1; SET_ZN(reg_A); return 2;
@@ -147,24 +146,23 @@ int step_cpu() {
         case 0x78: reg_P |= FLAG_I; return 2; 
         case 0x18: reg_P &= ~FLAG_C; return 2; 
         case 0x38: reg_P |= FLAG_C; return 2; 
-        case 0xEA: return 2; 
+        case 0xEA: return 2;
         default: return 1;
     }
 }
 
 void render_frame() {
     for (int t = 0; t < 960; t++) {
-        int tile_id = ppu_vram[t]; 
+        int tile_id = ppu_vram[t];
         int xb = (t % 32) * 8, yb = (t / 32) * 8;
         uint8_t attr_byte = ppu_vram[960 + ((yb/32)*8) + (xb/32)];
         int palette_idx = (attr_byte >> (((xb%32)/16)*2 + ((yb%32)/16)*4)) & 0x03;
-
         for (int row = 0; row < 8; row++) {
             uint8_t p1 = chr_rom[tile_id * 16 + row], p2 = chr_rom[tile_id * 16 + row + 8];
             for (int col = 0; col < 8; col++) {
                 int pix = ((p1 >> (7-col)) & 1) | (((p2 >> (7-col)) & 1) << 1);
-                if (pix != 0) screen_buffer[(yb + row) * 256 + (xb + col)] = nes_palette[palette_ram[palette_idx * 4 + pix] & 0x3F];
-                else screen_buffer[(yb + row) * 256 + (xb + col)] = 0xFF000000;
+                uint32_t color = (pix != 0) ? nes_palette[palette_ram[palette_idx * 4 + pix] & 0x3F] : 0xFF000000;
+                screen_buffer[(yb + row) * 256 + (xb + col)] = color;
             }
         }
     }
@@ -178,10 +176,41 @@ void master_clock() {
         while (cycles < 29780) { cycles += step_cpu(); }
         ppu_status |= 0x80;
         if (ppu_ctrl & 0x80) trigger_nmi(); 
-        render_frame();
+        {
+            std::lock_guard<std::mutex> lock(buffer_mutex);
+            render_frame();
+        }
         next += std::chrono::microseconds(16666); 
         std::this_thread::sleep_until(next);
     }
+}
+
+// RESTORED ROM EXTRACTOR
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstring romPath, jstring outDir) {
+    const char* cPath = env->GetStringUTFChars(romPath, nullptr);
+    const char* cOut = env->GetStringUTFChars(outDir, nullptr);
+    std::string outDirStr(cOut);
+    std::ifstream nes(cPath, std::ios::binary);
+    if (!nes.is_open()) return env->NewStringUTF("File Error");
+    char header[16]; nes.read(header, 16);
+    if (header[0] != 'N') return env->NewStringUTF("Invalid ROM");
+    
+    // Simple extraction for NROM/MMC1
+    for (int i = 0; i < 4; i++) {
+        std::vector<char> buffer(16384, 0);
+        if (i < header[4]) nes.read(buffer.data(), 16384);
+        std::ofstream out(outDirStr + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
+        out.write(buffer.data(), 16384);
+    }
+    std::vector<char> chr(8192, 0);
+    nes.read(chr.data(), 8192);
+    std::ofstream chrOut(outDirStr + "/chr_rom.bin", std::ios::binary);
+    chrOut.write(chr.data(), 8192);
+
+    env->ReleaseStringUTFChars(romPath, cPath);
+    env->ReleaseStringUTFChars(outDir, cOut);
+    return env->NewStringUTF("Success");
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -194,7 +223,6 @@ Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv* env, jobject thiz, jstri
     }
     std::ifstream chr_in(pathStr + "/chr_rom.bin", std::ios::binary);
     if (chr_in.is_open()) chr_in.read((char*)chr_rom, 8192);
-
     reg_PC = (read_byte(0xFFFD) << 8) | read_byte(0xFFFC);
     reg_S = 0xFD; reg_P = 0x24;
     is_running = true;
@@ -206,7 +234,10 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv* env, jobject thiz, jobject bitmap) {
     void* pixels;
     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
-    memcpy(pixels, screen_buffer, 256 * 240 * 4);
+    {
+        std::lock_guard<std::mutex> lock(buffer_mutex);
+        memcpy(pixels, screen_buffer, 256 * 240 * 4);
+    }
     AndroidBitmap_unlockPixels(env, bitmap);
 }
 
