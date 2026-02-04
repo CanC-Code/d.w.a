@@ -23,21 +23,25 @@ uint16_t reg_PC;
 uint8_t reg_A, reg_X, reg_Y, reg_S, reg_P;
 bool is_running = false;
 
-// --- PPU & Mapper State ---
+// --- MMC1 & PPU State ---
 uint8_t ppu_status = 0;
 uint8_t mmc1_shift_reg = 0x10;
-uint8_t mmc1_control = 0x0C; // Default MMC1 state
 uint8_t current_prg_bank = 0;
+
+// Helper to set CPU flags (P register)
+void set_nz(uint8_t val) {
+    reg_P = (reg_P & 0x7D) | (val & 0x80) | ((val == 0) << 1);
+}
 
 // --- Memory Access Logic ---
 uint8_t read_byte(uint16_t addr) {
     if (addr < 0x2000) return cpu_ram[addr % 0x0800];
     if (addr == 0x2002) {
         uint8_t s = ppu_status;
-        ppu_status &= ~0x80; // Reading clears VBlank
+        ppu_status &= ~0x80; 
         return s;
     }
-    // MMC1 Logic: $8000-$BFFF is switchable, $C000-$FFFF is fixed (Bank 3)
+    // MMC1 Mapping: $8000-$BFFF is switchable, $C000-$FFFF is fixed to Bank 3
     if (addr >= 0x8000 && addr < 0xC000) return prg_rom[current_prg_bank][addr - 0x8000];
     if (addr >= 0xC000) return prg_rom[3][addr - 0xC000];
     return 0;
@@ -46,15 +50,13 @@ uint8_t read_byte(uint16_t addr) {
 void write_byte(uint16_t addr, uint8_t val) {
     if (addr < 0x2000) cpu_ram[addr % 0x0800] = val;
     else if (addr >= 0x8000) {
-        // MMC1 Serial Write Logic
         if (val & 0x80) {
-            mmc1_shift_reg = 0x10;
+            mmc1_shift_reg = 0x10; // Reset MMC1
         } else {
             bool complete = (mmc1_shift_reg & 0x01);
             mmc1_shift_reg >>= 1;
             mmc1_shift_reg |= ((val & 0x01) << 4);
             if (complete) {
-                // Determine which MMC1 register to write to based on addr
                 uint8_t target = (addr >> 13) & 0x03;
                 if (target == 3) current_prg_bank = mmc1_shift_reg & 0x0F;
                 mmc1_shift_reg = 0x10;
@@ -65,52 +67,68 @@ void write_byte(uint16_t addr, uint8_t val) {
 
 
 
-// --- Core CPU Execution (Simplified Dispatcher) ---
+// --- Core CPU Execution (Expanded) ---
 void step_cpu() {
     uint8_t opcode = read_byte(reg_PC++);
     switch (opcode) {
-        case 0x78: break; // SEI (Ignore Interrupts)
-        case 0xD8: break; // CLD (Clear Decimal)
-        case 0xA9: reg_A = read_byte(reg_PC++); break; // LDA Immediate
-        case 0xAD: { // LDA Absolute
+        case 0x78: break; // SEI
+        case 0xD8: reg_P &= ~0x08; break; // CLD
+        case 0xA9: reg_A = read_byte(reg_PC++); set_nz(reg_A); break; // LDA Imm
+        case 0xA2: reg_X = read_byte(reg_PC++); set_nz(reg_X); break; // LDX Imm
+        case 0xA0: reg_Y = read_byte(reg_PC++); set_nz(reg_Y); break; // LDY Imm
+        case 0x8D: { // STA Abs
             uint16_t lo = read_byte(reg_PC++);
             uint16_t hi = read_byte(reg_PC++);
-            reg_A = read_byte((hi << 8) | lo);
+            write_byte((hi << 8) | lo, reg_A);
             break;
         }
-        case 0x4C: { // JMP Absolute
+        case 0x9A: reg_S = reg_X; break; // TXS
+        case 0x20: { // JSR
+            uint16_t lo = read_byte(reg_PC++);
+            uint16_t hi = read_byte(reg_PC++);
+            uint16_t ret = reg_PC - 1;
+            write_byte(0x0100 + reg_S--, (ret >> 8) & 0xFF);
+            write_byte(0x0100 + reg_S--, ret & 0xFF);
+            reg_PC = (hi << 8) | lo;
+            break;
+        }
+        case 0x60: { // RTS
+            uint16_t lo = read_byte(0x0100 + ++reg_S);
+            uint16_t hi = read_byte(0x0100 + ++reg_S);
+            reg_PC = ((hi << 8) | lo) + 1;
+            break;
+        }
+        case 0x4C: { // JMP
             uint16_t lo = read_byte(reg_PC++);
             uint16_t hi = read_byte(reg_PC++);
             reg_PC = (hi << 8) | lo;
             break;
         }
-        // Additional 6502 opcodes would follow here...
     }
-    
-    // Safety: Simulation of VBlank to satisfy initialization loops
-    static int cycle_count = 0;
-    if (++cycle_count > 2000) {
+
+    // PPU status simulation to keep game loops moving
+    static int cycle_sim = 0;
+    if (++cycle_sim > 2500) {
         ppu_status |= 0x80;
-        cycle_count = 0;
+        cycle_sim = 0;
     }
 }
 
 void master_clock() {
     while (is_running) {
         auto start = std::chrono::steady_clock::now();
-        
-        // Execute one frame's worth of instructions
         for (int i = 0; i < 29780; i++) step_cpu();
-
-        // Render logic: Basic background clear
+        
         {
             std::lock_guard<std::mutex> lock(buffer_mutex);
-            for (int i = 0; i < 256 * 240; i++) screen_buffer[i] = 0xFF1412A7; // DW Blue
+            // After implementing PPU rendering, replace this clear with tile drawing logic
+            for (int i = 0; i < 256 * 240; i++) screen_buffer[i] = 0xFF1412A7; 
         }
-
         std::this_thread::sleep_until(start + std::chrono::milliseconds(16));
     }
 }
+
+
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstring romPath, jstring outDir) {
@@ -120,11 +138,9 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstri
     std::ifstream nes(cPath, std::ios::binary);
 
     if (!nes.is_open()) return env->NewStringUTF("File Error");
-
     uint8_t header[16];
     nes.read((char*)header, 16);
 
-    // Skip 16-byte header, extract 4 PRG banks
     for (int i = 0; i < 4; i++) {
         std::vector<char> buffer(16384);
         nes.read(buffer.data(), 16384);
@@ -132,7 +148,6 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstri
         out.write(buffer.data(), 16384);
     }
 
-    // Extract 16KB CHR
     std::vector<char> chrBuffer(16384);
     nes.read(chrBuffer.data(), 16384);
     std::ofstream chrOut(outDirStr + "/chr_rom.bin", std::ios::binary);
@@ -156,7 +171,9 @@ Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv* env, jobject thiz, jstri
     std::ifstream chr_in(pathStr + "/chr_rom.bin", std::ios::binary);
     if (chr_in.is_open()) chr_in.read((char*)chr_rom, 16384);
 
-    // Read Reset Vector from the end of Bank 3
+    // Initial CPU State
+    reg_S = 0xFD;
+    reg_P = 0x24; 
     uint16_t lo = prg_rom[3][0x3FFC];
     uint16_t hi = prg_rom[3][0x3FFD];
     reg_PC = (hi << 8) | lo;
@@ -179,5 +196,5 @@ Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv* env, jobject thiz, jo
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_injectInput(JNIEnv* env, jobject thiz, jint buttonBit, jboolean isPressed) {
-    // Basic controller input placeholder
+    // Input handling logic here
 }
