@@ -1,4 +1,4 @@
-Name: Android CI
+name: Android CI
 on: 
   push:
     branches: [ main, master ]
@@ -17,14 +17,13 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
+          cache: 'gradle' # Speeds up subsequent runs
 
       - name: Install and Map ImageMagick
         run: |
           sudo apt-get update
           sudo apt-get install -y imagemagick
-          # Fix for "magick command not found": 
-          # Ubuntu's apt installs v6 where the binary is 'convert'.
-          # We link 'magick' to 'convert' to satisfy your scripts.
+          # Create symlink so 'magick' command works with v6 binaries
           sudo ln -s /usr/bin/convert /usr/bin/magick
 
       - name: Execute Runtime Asset Generation
@@ -35,7 +34,6 @@ jobs:
           chmod +x runtime/*.sh
           for script in runtime/*.sh; do
             echo "Running $script..."
-            # Using bash explicitly to avoid potential dash/sh compatibility issues
             /bin/bash ./"$script"
           done
 
@@ -49,4 +47,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dw-native-port
-          path: app/build/outputs/apk/debug/app-debug.apk
+          # Using a wildcard to ensure it finds the APK even if flavor folders exist
+          path: app/build/outputs/apk/debug/*.apk
