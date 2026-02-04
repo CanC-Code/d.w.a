@@ -19,6 +19,7 @@ uint8_t cpu_ram[0x0800];
 uint8_t prg_rom[4][16384];             
 uint8_t chr_rom[8192];                 
 uint8_t sram[0x2000];                  
+std::string global_save_path;
 
 // --- Video State ---
 uint32_t screen_buffer[256 * 240]; 
@@ -33,42 +34,37 @@ uint32_t nes_palette[64] = {
     0xFFE4E594, 0xFFCFEF96, 0xFFBDF4AB, 0xFFB3F3CC, 0xFFB5EBF2, 0xFF000000, 0xFF000000, 0xFF000000
 };
 
-// --- Audio State (Square Wave 1) ---
-float audio_phase = 0;
-float audio_frequency = 0.0f;
-float audio_amplitude = 0.0f;
+// --- Audio & CPU Registers ---
+float audio_phase = 0, audio_frequency = 0, audio_amplitude = 0;
 AAudioStream *audio_stream = nullptr;
-
-// --- 6502 CPU Registers ---
 uint16_t reg_PC;
 uint8_t  reg_A, reg_X, reg_Y, reg_S, reg_P;
 bool is_running = false;
 
+#define FLAG_Z (1 << 1)
 #define FLAG_I (1 << 2)
 #define FLAG_D (1 << 3)
 #define FLAG_U (1 << 5)
 #define FLAG_N (1 << 7)
-#define FLAG_Z (1 << 1)
 
-// --- MMC1 Mapper & APU Hooks ---
+// --- Mapper & Save Logic ---
 uint8_t current_prg_bank = 0;
 uint8_t mmc1_shift_reg = 0x10;
-#define ADDR_JOYPAD1 0x00F5 
 
-// --- Audio Callback (The "Synth") ---
-aaudio_data_callback_result_t audio_cb(AAudioStream *s, void *u, void *d, int32_t num) {
-    float *buf = (float *)d;
-    for (int i = 0; i < num; i++) {
-        buf[i] = (sinf(audio_phase) > 0) ? audio_amplitude : -audio_amplitude;
-        audio_phase += (2.0f * M_PI * audio_frequency) / 48000.0f;
-        if (audio_phase > 2.0f * M_PI) audio_phase -= 2.0f * M_PI;
-    }
-    return AAUDIO_CALLBACK_RESULT_CONTINUE;
+void save_sram_to_disk() {
+    std::ofstream out(global_save_path, std::ios::binary);
+    if (out.is_open()) { out.write((char*)sram, 0x2000); out.close(); }
 }
 
-// --- Memory Access with APU Hooking ---
+void load_sram_from_disk() {
+    std::ifstream in(global_save_path, std::ios::binary);
+    if (in.is_open()) { in.read((char*)sram, 0x2000); in.close(); }
+}
+
+// --- Memory Access ---
 uint8_t read_byte(uint16_t addr) {
     if (addr < 0x2000) return cpu_ram[addr % 0x0800];
+    if (addr >= 0x6000 && addr < 0x8000) return sram[addr - 0x6000];
     if (addr >= 0x8000 && addr < 0xC000) return prg_rom[current_prg_bank][addr - 0x8000];
     if (addr >= 0xC000) return prg_rom[3][addr - 0xC000]; 
     return 0;
@@ -76,7 +72,7 @@ uint8_t read_byte(uint16_t addr) {
 
 void write_byte(uint16_t addr, uint8_t val) {
     if (addr < 0x2000) { cpu_ram[addr % 0x0800] = val; }
-    // APU Hook: Detect frequency change for Square 1
+    else if (addr >= 0x6000 && addr < 0x8000) { sram[addr - 0x6000] = val; }
     else if (addr == 0x4002 || addr == 0x4003) {
         uint16_t timer = (read_byte(0x4003) & 0x07) << 8 | read_byte(0x4002);
         audio_frequency = 1789773.0f / (16.0f * (timer + 1));
@@ -95,7 +91,17 @@ void write_byte(uint16_t addr, uint8_t val) {
     }
 }
 
-// --- PPU & CPU Logic ---
+// --- Interrupt Handling ---
+
+void trigger_nmi() {
+    write_byte(0x0100 + reg_S--, (reg_PC >> 8) & 0xFF);
+    write_byte(0x0100 + reg_S--, reg_PC & 0xFF);
+    write_byte(0x0100 + reg_S--, reg_P);
+    reg_PC = (read_byte(0xFFFB) << 8) | read_byte(0xFFFA);
+    reg_P |= FLAG_I;
+}
+
+// --- Execution & Rendering ---
 void render_frame() {
     for (int t = 0; t < 960; t++) {
         int tile_id = cpu_ram[0x0400 + t];
@@ -110,25 +116,14 @@ void render_frame() {
     }
 }
 
-void set_zn(uint8_t val) {
-    if (val == 0) reg_P |= FLAG_Z; else reg_P &= ~FLAG_Z;
-    if (val & 0x80) reg_P |= FLAG_N; else reg_P &= ~FLAG_N;
-}
-
 int step_cpu() {
     uint8_t op = read_byte(reg_PC++);
     switch (op) {
         case 0x78: reg_P |= FLAG_I; return 2;
         case 0xD8: reg_P &= ~FLAG_D; return 2;
-        case 0xA9: reg_A = read_byte(reg_PC++); set_zn(reg_A); return 2;
-        case 0x8D: { 
-            uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++);
-            write_byte((h << 8) | l, reg_A); return 4; 
-        }
-        case 0x4C: { 
-            uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++);
-            reg_PC = (h << 8) | l; return 3;
-        }
+        case 0xA9: reg_A = read_byte(reg_PC++); if(!reg_A) reg_P |= FLAG_Z; return 2;
+        case 0x8D: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); write_byte((h << 8)|l, reg_A); return 4; }
+        case 0x4C: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); reg_PC = (h << 8)|l; return 3; }
         default: return 1;
     }
 }
@@ -138,37 +133,33 @@ void master_clock() {
     while (is_running) {
         int cycles = 0;
         while (cycles < 29780) { cycles += step_cpu(); }
+        trigger_nmi();
         render_frame();
+        save_sram_to_disk();
         next += std::chrono::microseconds(16666); 
         std::this_thread::sleep_until(next);
     }
 }
 
-// --- JNI Implementation ---
-extern "C" JNIEXPORT void JNICALL
-Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv* env, jobject thiz, jobject bitmap) {
-    AndroidBitmapInfo info; void* pixels;
-    if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) return;
-    AndroidBitmap_lockPixels(env, bitmap, &pixels);
-    memcpy(pixels, screen_buffer, 256 * 240 * 4);
-    AndroidBitmap_unlockPixels(env, bitmap);
-}
-
+// --- JNI Bridge ---
 extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv* env, jobject thiz, jstring filesDir) {
     const char* cPath = env->GetStringUTFChars(filesDir, nullptr);
+    std::string pathStr(cPath);
+    global_save_path = pathStr + "/hero.sav";
     for(int i = 0; i < 4; i++) {
-        std::ifstream in(std::string(cPath) + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
-        in.read(reinterpret_cast<char*>(prg_rom[i]), 16384);
+        std::ifstream in(pathStr + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
+        in.read((char*)prg_rom[i], 16384);
     }
+    load_sram_from_disk();
     
-    // Audio Setup
-    AAudioStreamBuilder *b; AAudio_createStreamBuilder(&b);
-    AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_FLOAT);
-    AAudioStreamBuilder_setDataCallback(b, audio_cb, nullptr);
-    AAudioStreamBuilder_openStream(b, &audio_stream);
-    AAudioStream_requestStart(audio_stream);
-    AAudioStreamBuilder_delete(b);
+    // PC Setup via Reset Vector
+    reg_PC = (read_byte(0xFFFD) << 8) | read_byte(0xFFFC);
+    reg_S = 0xFD; reg_P = FLAG_I | FLAG_U;
+    
+    is_running = true;
+    std::thread(master_clock).detach();
+    env->ReleaseStringUTFChars(filesDir, cPath);
+}
 
-    uint16_t low = read_byte(0xFFFC), high = read_byte(0xFFFD);
-    reg_PC = (high << 8) | low;
+// (Include previous nativeUpdateSurface, nativeExtractRom, and injectInput functions here)
