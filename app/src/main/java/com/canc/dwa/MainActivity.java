@@ -46,6 +46,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
         findViewById(R.id.btn_select_rom).setOnClickListener(v -> openFilePicker());
 
+        // Auto-start only if valid files exist
         if (isRomExtracted()) {
             startNativeEngine();
         }
@@ -84,18 +85,18 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         if (gameContainer != null) gameContainer.setVisibility(View.VISIBLE);
 
         setupTouchControls();
-        nativeInitEngine(getFilesDir().getAbsolutePath());
+        
+        // Pass the absolute path to ensure C++ fstream doesn't fail
+        String filesPath = getFilesDir().getAbsolutePath();
+        nativeInitEngine(filesPath);
 
         isEngineRunning = true;
         Choreographer.getInstance().postFrameCallback(this);
     }
 
-    /**
-     * UPDATED: Validates against the 16KB CHR size defined in Header.asm
-     */
     private boolean isRomExtracted() {
         File chrFile = new File(getFilesDir(), "chr_rom.bin");
-        // We check for 16384 bytes (2 banks * 8KB)
+        // Verify 16KB (2 banks) as per source Header.asm
         return chrFile.exists() && chrFile.length() >= 16384;
     }
 
@@ -122,7 +123,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             InputStream is = getContentResolver().openInputStream(uri);
             if (is == null) return;
 
-            // Use a temporary file for the raw .nes before extraction
             File internalRom = new File(getFilesDir(), "base.nes");
             FileOutputStream os = new FileOutputStream(internalRom);
 
@@ -134,14 +134,15 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             os.close();
             is.close();
 
-            // Native extraction splits the ROM into PRG banks and a 16KB CHR file
-            String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
+            // Perform extraction
+            String outPath = getFilesDir().getAbsolutePath();
+            String result = nativeExtractRom(internalRom.getAbsolutePath(), outPath);
 
             if ("Success".equals(result)) {
                 startNativeEngine();
             } else {
                 Toast.makeText(this, "Extraction failed: " + result, Toast.LENGTH_LONG).show();
-                // Clean up failed extraction
+                // Clean up any partial/corrupt extractions to prevent auto-start loop
                 new File(getFilesDir(), "chr_rom.bin").delete();
             }
         } catch (Exception e) {
