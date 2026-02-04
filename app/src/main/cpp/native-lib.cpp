@@ -21,6 +21,7 @@ uint8_t ppu_vram[0x2000];
 uint16_t ppu_addr_reg;    
 bool ppu_addr_latch;
 uint8_t ppu_ctrl;         
+uint8_t ppu_data_buffer; // Internal PPU read buffer
 
 // --- Video State ---
 uint32_t screen_buffer[256 * 240];
@@ -57,9 +58,17 @@ uint8_t mmc1_shift_reg = 0x10;
 uint8_t read_byte(uint16_t addr) {
     if (addr < 0x2000) return cpu_ram[addr % 0x0800];
     if (addr >= 0x2000 && addr < 0x4000) {
-        if ((0x2000 + (addr % 8)) == 0x2002) {
+        uint16_t reg = 0x2000 + (addr % 8);
+        if (reg == 0x2002) {
             ppu_addr_latch = false; 
-            return 0x80; // Fake VBlank bit to unstick game loops
+            return 0x80; // Status: VBlank active
+        }
+        if (reg == 0x2007) {
+            uint8_t data = ppu_data_buffer;
+            uint16_t target = ppu_addr_reg & 0x3FFF;
+            if (target >= 0x2000 && target < 0x3F00) ppu_data_buffer = ppu_vram[target - 0x2000];
+            ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
+            return data;
         }
     }
     if (addr >= 0x6000 && addr < 0x8000) return sram[addr - 0x6000];
@@ -104,20 +113,25 @@ int step_cpu() {
     uint8_t temp = 0;
 
     switch (op) {
-        // --- Transfer ---
+        // --- Store ---
+        case 0x85: write_byte(read_byte(reg_PC++), reg_A); return 3;
+        case 0x8D: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); write_byte((h<<8)|l, reg_A); return 4; }
+        case 0x9D: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); write_byte(((h<<8)|l) + reg_X, reg_A); return 5; }
+        case 0x8E: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); write_byte((h<<8)|l, reg_X); return 4; }
+
+        // --- Load ---
         case 0xA9: reg_A = read_byte(reg_PC++); SET_ZN(reg_A); return 2;
+        case 0xA5: reg_A = read_byte(read_byte(reg_PC++)); SET_ZN(reg_A); return 3;
+        case 0xAD: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); reg_A = read_byte((h<<8)|l); SET_ZN(reg_A); return 4; }
+        case 0xBD: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); reg_A = read_byte(((h<<8)|l) + reg_X); SET_ZN(reg_A); return 4; }
         case 0xA2: reg_X = read_byte(reg_PC++); SET_ZN(reg_X); return 2;
         case 0xA0: reg_Y = read_byte(reg_PC++); SET_ZN(reg_Y); return 2;
-        case 0x8D: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); write_byte((h<<8)|l, reg_A); return 4; }
-        case 0x8E: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); write_byte((h<<8)|l, reg_X); return 4; }
-        case 0xAD: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); reg_A = read_byte((h<<8)|l); SET_ZN(reg_A); return 4; }
         case 0x9A: reg_S = reg_X; return 2;
 
         // --- Logic/Math ---
         case 0x29: reg_A &= read_byte(reg_PC++); SET_ZN(reg_A); return 2;
         case 0xC9: temp = read_byte(reg_PC++); if(reg_A >= temp) reg_P |= FLAG_C; else reg_P &= ~FLAG_C; SET_ZN(reg_A - temp); return 2;
         case 0xE0: temp = read_byte(reg_PC++); if(reg_X >= temp) reg_P |= FLAG_C; else reg_P &= ~FLAG_C; SET_ZN(reg_X - temp); return 2;
-        case 0xC0: temp = read_byte(reg_PC++); if(reg_Y >= temp) reg_P |= FLAG_C; else reg_P &= ~FLAG_C; SET_ZN(reg_Y - temp); return 2;
         case 0x24: { temp = read_byte(read_byte(reg_PC++)); reg_P = (reg_P & 0x3F) | (temp & 0xC0); if ((temp & reg_A) == 0) reg_P |= FLAG_Z; else reg_P &= ~FLAG_Z; return 3; }
         case 0xE6: { uint8_t a = read_byte(reg_PC++); temp = read_byte(a) + 1; write_byte(a, temp); SET_ZN(temp); return 5; }
         case 0xCA: reg_X--; SET_ZN(reg_X); return 2;
@@ -130,7 +144,6 @@ int step_cpu() {
         case 0xD0: temp = read_byte(reg_PC++); if(!(reg_P & FLAG_Z)) reg_PC += (int8_t)temp; return 2;
         case 0xF0: temp = read_byte(reg_PC++); if(reg_P & FLAG_Z) reg_PC += (int8_t)temp; return 2;
         case 0x10: temp = read_byte(reg_PC++); if(!(reg_P & FLAG_N)) reg_PC += (int8_t)temp; return 2;
-        case 0x30: temp = read_byte(reg_PC++); if(reg_P & FLAG_N) reg_PC += (int8_t)temp; return 2;
 
         // --- System ---
         case 0x78: reg_P |= FLAG_I; return 2;
@@ -151,8 +164,8 @@ void render_frame() {
             uint8_t p2 = chr_rom[tile_id * 16 + row + 8];
             for (int col = 0; col < 8; col++) {
                 int pix = ((p1 >> (7 - col)) & 1) | (((p2 >> (7 - col)) & 1) << 1);
-                // Use background palette 0 (indices 0x01-0x03)
-                uint32_t color = (pix == 0) ? 0xFF000000 : nes_palette[pix + 0x01];
+                // Map to palette (offset by 0x30 to get standard title screen colors)
+                uint32_t color = (pix == 0) ? 0xFF000000 : nes_palette[pix + 0x31];
                 screen_buffer[(yb + row) * 256 + (xb + col)] = color;
             }
         }
