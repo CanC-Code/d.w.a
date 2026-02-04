@@ -4,19 +4,18 @@
     android:layout_height="match_parent"
     android:background="#000000">
 
+    <Button
+        android:id="@+id/btn_select_rom"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_centerInParent="true"
+        android:text="Select Dragon Warrior ROM" />
+
     <SurfaceView
         android:id="@+id/gameView"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_centerInParent="true" />
+        android:layout_height="240dp"
+        android:layout_above="@id/btn_select_rom"
+        android:visibility="gone" />
 
-    <ImageButton
-        android:id="@+id/btn_up"
-        android:layout_width="80dp"
-        android:layout_height="80dp"
-        android:layout_above="@+id/btn_down"
-        android:layout_alignStart="@+id/btn_down"
-        android:src="@drawable/dpad_up"
-        android:background="@android:color/transparent" />
-
-    </RelativeLayout>
+</RelativeLayout>
