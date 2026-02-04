@@ -36,18 +36,16 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
-        
+
         setupContainer = findViewById(R.id.setup_layout);
         gameContainer = findViewById(R.id.game_layout);
         gameSurface = findViewById(R.id.game_surface);
-        
-        // Ensure bitmap is mutable for JNI access
+
         screenBitmap = Bitmap.createBitmap(256, 240, Bitmap.Config.ARGB_8888);
         gameSurface.getHolder().addCallback(this);
 
         findViewById(R.id.btn_select_rom).setOnClickListener(v -> openFilePicker());
-        
-        // Auto-start if a ROM was already extracted in a previous session
+
         if (isRomExtracted()) {
             startNativeEngine();
         }
@@ -57,57 +55,54 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     public void doFrame(long frameTimeNanos) {
         if (!isEngineRunning) return;
 
-        // 1. Get latest frame from C++
         nativeUpdateSurface(screenBitmap);
 
-        // 2. Draw to SurfaceView
         Canvas canvas = gameSurface.getHolder().lockCanvas();
         if (canvas != null) {
             try {
-                // Maintain NES 4:3 Aspect Ratio within the surface
                 float scale = Math.min((float)gameSurface.getWidth() / 256, (float)gameSurface.getHeight() / 240);
                 int w = (int)(256 * scale);
                 int h = (int)(240 * scale);
                 int left = (gameSurface.getWidth() - w) / 2;
                 int top = (gameSurface.getHeight() - h) / 2;
-                
+
                 destRect.set(left, top, left + w, top + h);
-                
-                canvas.drawColor(0xFF000000); // Black background
+
+                canvas.drawColor(0xFF000000); 
                 canvas.drawBitmap(screenBitmap, null, destRect, null);
             } finally {
                 gameSurface.getHolder().unlockCanvasAndPost(canvas);
             }
         }
-        
-        // Request next frame
         Choreographer.getInstance().postFrameCallback(this);
     }
 
     private void startNativeEngine() {
-        if (isEngineRunning) return; // Prevent double threads
+        if (isEngineRunning) return; 
 
         if (setupContainer != null) setupContainer.setVisibility(View.GONE);
         if (gameContainer != null) gameContainer.setVisibility(View.VISIBLE);
-        
+
         setupTouchControls();
-        
-        // Initialize the C++ side
         nativeInitEngine(getFilesDir().getAbsolutePath());
-        
+
         isEngineRunning = true;
         Choreographer.getInstance().postFrameCallback(this);
     }
 
+    /**
+     * UPDATED: Validates against the 16KB CHR size defined in Header.asm
+     */
     private boolean isRomExtracted() {
-        // We consider the ROM "ready" if the CHR bank exists
-        return new File(getFilesDir(), "chr_rom.bin").exists();
+        File chrFile = new File(getFilesDir(), "chr_rom.bin");
+        // We check for 16384 bytes (2 banks * 8KB)
+        return chrFile.exists() && chrFile.length() >= 16384;
     }
 
     private void openFilePicker() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("*/*"); // Some NES files aren't MIME-typed correctly
+        intent.setType("*/*"); 
         startActivityForResult(intent, PICK_ROM_REQUEST);
     }
 
@@ -124,13 +119,13 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     private void copyAndExtract(Uri uri) {
         try {
-            // Open stream from Scoped Storage
             InputStream is = getContentResolver().openInputStream(uri);
             if (is == null) return;
 
+            // Use a temporary file for the raw .nes before extraction
             File internalRom = new File(getFilesDir(), "base.nes");
             FileOutputStream os = new FileOutputStream(internalRom);
-            
+
             byte[] buffer = new byte[16384];
             int length;
             while ((length = is.read(buffer)) > 0) {
@@ -139,13 +134,15 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             os.close();
             is.close();
 
-            // Extract the .nes file into the bank files the C++ engine expects
+            // Native extraction splits the ROM into PRG banks and a 16KB CHR file
             String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
-            
+
             if ("Success".equals(result)) {
                 startNativeEngine();
             } else {
                 Toast.makeText(this, "Extraction failed: " + result, Toast.LENGTH_LONG).show();
+                // Clean up failed extraction
+                new File(getFilesDir(), "chr_rom.bin").delete();
             }
         } catch (Exception e) {
             Log.e("DWA", "File error", e);
@@ -155,7 +152,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     @SuppressLint("ClickableViewAccessibility")
     private void setupTouchControls() {
-        // Bitmask values must match the controller_state logic in native-lib.cpp
         safeBind(R.id.btn_up,    0x08); 
         safeBind(R.id.btn_down,  0x04);
         safeBind(R.id.btn_left,  0x02); 
@@ -186,11 +182,9 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     @Override public void surfaceCreated(@NonNull SurfaceHolder h) {}
     @Override public void surfaceChanged(@NonNull SurfaceHolder h, int f, int w, int h1) {}
     @Override public void surfaceDestroyed(@NonNull SurfaceHolder h) {
-        // Stop the loop when the user exits the app to save battery/prevent crashes
         isEngineRunning = false; 
     }
 
-    // JNI Declarations
     public native String nativeExtractRom(String romPath, String outDir);
     public native void nativeInitEngine(String filesDir);
     public native void nativeUpdateSurface(Bitmap bitmap);
