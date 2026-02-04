@@ -17,7 +17,7 @@ uint8_t chr_rom[8192];
 uint8_t sram[0x2000];
 
 // --- PPU State ---
-uint8_t ppu_vram[0x4000]; // Increased to full range
+uint8_t ppu_vram[0x4000]; 
 uint16_t ppu_addr_reg;    
 bool ppu_addr_latch;
 uint8_t ppu_ctrl, ppu_mask, ppu_status, ppu_data_buffer; 
@@ -68,7 +68,7 @@ uint8_t read_byte(uint16_t addr) {
             uint8_t data = ppu_data_buffer;
             uint16_t target = ppu_addr_reg & 0x3FFF;
             ppu_data_buffer = ppu_vram[target];
-            if (target >= 0x3F00) data = ppu_vram[target]; // Palette reads are immediate
+            if (target >= 0x3F00) data = ppu_vram[target]; 
             ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
             return data;
         }
@@ -93,9 +93,8 @@ void write_byte(uint16_t addr, uint8_t val) {
         else if (reg == 0x2007) {
             uint16_t target = ppu_addr_reg & 0x3FFF;
             ppu_vram[target] = val;
-            if (target >= 0x3F00) { // Palette Mirroring
-                 if ((target & 0x000F) == 0) ppu_vram[0x3F00 ^ (target & 0x0010)] = val;
-            }
+            // Mirroring Palette writes
+            if (target >= 0x3F00 && (target & 0x3) == 0) ppu_vram[target ^ 0x10] = val;
             ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
         }
     }
@@ -122,25 +121,34 @@ void trigger_nmi() {
 
 int step_cpu() {
     uint8_t op = read_byte(reg_PC++);
-    uint16_t addr = 0;
     uint8_t val = 0;
 
     switch (op) {
-        // --- Core Math ---
-        case 0x69: { // ADC Immediate
+        // --- Added Math ---
+        case 0x69: { // ADC
             val = read_byte(reg_PC++);
             uint16_t sum = reg_A + val + (reg_P & FLAG_C);
             reg_P = (reg_P & ~(FLAG_C | FLAG_V)) | (sum > 0xFF ? FLAG_C : 0);
             if (~(reg_A ^ val) & (reg_A ^ sum) & 0x80) reg_P |= FLAG_V;
             reg_A = sum & 0xFF; SET_ZN(reg_A); return 2;
         }
-        case 0xE9: { // SBC Immediate
+        case 0xE9: { // SBC
             val = read_byte(reg_PC++);
-            uint16_t sub = reg_A - val - (~reg_P & FLAG_C);
+            uint16_t sub = reg_A - val - (!(reg_P & FLAG_C));
             reg_P = (reg_P & ~(FLAG_C | FLAG_V)) | (!(sub & 0x100) ? FLAG_C : 0);
             if ((reg_A ^ val) & (reg_A ^ sub) & 0x80) reg_P |= FLAG_V;
             reg_A = sub & 0xFF; SET_ZN(reg_A); return 2;
         }
+        // --- Essential Register Transfers ---
+        case 0xAA: reg_X = reg_A; SET_ZN(reg_X); return 2; // TAX
+        case 0xA8: reg_Y = reg_A; SET_ZN(reg_Y); return 2; // TAY
+        case 0x8A: reg_A = reg_X; SET_ZN(reg_A); return 2; // TXA
+        case 0x98: reg_A = reg_Y; SET_ZN(reg_A); return 2; // TYA
+        
+        // --- Branching ---
+        case 0x10: val = read_byte(reg_PC++); if(!(reg_P & FLAG_N)) reg_PC += (int8_t)val; return 2; // BPL
+        case 0x30: val = read_byte(reg_PC++); if(reg_P & FLAG_N) reg_PC += (int8_t)val; return 2;    // BMI
+
         // --- Core Ops ---
         case 0xA9: reg_A = read_byte(reg_PC++); SET_ZN(reg_A); return 2;
         case 0xAD: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); reg_A = read_byte((h<<8)|l); SET_ZN(reg_A); return 4; }
@@ -157,16 +165,13 @@ int step_cpu() {
         case 0x8E: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); write_byte((h<<8)|l, reg_X); return 4; }
         case 0xCA: reg_X--; SET_ZN(reg_X); return 2;
         case 0x88: reg_Y--; SET_ZN(reg_Y); return 2;
-        case 0xAA: reg_X = reg_A; SET_ZN(reg_X); return 2; // TAX
-        case 0xA8: reg_Y = reg_A; SET_ZN(reg_Y); return 2; // TAY
         case 0x9A: reg_S = reg_X; return 2;
-        case 0x48: write_byte(0x0100 + reg_S--, reg_A); return 3; // PHA
-        case 0x68: reg_A = read_byte(0x0100 + ++reg_S); SET_ZN(reg_A); return 4; // PLA
+        case 0x48: write_byte(0x0100 + reg_S--, reg_A); return 3; 
+        case 0x68: reg_A = read_byte(0x0100 + ++reg_S); SET_ZN(reg_A); return 4; 
         case 0x24: { val = read_byte(read_byte(reg_PC++)); reg_P = (reg_P & 0x3F) | (val & 0xC0); if ((val & reg_A) == 0) reg_P |= FLAG_Z; else reg_P &= ~FLAG_Z; return 3; }
         case 0xC9: val = read_byte(reg_PC++); if(reg_A >= val) reg_P |= FLAG_C; else reg_P &= ~FLAG_C; SET_ZN(reg_A - val); return 2;
         case 0xD0: val = read_byte(reg_PC++); if(!(reg_P & FLAG_Z)) reg_PC += (int8_t)val; return 2;
         case 0xF0: val = read_byte(reg_PC++); if(reg_P & FLAG_Z) reg_PC += (int8_t)val; return 2;
-        case 0x10: val = read_byte(reg_PC++); if(!(reg_P & FLAG_N)) reg_PC += (int8_t)val; return 2;
         case 0x4C: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); reg_PC = (h<<8)|l; return 3; }
         case 0x20: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); uint16_t ret = reg_PC - 1; write_byte(0x0100 + reg_S--, (ret >> 8) & 0xFF); write_byte(0x0100 + reg_S--, ret & 0xFF); reg_PC = (h << 8) | l; return 6; }
         case 0x60: { uint16_t l = read_byte(0x0100 + ++reg_S); uint16_t h = read_byte(0x0100 + ++reg_S); reg_PC = ((h << 8) | l) + 1; return 6; }
@@ -180,25 +185,33 @@ int step_cpu() {
 
 
 void render_frame() {
-    uint16_t nt_base = 0x2000; // Standard Name Table 0
-    int chr_offset = (ppu_ctrl & 0x10) ? 4096 : 0; // Pattern Table selection
+    uint16_t nt_base = 0x2000; 
+    int chr_offset = (ppu_ctrl & 0x10) ? 4096 : 0; 
 
     for (int t = 0; t < 960; t++) {
         int tile_id = ppu_vram[nt_base + t]; 
         int xb = (t % 32) * 8, yb = (t / 32) * 8;
         
+        // Basic Attribute Table lookup
+        int attr_x = (t % 32) / 4;
+        int attr_y = (t / 32) / 4;
+        uint8_t attr_byte = ppu_vram[nt_base + 960 + (attr_y * 8) + attr_x];
+        int shift = ((t % 32) % 4 / 2) * 2 + ((t / 32) % 4 / 2) * 4;
+        int palette_idx = (attr_byte >> shift) & 0x03;
+
         for (int row = 0; row < 8; row++) {
             uint8_t p1 = chr_rom[chr_offset + tile_id * 16 + row];
             uint8_t p2 = chr_rom[chr_offset + tile_id * 16 + row + 8];
             for (int col = 0; col < 8; col++) {
                 int bit1 = (p1 >> (7 - col)) & 1;
                 int bit2 = (p2 >> (7 - col)) & 1;
-                int color_idx = bit1 | (bit2 << 1);
+                int pixel_color = bit1 | (bit2 << 1);
                 
-                // Read from actual VRAM Palette (simplified attribute handling)
-                uint32_t color = nes_palette[ppu_vram[0x3F00 + color_idx] & 0x3F];
-                if (color_idx == 0) color = 0xFF000000; // Background transparency
-                
+                uint32_t color = 0xFF000000;
+                if (pixel_color != 0) {
+                    uint8_t pal_entry = ppu_vram[0x3F00 + (palette_idx * 4) + pixel_color];
+                    color = nes_palette[pal_entry & 0x3F];
+                }
                 screen_buffer[(yb + row) * 256 + (xb + col)] = color;
             }
         }
