@@ -1,11 +1,31 @@
-      - name: Install ImageMagick
+Name: Android CI
+on: 
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Install and Map ImageMagick
         run: |
           sudo apt-get update
           sudo apt-get install -y imagemagick
-          # Bridge the version gap: link 'magick' to 'convert' if it doesn't exist
-          if ! command -v magick &> /dev/null; then
-            sudo ln -s /usr/bin/convert /usr/bin/magick
-          fi
+          # Fix for "magick command not found": 
+          # Ubuntu's apt installs v6 where the binary is 'convert'.
+          # We link 'magick' to 'convert' to satisfy your scripts.
+          sudo ln -s /usr/bin/convert /usr/bin/magick
 
       - name: Execute Runtime Asset Generation
         run: |
@@ -15,5 +35,18 @@
           chmod +x runtime/*.sh
           for script in runtime/*.sh; do
             echo "Running $script..."
-            ./"$script"
+            # Using bash explicitly to avoid potential dash/sh compatibility issues
+            /bin/bash ./"$script"
           done
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build with Gradle
+        run: ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: dw-native-port
+          path: app/build/outputs/apk/debug/app-debug.apk
