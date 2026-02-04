@@ -17,35 +17,38 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-          cache: 'gradle' # Speeds up subsequent runs
+          cache: 'gradle'
 
       - name: Install and Map ImageMagick
         run: |
           sudo apt-get update
           sudo apt-get install -y imagemagick
-          # Create symlink so 'magick' command works with v6 binaries
           sudo ln -s /usr/bin/convert /usr/bin/magick
 
       - name: Execute Runtime Asset Generation
         run: |
           mkdir -p app/src/main/res/drawable
           mkdir -p app/src/main/res/mipmap-xxxhdpi
-          
           chmod +x runtime/*.sh
           for script in runtime/*.sh; do
-            echo "Running $script..."
             /bin/bash ./"$script"
           done
+
+      - name: Inject Source Files for Internal Extraction
+        run: |
+          # Move ASM source files into the APK assets folder
+          mkdir -p app/src/main/assets/source_files
+          cp source_files/*.asm app/src/main/assets/source_files/
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
       - name: Build with Gradle
-        run: ./gradlew assembleDebug
+        # Using :app:assembleDebug ensures we trigger the correct module
+        run: ./gradlew :app:assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: dw-native-port
-          # Using a wildcard to ensure it finds the APK even if flavor folders exist
           path: app/build/outputs/apk/debug/*.apk
