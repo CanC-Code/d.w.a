@@ -1,0 +1,14 @@
+plugins {
+    id 'com.android.application'
+}
+android {
+    namespace 'com.canc.dwa'
+    compileSdk 33
+    defaultConfig {
+        applicationId "com.canc.dwa"
+        minSdk 24
+        targetSdk 33
+        versionCode 1
+        versionName "1.0"
+    }
+}
