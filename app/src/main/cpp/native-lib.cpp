@@ -5,8 +5,10 @@
 #include <iostream>
 #include <android/log.h>
 #include <android/bitmap.h>
+#include <aaudio/AAudio.h>
 #include <thread>
 #include <chrono>
+#include <math.h>
 
 #define LOG_TAG "DWA_NATIVE"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -31,27 +33,42 @@ uint32_t nes_palette[64] = {
     0xFFE4E594, 0xFFCFEF96, 0xFFBDF4AB, 0xFFB3F3CC, 0xFFB5EBF2, 0xFF000000, 0xFF000000, 0xFF000000
 };
 
+// --- Audio State (Square Wave 1) ---
+float audio_phase = 0;
+float audio_frequency = 0.0f;
+float audio_amplitude = 0.0f;
+AAudioStream *audio_stream = nullptr;
+
 // --- 6502 CPU Registers ---
 uint16_t reg_PC;
 uint8_t  reg_A, reg_X, reg_Y, reg_S, reg_P;
 bool is_running = false;
 
-#define FLAG_C (1 << 0)
-#define FLAG_Z (1 << 1)
 #define FLAG_I (1 << 2)
 #define FLAG_D (1 << 3)
 #define FLAG_U (1 << 5)
 #define FLAG_N (1 << 7)
+#define FLAG_Z (1 << 1)
 
-// --- MMC1 Mapper ---
+// --- MMC1 Mapper & APU Hooks ---
 uint8_t current_prg_bank = 0;
 uint8_t mmc1_shift_reg = 0x10;
 #define ADDR_JOYPAD1 0x00F5 
 
-// --- Memory Access ---
+// --- Audio Callback (The "Synth") ---
+aaudio_data_callback_result_t audio_cb(AAudioStream *s, void *u, void *d, int32_t num) {
+    float *buf = (float *)d;
+    for (int i = 0; i < num; i++) {
+        buf[i] = (sinf(audio_phase) > 0) ? audio_amplitude : -audio_amplitude;
+        audio_phase += (2.0f * M_PI * audio_frequency) / 48000.0f;
+        if (audio_phase > 2.0f * M_PI) audio_phase -= 2.0f * M_PI;
+    }
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
+
+// --- Memory Access with APU Hooking ---
 uint8_t read_byte(uint16_t addr) {
     if (addr < 0x2000) return cpu_ram[addr % 0x0800];
-    if (addr >= 0x6000 && addr < 0x8000) return sram[addr - 0x6000];
     if (addr >= 0x8000 && addr < 0xC000) return prg_rom[current_prg_bank][addr - 0x8000];
     if (addr >= 0xC000) return prg_rom[3][addr - 0xC000]; 
     return 0;
@@ -59,6 +76,12 @@ uint8_t read_byte(uint16_t addr) {
 
 void write_byte(uint16_t addr, uint8_t val) {
     if (addr < 0x2000) { cpu_ram[addr % 0x0800] = val; }
+    // APU Hook: Detect frequency change for Square 1
+    else if (addr == 0x4002 || addr == 0x4003) {
+        uint16_t timer = (read_byte(0x4003) & 0x07) << 8 | read_byte(0x4002);
+        audio_frequency = 1789773.0f / (16.0f * (timer + 1));
+        audio_amplitude = (timer > 0) ? 0.05f : 0.0f;
+    }
     else if (addr >= 0x8000) {
         if (val & 0x80) { mmc1_shift_reg = 0x10; }
         else {
@@ -72,36 +95,29 @@ void write_byte(uint16_t addr, uint8_t val) {
     }
 }
 
-// --- PPU Rendering Logic ---
-
+// --- PPU & CPU Logic ---
 void render_frame() {
-    // Basic Background Rendering (Simplified for Native Port)
-    // In a perfect port, we iterate through the nametable in RAM
-    for (int t = 0; t < 960; t++) { // 32x30 tiles
-        int tile_id = cpu_ram[0x0400 + t]; // Dummy offset for nametable
-        int x_base = (t % 32) * 8;
-        int y_base = (t / 32) * 8;
-
+    for (int t = 0; t < 960; t++) {
+        int tile_id = cpu_ram[0x0400 + t];
+        int xb = (t % 32) * 8, yb = (t / 32) * 8;
         for (int row = 0; row < 8; row++) {
-            uint8_t p1 = chr_rom[tile_id * 16 + row];
-            uint8_t p2 = chr_rom[tile_id * 16 + row + 8];
+            uint8_t p1 = chr_rom[tile_id * 16 + row], p2 = chr_rom[tile_id * 16 + row + 8];
             for (int col = 0; col < 8; col++) {
-                int pixel = ((p1 >> (7 - col)) & 1) | (((p2 >> (7 - col)) & 1) << 1);
-                screen_buffer[(y_base + row) * 256 + (x_base + col)] = nes_palette[pixel * 10]; // Placeholder color logic
+                int pix = ((p1 >> (7 - col)) & 1) | (((p2 >> (7 - col)) & 1) << 1);
+                screen_buffer[(yb + row) * 256 + (xb + col)] = nes_palette[pix + 10];
             }
         }
     }
 }
 
-// --- CPU Logic ---
 void set_zn(uint8_t val) {
     if (val == 0) reg_P |= FLAG_Z; else reg_P &= ~FLAG_Z;
     if (val & 0x80) reg_P |= FLAG_N; else reg_P &= ~FLAG_N;
 }
 
 int step_cpu() {
-    uint8_t opcode = read_byte(reg_PC++);
-    switch (opcode) {
+    uint8_t op = read_byte(reg_PC++);
+    switch (op) {
         case 0x78: reg_P |= FLAG_I; return 2;
         case 0xD8: reg_P &= ~FLAG_D; return 2;
         case 0xA9: reg_A = read_byte(reg_PC++); set_zn(reg_A); return 2;
@@ -117,77 +133,42 @@ int step_cpu() {
     }
 }
 
-// --- Master Clock ---
 void master_clock() {
-    auto next_frame = std::chrono::steady_clock::now();
+    auto next = std::chrono::steady_clock::now();
     while (is_running) {
         int cycles = 0;
         while (cycles < 29780) { cycles += step_cpu(); }
-        
-        render_frame(); // Draw the screen after CPU work
-
-        next_frame += std::chrono::microseconds(16666); 
-        std::this_thread::sleep_until(next_frame);
+        render_frame();
+        next += std::chrono::microseconds(16666); 
+        std::this_thread::sleep_until(next);
     }
 }
 
-// --- JNI Bridge ---
+// --- JNI Implementation ---
 extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv* env, jobject thiz, jobject bitmap) {
-    AndroidBitmapInfo info;
-    void* pixels;
+    AndroidBitmapInfo info; void* pixels;
     if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) return;
-    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
-    
+    AndroidBitmap_lockPixels(env, bitmap, &pixels);
     memcpy(pixels, screen_buffer, 256 * 240 * 4);
-    
     AndroidBitmap_unlockPixels(env, bitmap);
-}
-
-extern "C" JNIEXPORT jstring JNICALL
-Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstring romPath, jstring outDir) {
-    const char* cRomPath = env->GetStringUTFChars(romPath, nullptr);
-    const char* cOutDir = env->GetStringUTFChars(outDir, nullptr);
-    std::ifstream rom(cRomPath, std::ios::binary);
-    if (!rom.is_open()) return env->NewStringUTF("Error: ROM not found.");
-
-    char header[16]; rom.read(header, 16);
-    std::string outStr(cOutDir);
-    for(int i = 0; i < 4; i++) {
-        rom.read(reinterpret_cast<char*>(prg_rom[i]), 16384);
-        std::ofstream out(outStr + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
-        out.write(reinterpret_cast<char*>(prg_rom[i]), 16384);
-    }
-    rom.read(reinterpret_cast<char*>(chr_rom), 8192);
-    std::ofstream oc(outStr + "/chr_assets.bin", std::ios::binary);
-    oc.write(reinterpret_cast<char*>(chr_rom), 8192);
-
-    rom.close();
-    env->ReleaseStringUTFChars(romPath, cRomPath);
-    env->ReleaseStringUTFChars(outDir, cOutDir);
-    return env->NewStringUTF("Success: Extracted.");
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv* env, jobject thiz, jstring filesDir) {
-    const char* cFilesDir = env->GetStringUTFChars(filesDir, nullptr);
-    std::string path(cFilesDir);
+    const char* cPath = env->GetStringUTFChars(filesDir, nullptr);
     for(int i = 0; i < 4; i++) {
-        std::ifstream in(path + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
+        std::ifstream in(std::string(cPath) + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
         in.read(reinterpret_cast<char*>(prg_rom[i]), 16384);
     }
     
+    // Audio Setup
+    AAudioStreamBuilder *b; AAudio_createStreamBuilder(&b);
+    AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_FLOAT);
+    AAudioStreamBuilder_setDataCallback(b, audio_cb, nullptr);
+    AAudioStreamBuilder_openStream(b, &audio_stream);
+    AAudioStream_requestStart(audio_stream);
+    AAudioStreamBuilder_delete(b);
+
     uint16_t low = read_byte(0xFFFC), high = read_byte(0xFFFD);
     reg_PC = (high << 8) | low;
-    reg_S = 0xFD; reg_P = FLAG_I | FLAG_U;
-    
-    is_running = true;
-    std::thread(master_clock).detach();
-    env->ReleaseStringUTFChars(filesDir, cFilesDir);
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_canc_dwa_MainActivity_injectInput(JNIEnv* env, jobject thiz, jint buttonBit, jboolean isPressed) {
-    if (isPressed) cpu_ram[ADDR_JOYPAD1] |= (uint8_t)buttonBit;
-    else cpu_ram[ADDR_JOYPAD1] &= ~(uint8_t)buttonBit;
-}
