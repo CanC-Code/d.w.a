@@ -18,7 +18,8 @@ uint8_t sram[0x2000];
 uint8_t controller_state = 0, controller_shift = 0;
 
 // --- PPU State ---
-uint8_t ppu_vram[0x4000]; 
+uint8_t ppu_vram[2048]; // Physical Name Table RAM
+uint8_t palette_ram[32]; // Physical Palette RAM
 uint16_t ppu_addr_reg;    
 bool ppu_addr_latch;
 uint8_t ppu_ctrl, ppu_mask, ppu_status, ppu_data_buffer; 
@@ -55,33 +56,29 @@ bool is_running = false;
 uint8_t current_prg_bank = 0;
 uint8_t mmc1_shift_reg = 0x10;
 
+// Correct PPU Mapping logic to prevent crashes
+uint8_t& map_ppu(uint16_t addr) {
+    addr &= 0x3FFF;
+    if (addr < 0x2000) return chr_rom[addr]; // Simplified: assume no CHR-RAM for now
+    if (addr < 0x3F00) return ppu_vram[(addr - 0x2000) % 2048]; // Mirrored Name Tables
+    return palette_ram[addr & 0x1F]; // Palette mapping
+}
+
 uint8_t read_byte(uint16_t addr) {
     if (addr < 0x2000) return cpu_ram[addr % 0x0800];
     if (addr >= 0x2000 && addr < 0x4000) {
         uint16_t reg = 0x2000 + (addr % 8);
-        if (reg == 0x2002) { 
-            uint8_t res = ppu_status;
-            ppu_status &= ~0x80; // Clear VBlank on read
-            ppu_addr_latch = false; 
-            return res; 
-        }
+        if (reg == 0x2002) { uint8_t res = ppu_status; ppu_status &= ~0x80; ppu_addr_latch = false; return res; }
         if (reg == 0x2007) {
             uint8_t data = ppu_data_buffer;
-            uint16_t target = ppu_addr_reg & 0x3FFF;
-            ppu_data_buffer = ppu_vram[target];
-            if (target >= 0x3F00) data = ppu_vram[target]; 
+            ppu_data_buffer = map_ppu(ppu_addr_reg);
+            if (ppu_addr_reg >= 0x3F00) data = ppu_data_buffer; 
             ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
             return data;
         }
     }
-    if (addr == 0x4016) { // Controller Read
-        uint8_t res = (controller_shift & 0x80) ? 1 : 0;
-        controller_shift <<= 1;
-        return res | 0x40;
-    }
-    if (addr >= 0x6000 && addr < 0x8000) return sram[addr - 0x6000];
-    if (addr >= 0x8000 && addr < 0xC000) return prg_rom[current_prg_bank][addr - 0x8000];
-    if (addr >= 0xC000) return prg_rom[3][addr - 0xC000];
+    if (addr == 0x4016) { uint8_t res = (controller_shift & 0x80) ? 1 : 0; controller_shift <<= 1; return res | 0x40; }
+    if (addr >= 0x8000) return (addr < 0xC000) ? prg_rom[current_prg_bank][addr - 0x8000] : prg_rom[3][addr - 0xC000];
     return 0;
 }
 
@@ -90,130 +87,84 @@ void write_byte(uint16_t addr, uint8_t val) {
     else if (addr >= 0x2000 && addr < 0x4000) {
         uint16_t reg = 0x2000 + (addr % 8);
         if (reg == 0x2000) ppu_ctrl = val;
-        else if (reg == 0x2001) ppu_mask = val;
         else if (reg == 0x2006) {
             if (!ppu_addr_latch) ppu_addr_reg = (ppu_addr_reg & 0x00FF) | (val << 8);
             else ppu_addr_reg = (ppu_addr_reg & 0xFF00) | val;
             ppu_addr_latch = !ppu_addr_latch;
         }
         else if (reg == 0x2007) {
-            uint16_t target = ppu_addr_reg & 0x3FFF;
-            ppu_vram[target] = val;
-            if (target >= 0x3F00 && (target & 0x3) == 0) ppu_vram[target ^ 0x10] = val;
+            map_ppu(ppu_addr_reg) = val;
             ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
         }
     }
-    else if (addr == 0x4016) { // Controller Latch
-        if (val & 0x01) controller_shift = controller_state;
-    }
+    else if (addr == 0x4016) { if (val & 0x01) controller_shift = controller_state; }
     else if (addr >= 0x8000) {
-        if (val & 0x80) { mmc1_shift_reg = 0x10; }
+        if (val & 0x80) mmc1_shift_reg = 0x10;
         else {
             bool complete = (mmc1_shift_reg & 0x01);
             mmc1_shift_reg >>= 1; mmc1_shift_reg |= ((val & 0x01) << 4);
-            if (complete) {
-                if (addr >= 0xE000) current_prg_bank = mmc1_shift_reg & 0x03;
-                mmc1_shift_reg = 0x10;
-            }
+            if (complete) { if (addr >= 0xE000) current_prg_bank = mmc1_shift_reg & 0x03; mmc1_shift_reg = 0x10; }
         }
     }
-}
-
-void trigger_nmi() {
-    write_byte(0x0100 + reg_S--, (reg_PC >> 8) & 0xFF);
-    write_byte(0x0100 + reg_S--, reg_PC & 0xFF);
-    write_byte(0x0100 + reg_S--, reg_P);
-    reg_PC = (read_byte(0xFFFB) << 8) | read_byte(0xFFFA);
-    reg_P |= FLAG_I;
 }
 
 int step_cpu() {
     uint8_t op = read_byte(reg_PC++);
     uint8_t val = 0;
-    uint16_t temp_addr;
+    uint16_t addr_bus;
 
     switch (op) {
-        // --- Added Logic & Bitwise ---
-        case 0x29: reg_A &= read_byte(reg_PC++); SET_ZN(reg_A); return 2; // AND Imm
-        case 0x09: reg_A |= read_byte(reg_PC++); SET_ZN(reg_A); return 2; // ORA Imm
-        case 0x49: reg_A ^= read_byte(reg_PC++); SET_ZN(reg_A); return 2; // EOR Imm
-        case 0x4A: reg_P = (reg_P & ~FLAG_C) | (reg_A & 0x01); reg_A >>= 1; SET_ZN(reg_A); return 2; // LSR A
+        // --- Critical Missing Branching ---
+        case 0x90: val = read_byte(reg_PC++); if(!(reg_P & FLAG_C)) reg_PC += (int8_t)val; return 2; // BCC
+        case 0xB0: val = read_byte(reg_PC++); if(reg_P & FLAG_C) reg_PC += (int8_t)val; return 2;    // BCS
+        
+        // --- Logical Tests ---
+        case 0x24: { val = read_byte(read_byte(reg_PC++)); reg_P = (reg_P & 0x3F) | (val & 0xC0); 
+                     if (!(val & reg_A)) reg_P |= FLAG_Z; else reg_P &= ~FLAG_Z; return 3; } // BIT ZP
 
-        // --- Stack Pointer & Transfers ---
-        case 0xBA: reg_X = reg_S; SET_ZN(reg_X); return 2; // TSX
-        case 0x8A: reg_A = reg_X; SET_ZN(reg_A); return 2; // TXA
-        case 0x98: reg_A = reg_Y; SET_ZN(reg_A); return 2; // TYA
-
-        // --- Addressing Modes (Zero Page X / Absolute X) ---
-        case 0xB5: val = read_byte((read_byte(reg_PC++) + reg_X) & 0xFF); reg_A = val; SET_ZN(reg_A); return 4;
-        case 0xBD: { 
-            uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); 
-            reg_A = read_byte(((h << 8) | l) + reg_X); SET_ZN(reg_A); return 4; 
-        }
-
-        // --- Existing Core ---
-        case 0x69: { val = read_byte(reg_PC++); uint16_t sum = reg_A + val + (reg_P & FLAG_C);
-                     reg_P = (reg_P & ~(FLAG_C | FLAG_V)) | (sum > 0xFF ? FLAG_C : 0);
-                     if (~(reg_A ^ val) & (reg_A ^ sum) & 0x80) reg_P |= FLAG_V;
-                     reg_A = sum & 0xFF; SET_ZN(reg_A); return 2; }
-        case 0xE9: { val = read_byte(reg_PC++); uint16_t sub = reg_A - val - (!(reg_P & FLAG_C));
-                     reg_P = (reg_P & ~(FLAG_C | FLAG_V)) | (!(sub & 0x100) ? FLAG_C : 0);
-                     if ((reg_A ^ val) & (reg_A ^ sub) & 0x80) reg_P |= FLAG_V;
-                     reg_A = sub & 0xFF; SET_ZN(reg_A); return 2; }
+        // --- Increments/Decrements ---
+        case 0xE6: { uint8_t zp = read_byte(reg_PC++); val = read_byte(zp) + 1; write_byte(zp, val); SET_ZN(val); return 5; } // INC ZP
+        case 0xC6: { uint8_t zp = read_byte(reg_PC++); val = read_byte(zp) - 1; write_byte(zp, val); SET_ZN(val); return 5; } // DEC ZP
+        
+        // --- Essential Math & Logic (Grouped) ---
+        case 0x29: reg_A &= read_byte(reg_PC++); SET_ZN(reg_A); return 2;
+        case 0x09: reg_A |= read_byte(reg_PC++); SET_ZN(reg_A); return 2;
+        case 0x4A: reg_P = (reg_P & ~FLAG_C) | (reg_A & 0x01); reg_A >>= 1; SET_ZN(reg_A); return 2;
         case 0xAA: reg_X = reg_A; SET_ZN(reg_X); return 2;
         case 0xA8: reg_Y = reg_A; SET_ZN(reg_Y); return 2;
-        case 0x10: val = read_byte(reg_PC++); if(!(reg_P & FLAG_N)) reg_PC += (int8_t)val; return 2;
-        case 0x30: val = read_byte(reg_PC++); if(reg_P & FLAG_N) reg_PC += (int8_t)val; return 2;
+        case 0x8A: reg_A = reg_X; SET_ZN(reg_A); return 2;
+        case 0x98: reg_A = reg_Y; SET_ZN(reg_A); return 2;
         case 0xA9: reg_A = read_byte(reg_PC++); SET_ZN(reg_A); return 2;
         case 0xAD: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); reg_A = read_byte((h<<8)|l); SET_ZN(reg_A); return 4; }
         case 0x85: write_byte(read_byte(reg_PC++), reg_A); return 3;
         case 0x8D: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); write_byte((h<<8)|l, reg_A); return 4; }
-        case 0xB1: { uint8_t zp = read_byte(reg_PC++); uint16_t base = read_byte(zp) | (read_byte((zp + 1) & 0xFF) << 8);
-                     reg_A = read_byte(base + reg_Y); SET_ZN(reg_A); return 5; }
-        case 0xA2: reg_X = read_byte(reg_PC++); SET_ZN(reg_X); return 2;
-        case 0xA0: reg_Y = read_byte(reg_PC++); SET_ZN(reg_Y); return 2;
-        case 0xCA: reg_X--; SET_ZN(reg_X); return 2;
-        case 0x88: reg_Y--; SET_ZN(reg_Y); return 2;
-        case 0x9A: reg_S = reg_X; return 2;
-        case 0x48: write_byte(0x0100 + reg_S--, reg_A); return 3;
-        case 0x68: reg_A = read_byte(0x0100 + ++reg_S); SET_ZN(reg_A); return 4;
+        case 0x20: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); uint16_t ret = reg_PC - 1; 
+                     write_byte(0x0100 + reg_S--, (ret >> 8) & 0xFF); write_byte(0x0100 + reg_S--, ret & 0xFF); reg_PC = (h << 8) | l; return 6; }
+        case 0x60: { uint16_t l = read_byte(0x0100 + ++reg_S); uint16_t h = read_byte(0x0100 + ++reg_S); reg_PC = ((h << 8) | l) + 1; return 6; }
         case 0xD0: val = read_byte(reg_PC++); if(!(reg_P & FLAG_Z)) reg_PC += (int8_t)val; return 2;
         case 0xF0: val = read_byte(reg_PC++); if(reg_P & FLAG_Z) reg_PC += (int8_t)val; return 2;
-        case 0x4C: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); reg_PC = (h<<8)|l; return 3; }
-        case 0x20: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); uint16_t ret = reg_PC - 1; 
-                     write_byte(0x0100 + reg_S--, (ret >> 8) & 0xFF); write_byte(0x0100 + reg_S--, ret & 0xFF); 
-                     reg_PC = (h << 8) | l; return 6; }
-        case 0x60: { uint16_t l = read_byte(0x0100 + ++reg_S); uint16_t h = read_byte(0x0100 + ++reg_S); reg_PC = ((h << 8) | l) + 1; return 6; }
-        case 0x38: reg_P |= FLAG_C; return 2;
-        case 0x18: reg_P &= ~FLAG_C; return 2;
-        default: return 1;
+        case 0x78: reg_P |= FLAG_I; return 2; // SEI
+        case 0x18: reg_P &= ~FLAG_C; return 2; // CLC
+        case 0x38: reg_P |= FLAG_C; return 2; // SEC
+        case 0xEA: return 2; // NOP
+        
+        default: return 1; // Unimplemented - will lead to desync
     }
 }
 
 void render_frame() {
-    uint16_t nt_base = 0x2000; 
-    int chr_offset = (ppu_ctrl & 0x10) ? 4096 : 0; 
-
     for (int t = 0; t < 960; t++) {
-        int tile_id = ppu_vram[nt_base + t]; 
+        int tile_id = ppu_vram[t]; // Simplified addressing
         int xb = (t % 32) * 8, yb = (t / 32) * 8;
-        
-        int attr_x = (t % 32) / 4, attr_y = (t / 32) / 4;
-        uint8_t attr_byte = ppu_vram[nt_base + 960 + (attr_y * 8) + attr_x];
-        int shift = ((t % 32) % 4 / 2) * 2 + ((t / 32) % 4 / 2) * 4;
-        int palette_idx = (attr_byte >> shift) & 0x03;
+        uint8_t attr_byte = ppu_vram[960 + ((yb/32)*8) + (xb/32)];
+        int palette_idx = (attr_byte >> (((xb%32)/16)*2 + ((yb%32)/16)*4)) & 0x03;
 
         for (int row = 0; row < 8; row++) {
-            uint8_t p1 = chr_rom[chr_offset + tile_id * 16 + row];
-            uint8_t p2 = chr_rom[chr_offset + tile_id * 16 + row + 8];
+            uint8_t p1 = chr_rom[tile_id * 16 + row], p2 = chr_rom[tile_id * 16 + row + 8];
             for (int col = 0; col < 8; col++) {
-                int color_bits = ((p1 >> (7 - col)) & 1) | (((p2 >> (7 - col)) & 1) << 1);
-                uint32_t color = 0xFF000000;
-                if (color_bits != 0) {
-                    uint8_t pal_entry = ppu_vram[0x3F00 + (palette_idx * 4) + color_bits];
-                    color = nes_palette[pal_entry & 0x3F];
-                }
-                screen_buffer[(yb + row) * 256 + (xb + col)] = color;
+                int pix = ((p1 >> (7-col)) & 1) | (((p2 >> (7-col)) & 1) << 1);
+                if (pix != 0) screen_buffer[(yb + row) * 256 + (xb + col)] = nes_palette[palette_ram[palette_idx * 4 + pix] & 0x3F];
+                else screen_buffer[(yb + row) * 256 + (xb + col)] = 0xFF000000;
             }
         }
     }
@@ -261,6 +212,5 @@ Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv* env, jobject thiz, jo
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_injectInput(JNIEnv* env, jobject thiz, jint buttonBit, jboolean isPressed) {
-    if (isPressed) controller_state |= buttonBit;
-    else controller_state &= ~buttonBit;
+    if (isPressed) controller_state |= buttonBit; else controller_state &= ~buttonBit;
 }
