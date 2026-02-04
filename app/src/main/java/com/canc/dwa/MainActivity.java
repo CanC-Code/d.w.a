@@ -90,7 +90,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     }
 
     private boolean isRomExtracted() {
-        return new File(getFilesDir(), "prg_bank_0.bin").exists();
+        return new File(getFilesDir(), "chr_rom.bin").exists();
     }
 
     private void openFilePicker() {
@@ -118,7 +118,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             int length;
             while ((length = is.read(buffer)) > 0) os.write(buffer, 0, length);
             os.close(); is.close();
-            
+
             nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
             startNativeEngine();
         } catch (Exception e) {
