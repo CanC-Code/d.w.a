@@ -12,7 +12,6 @@
 
 #define LOG_TAG "DWA_NATIVE"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // --- NES Hardware State ---
 uint8_t cpu_ram[0x0800];               
@@ -34,9 +33,23 @@ uint32_t nes_palette[64] = {
     0xFFE4E594, 0xFFCFEF96, 0xFFBDF4AB, 0xFFB3F3CC, 0xFFB5EBF2, 0xFF000000, 0xFF000000, 0xFF000000
 };
 
-// --- Audio & CPU Registers ---
+// --- Audio Engine ---
 float audio_phase = 0, audio_frequency = 0, audio_amplitude = 0;
 AAudioStream *audio_stream = nullptr;
+
+// AAudio Callback: Synthesizes the Square Wave 1 in real-time
+aaudio_data_callback_result_t audio_callback(AAudioStream *stream, void *user_data, void *audio_data, int32_t num_frames) {
+    float *buffer = (float *)audio_data;
+    for (int i = 0; i < num_frames; i++) {
+        // Square wave synthesis
+        buffer[i] = (sinf(audio_phase) > 0) ? audio_amplitude : -audio_amplitude;
+        audio_phase += (2.0f * M_PI * audio_frequency) / 48000.0f;
+        if (audio_phase > 2.0f * M_PI) audio_phase -= 2.0f * M_PI;
+    }
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
+
+// --- CPU State ---
 uint16_t reg_PC;
 uint8_t  reg_A, reg_X, reg_Y, reg_S, reg_P;
 bool is_running = false;
@@ -47,7 +60,7 @@ bool is_running = false;
 #define FLAG_U (1 << 5)
 #define FLAG_N (1 << 7)
 
-// --- Mapper & Save Logic ---
+// --- Mapper & Persistence ---
 uint8_t current_prg_bank = 0;
 uint8_t mmc1_shift_reg = 0x10;
 
@@ -61,7 +74,7 @@ void load_sram_from_disk() {
     if (in.is_open()) { in.read((char*)sram, 0x2000); in.close(); }
 }
 
-// --- Memory Access ---
+// --- Memory Bus ---
 uint8_t read_byte(uint16_t addr) {
     if (addr < 0x2000) return cpu_ram[addr % 0x0800];
     if (addr >= 0x6000 && addr < 0x8000) return sram[addr - 0x6000];
@@ -74,9 +87,10 @@ void write_byte(uint16_t addr, uint8_t val) {
     if (addr < 0x2000) { cpu_ram[addr % 0x0800] = val; }
     else if (addr >= 0x6000 && addr < 0x8000) { sram[addr - 0x6000] = val; }
     else if (addr == 0x4002 || addr == 0x4003) {
+        // Simple APU Square 1 simulation
         uint16_t timer = (read_byte(0x4003) & 0x07) << 8 | read_byte(0x4002);
         audio_frequency = 1789773.0f / (16.0f * (timer + 1));
-        audio_amplitude = (timer > 0) ? 0.05f : 0.0f;
+        audio_amplitude = (timer > 5) ? 0.1f : 0.0f; // Gate sound if timer is too low
     }
     else if (addr >= 0x8000) {
         if (val & 0x80) { mmc1_shift_reg = 0x10; }
@@ -91,7 +105,8 @@ void write_byte(uint16_t addr, uint8_t val) {
     }
 }
 
-// --- Interrupt Handling ---
+// --- PPU & Interrupt Logic ---
+
 
 void trigger_nmi() {
     write_byte(0x0100 + reg_S--, (reg_PC >> 8) & 0xFF);
@@ -101,8 +116,8 @@ void trigger_nmi() {
     reg_P |= FLAG_I;
 }
 
-// --- Execution & Rendering ---
 void render_frame() {
+    // Simplified background renderer (Tilemap at $0400)
     for (int t = 0; t < 960; t++) {
         int tile_id = cpu_ram[0x0400 + t];
         int xb = (t % 32) * 8, yb = (t / 32) * 8;
@@ -121,7 +136,7 @@ int step_cpu() {
     switch (op) {
         case 0x78: reg_P |= FLAG_I; return 2;
         case 0xD8: reg_P &= ~FLAG_D; return 2;
-        case 0xA9: reg_A = read_byte(reg_PC++); if(!reg_A) reg_P |= FLAG_Z; return 2;
+        case 0xA9: reg_A = read_byte(reg_PC++); if(!reg_A) reg_P |= FLAG_Z; else reg_P &= ~FLAG_Z; return 2;
         case 0x8D: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); write_byte((h << 8)|l, reg_A); return 4; }
         case 0x4C: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); reg_PC = (h << 8)|l; return 3; }
         default: return 1;
@@ -147,19 +162,38 @@ Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv* env, jobject thiz, jstri
     const char* cPath = env->GetStringUTFChars(filesDir, nullptr);
     std::string pathStr(cPath);
     global_save_path = pathStr + "/hero.sav";
+
+    // Load Banks
     for(int i = 0; i < 4; i++) {
         std::ifstream in(pathStr + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
         in.read((char*)prg_rom[i], 16384);
     }
     load_sram_from_disk();
-    
-    // PC Setup via Reset Vector
+
+    // Setup AAudio
+    AAudioStreamBuilder *builder;
+    AAudio_createStreamBuilder(&builder);
+    AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
+    AAudioStreamBuilder_setChannelCount(builder, 1);
+    AAudioStreamBuilder_setDataCallback(builder, audio_callback, nullptr);
+    AAudioStreamBuilder_openStream(builder, &audio_stream);
+    AAudioStream_requestStart(audio_stream);
+    AAudioStreamBuilder_delete(builder);
+
+    // Initial CPU State
     reg_PC = (read_byte(0xFFFD) << 8) | read_byte(0xFFFC);
-    reg_S = 0xFD; reg_P = FLAG_I | FLAG_U;
-    
+    reg_S = 0xFD; 
+    reg_P = FLAG_I | FLAG_U;
+
     is_running = true;
     std::thread(master_clock).detach();
     env->ReleaseStringUTFChars(filesDir, cPath);
 }
 
-// (Include previous nativeUpdateSurface, nativeExtractRom, and injectInput functions here)
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv* env, jobject thiz, jobject bitmap) {
+    void* pixels;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
+    memcpy(pixels, screen_buffer, 256 * 240 * 4);
+    AndroidBitmap_unlockPixels(env, bitmap);
+}
