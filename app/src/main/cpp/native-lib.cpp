@@ -60,16 +60,7 @@ bool is_running = false;
 uint8_t current_prg_bank = 0;
 uint8_t mmc1_shift_reg = 0x10;
 
-void save_sram_to_disk() {
-    std::ofstream out(global_save_path, std::ios::binary);
-    if (out.is_open()) { out.write((char*)sram, 0x2000); out.close(); }
-}
-
-void load_sram_from_disk() {
-    std::ifstream in(global_save_path, std::ios::binary);
-    if (in.is_open()) { in.read((char*)sram, 0x2000); in.close(); }
-}
-
+// Memory Helpers
 uint8_t read_byte(uint16_t addr) {
     if (addr < 0x2000) return cpu_ram[addr % 0x0800];
     if (addr >= 0x6000 && addr < 0x8000) return sram[addr - 0x6000];
@@ -81,11 +72,6 @@ uint8_t read_byte(uint16_t addr) {
 void write_byte(uint16_t addr, uint8_t val) {
     if (addr < 0x2000) { cpu_ram[addr % 0x0800] = val; }
     else if (addr >= 0x6000 && addr < 0x8000) { sram[addr - 0x6000] = val; }
-    else if (addr == 0x4002 || addr == 0x4003) {
-        uint16_t timer = (read_byte(0x4003) & 0x07) << 8 | read_byte(0x4002);
-        audio_frequency = 1789773.0f / (16.0f * (timer + 1));
-        audio_amplitude = (timer > 5) ? 0.1f : 0.0f;
-    }
     else if (addr >= 0x8000) {
         if (val & 0x80) { mmc1_shift_reg = 0x10; }
         else {
@@ -99,37 +85,51 @@ void write_byte(uint16_t addr, uint8_t val) {
     }
 }
 
-void trigger_nmi() {
-    write_byte(0x0100 + reg_S--, (reg_PC >> 8) & 0xFF);
-    write_byte(0x0100 + reg_S--, reg_PC & 0xFF);
-    write_byte(0x0100 + reg_S--, reg_P);
-    reg_PC = (read_byte(0xFFFB) << 8) | read_byte(0xFFFA);
-    reg_P |= FLAG_I;
-}
-
-void render_frame() {
-    for (int t = 0; t < 960; t++) {
-        int tile_id = cpu_ram[0x0400 + t];
-        int xb = (t % 32) * 8, yb = (t / 32) * 8;
-        for (int row = 0; row < 8; row++) {
-            uint8_t p1 = chr_rom[tile_id * 16 + row], p2 = chr_rom[tile_id * 16 + row + 8];
-            for (int col = 0; col < 8; col++) {
-                int pix = ((p1 >> (7 - col)) & 1) | (((p2 >> (7 - col)) & 1) << 1);
-                screen_buffer[(yb + row) * 256 + (xb + col)] = nes_palette[pix + 10];
-            }
-        }
-    }
-}
-
+// CPU Logic
 int step_cpu() {
     uint8_t op = read_byte(reg_PC++);
     switch (op) {
-        case 0x78: reg_P |= FLAG_I; return 2;
-        case 0xD8: reg_P &= ~FLAG_D; return 2;
-        case 0xA9: reg_A = read_byte(reg_PC++); if(!reg_A) reg_P |= FLAG_Z; else reg_P &= ~FLAG_Z; return 2;
-        case 0x8D: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); write_byte((h << 8)|l, reg_A); return 4; }
-        case 0x4C: { uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++); reg_PC = (h << 8)|l; return 3; }
-        default: return 1; 
+        case 0x78: reg_P |= FLAG_I; return 2; // SEI
+        case 0xD8: reg_P &= ~FLAG_D; return 2; // CLD
+        case 0xA9: // LDA Immediate
+            reg_A = read_byte(reg_PC++);
+            reg_P = (reg_A == 0) ? (reg_P | FLAG_Z) : (reg_P & ~FLAG_Z);
+            reg_P = (reg_A & 0x80) ? (reg_P | FLAG_N) : (reg_P & ~FLAG_N);
+            return 2;
+        case 0x8D: { // STA Absolute
+            uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++);
+            write_byte((h << 8) | l, reg_A);
+            return 4;
+        }
+        case 0x20: { // JSR (Jump to Subroutine)
+            uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++);
+            uint16_t ret = reg_PC - 1;
+            write_byte(0x0100 + reg_S--, (ret >> 8) & 0xFF);
+            write_byte(0x0100 + reg_S--, ret & 0xFF);
+            reg_PC = (h << 8) | l;
+            return 6;
+        }
+        case 0x60: { // RTS (Return from Subroutine)
+            uint16_t l = read_byte(0x0100 + ++reg_S);
+            uint16_t h = read_byte(0x0100 + ++reg_S);
+            reg_PC = ((h << 8) | l) + 1;
+            return 6;
+        }
+        case 0x4C: { // JMP Absolute
+            uint16_t l = read_byte(reg_PC++), h = read_byte(reg_PC++);
+            reg_PC = (h << 8) | l;
+            return 3;
+        }
+        default: return 1; // NOP-like for unknown
+    }
+}
+
+void render_frame() {
+    // Basic test pattern to confirm the screen isn't just one color
+    for (int y = 0; y < 240; y++) {
+        for (int x = 0; x < 256; x++) {
+            screen_buffer[y * 256 + x] = nes_palette[(x + y) % 64];
+        }
     }
 }
 
@@ -138,9 +138,7 @@ void master_clock() {
     while (is_running) {
         int cycles = 0;
         while (cycles < 29780) { cycles += step_cpu(); }
-        trigger_nmi();
         render_frame();
-        save_sram_to_disk();
         next += std::chrono::microseconds(16666); 
         std::this_thread::sleep_until(next);
     }
@@ -156,16 +154,6 @@ Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv* env, jobject thiz, jstri
         std::ifstream in(pathStr + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
         if (in.is_open()) { in.read((char*)prg_rom[i], 16384); in.close(); }
     }
-    load_sram_from_disk();
-
-    AAudioStreamBuilder *builder;
-    AAudio_createStreamBuilder(&builder);
-    AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
-    AAudioStreamBuilder_setChannelCount(builder, 1);
-    AAudioStreamBuilder_setDataCallback(builder, audio_callback, nullptr);
-    AAudioStreamBuilder_openStream(builder, &audio_stream);
-    AAudioStream_requestStart(audio_stream);
-    AAudioStreamBuilder_delete(builder);
 
     reg_PC = (read_byte(0xFFFD) << 8) | read_byte(0xFFFC);
     reg_S = 0xFD; 
@@ -193,9 +181,7 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstri
     std::ifstream in(cRomPath, std::ios::binary);
     if (!in.is_open()) return env->NewStringUTF("Error: Could not open ROM");
 
-    char header[16];
-    in.read(header, 16);
-
+    in.seekg(16); // Skip iNES Header
     for (int i = 0; i < 4; i++) {
         std::ofstream out(outDirStr + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
         char bankData[16384];
@@ -210,7 +196,4 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstri
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_canc_dwa_MainActivity_injectInput(JNIEnv* env, jobject thiz, jint buttonBit, jboolean isPressed) {
-    // Simple input stub: button states would be mapped to $4016/$4017 registers
-    LOGI("Input: %d, Pressed: %d", buttonBit, isPressed);
-}
+Java_com_canc_dwa_MainActivity_injectInput(JNIEnv* env, jobject thiz, jint buttonBit, jboolean isPressed) {}
