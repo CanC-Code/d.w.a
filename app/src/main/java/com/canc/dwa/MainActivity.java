@@ -22,20 +22,9 @@ import java.io.InputStream;
 
 public class MainActivity extends AppCompatActivity implements SurfaceHolder.Callback, Choreographer.FrameCallback {
 
-    static {
-        System.loadLibrary("dwa");
-    }
+    static { System.loadLibrary("dwa"); }
 
     private static final int PICK_ROM_REQUEST = 1;
-    private static final int BUTTON_A = 0x80;
-    private static final int BUTTON_B = 0x40;
-    private static final int BUTTON_SELECT = 0x20;
-    private static final int BUTTON_START = 0x10;
-    private static final int BUTTON_UP = 0x08;
-    private static final int BUTTON_DOWN = 0x04;
-    private static final int BUTTON_LEFT = 0x02;
-    private static final int BUTTON_RIGHT = 0x01;
-
     private View gameContainer, setupContainer;
     private SurfaceView gameSurface;
     private Bitmap screenBitmap;
@@ -46,33 +35,25 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
-
         setupContainer = findViewById(R.id.setup_layout);
         gameContainer = findViewById(R.id.game_layout);
         gameSurface = findViewById(R.id.game_surface);
-
         screenBitmap = Bitmap.createBitmap(256, 240, Bitmap.Config.ARGB_8888);
         gameSurface.getHolder().addCallback(this);
 
         findViewById(R.id.btn_select_rom).setOnClickListener(v -> openFilePicker());
-
-        if (isRomExtracted()) {
-            startNativeEngine();
-        }
+        if (isRomExtracted()) startNativeEngine();
     }
 
     @Override
     public void doFrame(long frameTimeNanos) {
         if (!isEngineRunning) return;
-
         nativeUpdateSurface(screenBitmap);
-
         Canvas canvas = gameSurface.getHolder().lockCanvas();
         if (canvas != null) {
             float scale = Math.min((float)gameSurface.getWidth() / 256, (float)gameSurface.getHeight() / 240);
             int w = (int)(256 * scale), h = (int)(240 * scale);
             destRect.set((gameSurface.getWidth()-w)/2, (gameSurface.getHeight()-h)/2, (gameSurface.getWidth()+w)/2, (gameSurface.getHeight()+h)/2);
-
             canvas.drawColor(0xFF000000);
             canvas.drawBitmap(screenBitmap, null, destRect, null);
             gameSurface.getHolder().unlockCanvasAndPost(canvas);
@@ -89,9 +70,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         Choreographer.getInstance().postFrameCallback(this);
     }
 
-    private boolean isRomExtracted() {
-        return new File(getFilesDir(), "chr_rom.bin").exists();
-    }
+    private boolean isRomExtracted() { return new File(getFilesDir(), "chr_rom.bin").exists(); }
 
     private void openFilePicker() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -119,8 +98,9 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             while ((length = is.read(buffer)) > 0) os.write(buffer, 0, length);
             os.close(); is.close();
 
-            nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
-            startNativeEngine();
+            String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
+            if ("Success".equals(result)) startNativeEngine();
+            else Toast.makeText(this, "Extraction failed: " + result, Toast.LENGTH_LONG).show();
         } catch (Exception e) {
             Toast.makeText(this, "Error: " + e.getMessage(), Toast.LENGTH_SHORT).show();
         }
@@ -128,14 +108,10 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     @SuppressLint("ClickableViewAccessibility")
     private void setupTouchControls() {
-        safeBind(R.id.btn_up, BUTTON_UP);
-        safeBind(R.id.btn_down, BUTTON_DOWN);
-        safeBind(R.id.btn_left, BUTTON_LEFT);
-        safeBind(R.id.btn_right, BUTTON_RIGHT);
-        safeBind(R.id.btn_a, BUTTON_A);
-        safeBind(R.id.btn_b, BUTTON_B);
-        safeBind(R.id.btn_start, BUTTON_START);
-        safeBind(R.id.btn_select, BUTTON_SELECT);
+        safeBind(R.id.btn_up, 0x08); safeBind(R.id.btn_down, 0x04);
+        safeBind(R.id.btn_left, 0x02); safeBind(R.id.btn_right, 0x01);
+        safeBind(R.id.btn_a, 0x80); safeBind(R.id.btn_b, 0x40);
+        safeBind(R.id.btn_start, 0x10); safeBind(R.id.btn_select, 0x20);
     }
 
     private void safeBind(int resId, int bitmask) {
