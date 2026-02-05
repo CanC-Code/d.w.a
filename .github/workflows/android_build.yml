@@ -19,11 +19,23 @@ jobs:
           distribution: 'temurin'
           cache: 'gradle'
 
+      - name: Set up Python 3.x
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
       - name: Install and Map ImageMagick
         run: |
           sudo apt-get update
           sudo apt-get install -y imagemagick
           sudo ln -s /usr/bin/convert /usr/bin/magick
+
+      - name: Execute Static Recompilation
+        run: |
+          # Create the directory for recompiled C++ code
+          mkdir -p app/src/main/cpp/recompiled
+          # Run the converter script
+          python3 runtime/asm_to_c.py
 
       - name: Execute Runtime Asset Generation
         run: |
@@ -31,7 +43,10 @@ jobs:
           mkdir -p app/src/main/res/mipmap-xxxhdpi
           chmod +x runtime/*.sh
           for script in runtime/*.sh; do
-            /bin/bash ./"$script"
+            # Skip python scripts if they were accidentally placed here
+            if [[ "$script" == *.sh ]]; then
+              /bin/bash ./"$script"
+            fi
           done
 
       - name: Inject Source Files for Internal Extraction
