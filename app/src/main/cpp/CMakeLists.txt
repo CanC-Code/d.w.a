@@ -2,19 +2,28 @@ cmake_minimum_required(VERSION 3.18.1)
 
 project("dwa")
 
-# Add the main native library
-add_library(dwa SHARED native-lib.cpp)
+# 1. Collect all recompiled C++ files generated from ASM
+# These are located in the 'recompiled' directory created by your CI
+file(GLOB RECOMPILED_SOURCES "recompiled/*.cpp")
 
-# Set C++ standard to 17 for thread, chrono, and advanced math
+# 2. Define the main native library
+# We include both the core engine (native-lib.cpp) and all recompiled game logic
+add_library(dwa SHARED 
+    native-lib.cpp 
+    ${RECOMPILED_SOURCES}
+)
+
+# Set C++ standard to 17 for thread, chrono, and advanced features
 set_target_properties(dwa PROPERTIES CXX_STANDARD 17)
 
-# Locate standard NDK libraries
+# 3. Locate standard NDK libraries
 find_library(log-lib log)
 find_library(graphics-lib jnigraphics)
 
-# Link all required libraries
-# 'aaudio' is linked directly to fix the CI build failure
-# 'android' is linked to allow the C++ code to use AAssetManager
+# 4. Link all required libraries
+# 'android' is required for AAssetManager
+# 'jnigraphics' is required for AndroidBitmap_lockPixels
+# 'aaudio' handles sound output
 target_link_libraries(dwa 
     ${log-lib} 
     ${graphics-lib}
