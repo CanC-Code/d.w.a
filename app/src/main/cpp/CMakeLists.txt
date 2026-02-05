@@ -2,31 +2,40 @@ cmake_minimum_required(VERSION 3.18.1)
 
 project("dwa")
 
-# 1. Collect all recompiled C++ files generated from ASM
-# These are located in the 'recompiled' directory created by your CI
-file(GLOB RECOMPILED_SOURCES "recompiled/*.cpp")
+# 1. Set C++ standard to 17
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 2. Define the main native library
-# We include both the core engine (native-lib.cpp) and all recompiled game logic
+# 2. Collect recompiled sources
+# Note: file(GLOB) is convenient but doesn't track new files well. 
+# CONFIGURE_DEPENDS ensures CMake re-scans when you add/remove files in CI.
+file(GLOB RECOMPILED_SOURCES CONFIGURE_DEPENDS "src/main/cpp/recompiled/*.cpp")
+
+# 3. Define the main native library
+# We include the core engine, the Mapper, and all recompiled banks
 add_library(dwa SHARED 
-    native-lib.cpp 
+    src/main/cpp/native-lib.cpp 
     ${RECOMPILED_SOURCES}
 )
 
-# Set C++ standard to 17 for thread, chrono, and advanced features
-set_target_properties(dwa PROPERTIES CXX_STANDARD 17)
+# 4. Include Directories
+# This allows native-lib.cpp and MapperMMC1.h to find each other
+target_include_directories(dwa PRIVATE 
+    src/main/cpp 
+    src/main/cpp/recompiled
+)
 
-# 3. Locate standard NDK libraries
+# 5. Locate standard NDK libraries
 find_library(log-lib log)
 find_library(graphics-lib jnigraphics)
 
-# 4. Link all required libraries
-# 'android' is required for AAssetManager
-# 'jnigraphics' is required for AndroidBitmap_lockPixels
-# 'aaudio' handles sound output
+# 6. Link all required libraries
+# added -latomic for 64-bit integer operations on some ARM builds
 target_link_libraries(dwa 
     ${log-lib} 
     ${graphics-lib}
     aaudio
     android
+    atomic
+    m
 )
