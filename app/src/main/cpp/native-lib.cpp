@@ -12,14 +12,12 @@
 
 #define LOG_TAG "DWA_NATIVE"
 
-// Hardware State
 uint8_t cpu_ram[0x0800] = {0}, ppu_vram[2048] = {0}, palette_ram[32] = {0};
 uint32_t screen_buffer[256 * 240] = {0};
 uint8_t controller_state = 0, ppu_data_buffer = 0;
 std::mutex buffer_mutex;
 MapperMMC1 mapper;
 
-// CPU Registers
 uint16_t reg_PC = 0;
 uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
 uint8_t ppu_status = 0, ppu_ctrl = 0, ppu_addr_latch = 0;
@@ -35,7 +33,6 @@ uint32_t nes_palette[64] = {
     0xFFBCBE00, 0xFF88D100, 0xFF5CE430, 0xFF45E082, 0xFF45E082, 0xFF48CDDE, 0xFF4F4F4F, 0xFF000000
 };
 
-// --- Memory Access ---
 uint8_t bus_read(uint16_t addr) {
     if (addr < 0x2000) return cpu_ram[addr % 0x0800];
     if (addr == 0x2002) { 
@@ -88,7 +85,6 @@ void handle_interrupt() {
     reg_PC = (bus_read(0xFFFB) << 8) | bus_read(0xFFFA); 
 }
 
-// --- Expanded CPU Core for Dragon Warrior ---
 void execute_instruction() {
     uint8_t op = bus_read(reg_PC++);
     switch (op) {
@@ -101,15 +97,15 @@ void execute_instruction() {
         case 0xAD: { uint16_t l = bus_read(reg_PC++); uint16_t h = bus_read(reg_PC++); reg_A = bus_read((h<<8)|l); update_nz(reg_A); break; }
         case 0x8D: { uint16_t l = bus_read(reg_PC++); uint16_t h = bus_read(reg_PC++); bus_write((h<<8)|l, reg_A); break; }
         case 0x9A: reg_S = reg_X; break;
-        case 0x90: { int8_t rel = (int8_t)bus_read(reg_PC++); if (!(reg_P & 0x01)) reg_PC += rel; break; } // BCC
-        case 0xB0: { int8_t rel = (int8_t)bus_read(reg_PC++); if (reg_P & 0x01) reg_PC += rel; break; }  // BCS
-        case 0xF0: { int8_t rel = (int8_t)bus_read(reg_PC++); if (reg_P & 0x02) reg_PC += rel; break; }  // BEQ
-        case 0xD0: { int8_t rel = (int8_t)bus_read(reg_PC++); if (!(reg_P & 0x02)) reg_PC += rel; break; } // BNE
-        case 0x10: { int8_t rel = (int8_t)bus_read(reg_PC++); if (!(reg_P & 0x80)) reg_PC += rel; break; } // BPL
-        case 0x30: { int8_t rel = (int8_t)bus_read(reg_PC++); if (reg_P & 0x80) reg_PC += rel; break; }  // BMI
-        case 0xC9: { uint8_t val = bus_read(reg_PC++); update_nz(reg_A - val); reg_P = (reg_P & 0xFE) | (reg_A >= val); break; } // CMP Imm
-        case 0xE0: { uint8_t val = bus_read(reg_PC++); update_nz(reg_X - val); reg_P = (reg_P & 0xFE) | (reg_X >= val); break; } // CPX Imm
-        case 0xC0: { uint8_t val = bus_read(reg_PC++); update_nz(reg_Y - val); reg_P = (reg_P & 0xFE) | (reg_Y >= val); break; } // CPY Imm
+        case 0x90: { int8_t rel = (int8_t)bus_read(reg_PC++); if (!(reg_P & 0x01)) reg_PC += rel; break; } 
+        case 0xB0: { int8_t rel = (int8_t)bus_read(reg_PC++); if (reg_P & 0x01) reg_PC += rel; break; }  
+        case 0xF0: { int8_t rel = (int8_t)bus_read(reg_PC++); if (reg_P & 0x02) reg_PC += rel; break; }  
+        case 0xD0: { int8_t rel = (int8_t)bus_read(reg_PC++); if (!(reg_P & 0x02)) reg_PC += rel; break; } 
+        case 0x10: { int8_t rel = (int8_t)bus_read(reg_PC++); if (!(reg_P & 0x80)) reg_PC += rel; break; } 
+        case 0x30: { int8_t rel = (int8_t)bus_read(reg_PC++); if (reg_P & 0x80) reg_PC += rel; break; }  
+        case 0xC9: { uint8_t val = bus_read(reg_PC++); update_nz(reg_A - val); reg_P = (reg_P & 0xFE) | (reg_A >= val); break; } 
+        case 0xE0: { uint8_t val = bus_read(reg_PC++); update_nz(reg_X - val); reg_P = (reg_P & 0xFE) | (reg_X >= val); break; } 
+        case 0xC0: { uint8_t val = bus_read(reg_PC++); update_nz(reg_Y - val); reg_P = (reg_P & 0xFE) | (reg_Y >= val); break; } 
         case 0x4C: { uint16_t l = bus_read(reg_PC++); uint16_t h = bus_read(reg_PC++); reg_PC = (h << 8) | l; break; }
         case 0x20: { uint16_t l = bus_read(reg_PC++); uint16_t h = bus_read(reg_PC++); uint16_t r = reg_PC - 1; push(r >> 8); push(r & 0xFF); reg_PC = (h << 8) | l; break; }
         case 0x60: { uint16_t l = pull(); uint16_t h = pull(); reg_PC = ((h << 8) | l) + 1; break; }
