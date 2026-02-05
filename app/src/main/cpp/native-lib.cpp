@@ -23,15 +23,14 @@ std::mutex buffer_mutex;
 MapperMMC1 mapper;
 
 // --- CPU Registers & Flags ---
-uint16_t reg_PC = 0;
 uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
 uint8_t ppu_status = 0, ppu_ctrl = 0, ppu_addr_latch = 0;
 uint16_t ppu_addr_reg = 0;
 bool is_running = false;
 
-// Helpers for the recompiler logic
-uint8_t tmp_val = 0;         // Used for INC/DEC calculations
-uint16_t target_addr = 0;    // Used for multi-byte address calculations
+// Recompiler Scratchpad (used for INC/DEC/Addressing)
+uint8_t tmp_val = 0;
+uint16_t target_addr = 0;
 
 uint32_t nes_palette[64] = {
     0xFF666666, 0xFF002A88, 0xFF1412A7, 0xFF3B00A4, 0xFF5C007E, 0xFF6E0040, 0xFF6C0600, 0xFF561D00,
@@ -45,18 +44,35 @@ uint32_t nes_palette[64] = {
 // --- Core Helper Functions for Recompiled Code ---
 
 void update_nz(uint8_t val) { 
-    reg_P = (reg_P & 0x7D) | (val & 0x80) | ((val == 0) << 1); 
+    reg_P &= ~0x82; // Clear N and Z
+    if (val == 0) reg_P |= 0x02;
+    if (val & 0x80) reg_P |= 0x80;
 }
 
-void set_carry(bool c) {
-    if (c) reg_P |= 0x01;
+void cpu_adc(uint8_t val) {
+    uint16_t carry = (reg_P & 0x01);
+    uint16_t sum = reg_A + val + carry;
+    
+    // Overflow (V) flag
+    if (~(reg_A ^ val) & (reg_A ^ sum) & 0x80) reg_P |= 0x40;
+    else reg_P &= ~0x40;
+    
+    // Carry (C) flag
+    if (sum > 0xFF) reg_P |= 0x01;
     else reg_P &= ~0x01;
+    
+    reg_A = (uint8_t)sum;
+    update_nz(reg_A);
 }
 
-// Support for Indirect Addressing: LDA ($12)
+void cpu_sbc(uint8_t val) {
+    // SBC is ADC with the complement of the value
+    cpu_adc(~val);
+}
+
 uint16_t read_pointer(uint16_t addr) {
-    uint16_t lo = cpu_ram[addr % 0x0800];
-    uint16_t hi = cpu_ram[(addr + 1) % 0x0800];
+    uint8_t lo = cpu_ram[addr % 0x0800];
+    uint8_t hi = cpu_ram[(addr + 1) % 0x0800];
     return (hi << 8) | lo;
 }
 
@@ -136,17 +152,15 @@ void draw_frame() {
 
 // --- Engine Lifecycle ---
 
-extern void power_on_reset();
-extern void nmi_handler();
+extern "C" void power_on_reset();
+extern "C" void nmi_handler();
 
 void engine_loop() {
     power_on_reset();
     while (is_running) {
         auto start = std::chrono::steady_clock::now();
-        
         ppu_status |= 0x80;
         if (ppu_ctrl & 0x80) nmi_handler();
-        
         draw_frame();
         std::this_thread::sleep_until(start + std::chrono::milliseconds(16));
     }
@@ -159,9 +173,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_canc_dwa_MainActivity_nativeExtrac
     const char* cOut = env->GetStringUTFChars(outDir, 0);
     std::string outDirStr(cOut); 
     std::ifstream nes(cPath, std::ios::binary);
-
     if (!nes) return env->NewStringUTF("File Error");
-
     nes.seekg(16);
     for (int i = 0; i < 4; i++) {
         std::vector<char> buf(16384); 
@@ -169,12 +181,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_canc_dwa_MainActivity_nativeExtrac
         std::ofstream out(outDirStr + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary); 
         out.write(buf.data(), 16384);
     }
-
     std::vector<char> chr(16384); 
     nes.read(chr.data(), 16384);
     std::ofstream c_out(outDirStr + "/chr_rom.bin", std::ios::binary); 
     c_out.write(chr.data(), 16384);
-
     env->ReleaseStringUTFChars(romPath, cPath); 
     env->ReleaseStringUTFChars(outDir, cOut);
     return env->NewStringUTF("Success");
@@ -184,14 +194,12 @@ extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeInitEngin
     if (is_running) return;
     const char* cPath = env->GetStringUTFChars(filesDir, 0); 
     std::string pathStr(cPath);
-
     for(int i = 0; i < 4; i++) {
         std::ifstream in(pathStr + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
         if (in) in.read((char*)mapper.prg_rom[i], 16384);
     }
     std::ifstream c_in(pathStr + "/chr_rom.bin", std::ios::binary); 
     if (c_in) c_in.read((char*)mapper.chr_rom, 16384);
-
     is_running = true; 
     std::thread(engine_loop).detach();
     env->ReleaseStringUTFChars(filesDir, cPath);
