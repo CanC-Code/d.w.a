@@ -6,6 +6,7 @@ OUT_DIR = "app/src/main/cpp/recompiled"
 
 def parse_address(operand):
     operand = operand.strip()
+    if not operand: return "0"
     if operand.startswith('#$'): return f"0x{operand[2:]}"
     if ',X' in operand.upper():
         base = operand.replace('$', '0x').split(',')[0]
@@ -23,7 +24,7 @@ def translate_line(line):
     clean_line = line.split(';')[0].strip()
     if not clean_line or clean_line.startswith('.'): return None
     match = re.match(r'^(\w{3})\s*(.*)$', clean_line)
-    if not match: return f"// {clean_line}"
+    if not match: return None
     opcode, operand = match.groups()
     opcode = opcode.upper()
 
@@ -34,8 +35,8 @@ def translate_line(line):
     if opcode == 'LDY': return f"reg_Y = {parse_address(operand)}; update_nz(reg_Y);"
     if opcode in ['STA', 'STX', 'STY']:
         reg = opcode[-1]
-        addr = operand.replace('$', '0x').split(',')[0]
-        return f"bus_write({addr}, reg_{reg});"
+        addr = operand.replace('$', '0x').split(',')[0].strip()
+        return f"bus_write({addr or '0x0000'}, reg_{reg});"
     if opcode == 'JSR': return f"{operand}();"
     if opcode == 'JMP': return f"{operand}(); return;"
     if opcode == 'RTS': return "return;"
@@ -43,58 +44,45 @@ def translate_line(line):
     if opcode == 'BEQ': return f"if (reg_P & 0x02) {{ {operand}(); return; }}"
     if opcode == 'SEC': return "reg_P |= 0x01;"
     if opcode == 'CLC': return "reg_P &= ~0x01;"
-
     return f"// {opcode} {operand}"
 
 def convert_file(filename):
     bank_name = os.path.splitext(filename)[0]
-    in_function = False
+    os.makedirs(OUT_DIR, exist_ok=True)
     with open(os.path.join(ASM_DIR, filename), 'r', encoding='utf-8', errors='ignore') as f:
         lines = f.readlines()
 
-    os.makedirs(OUT_DIR, exist_ok=True)
     with open(os.path.join(OUT_DIR, f"{bank_name}.cpp"), 'w') as out:
-        out.write('#include <stdint.h>\n\n')
-        # Force C-linkage for all shared engine state
-        out.write('extern "C" {\n')
+        out.write('#include <stdint.h>\n\nextern "C" {\n')
         out.write('    extern uint8_t reg_A, reg_X, reg_Y, reg_P, reg_S;\n')
         out.write('    extern void update_nz(uint8_t val);\n')
         out.write('    extern void cpu_adc(uint8_t val);\n')
         out.write('    extern void cpu_sbc(uint8_t val);\n')
         out.write('    extern uint8_t bus_read(uint16_t addr);\n')
         out.write('    extern void bus_write(uint16_t addr, uint8_t val);\n')
-        out.write('    extern uint16_t read_pointer(uint16_t addr);\n')
-        
-        # Forward declarations for other labels in this file (so they don't need to be in order)
-        for line in lines:
-            l_match = re.match(r'^(\w+):', line.strip())
-            if l_match:
-                label = l_match.group(1)
-                if label not in ['power_on_reset', 'nmi_handler']:
-                    out.write(f'    static void {label}();\n')
-                else:
-                    out.write(f'    void {label}();\n')
-        out.write('}\n\n')
+        out.write('    extern uint16_t read_pointer(uint16_t addr);\n\n')
 
+        # Declare all labels first so functions can jump to each other
         for line in lines:
-            label_match = re.match(r'^(\w+):', line.strip())
+            l_match = re.search(r'^\s*(\w+):', line)
+            if l_match: out.write(f'    void {l_match.group(1)}();\n')
+
+        out.write('\n')
+        in_func = False
+        for line in lines:
+            label_match = re.search(r'^\s*(\w+):', line)
             if label_match:
-                if in_function: out.write("}\n")
-                label = label_match.group(1)
-                is_global = label in ['power_on_reset', 'nmi_handler']
-                # Wrap every function definition in extern "C"
-                prefix = 'extern "C" ' if is_global else 'static '
-                out.write(f"{prefix}void {label}() {{\n")
-                in_function = True
+                if in_func: out.write("    }\n\n")
+                out.write(f"    void {label_match.group(1)}() {{\n")
+                in_func = True
             elif line.strip():
                 code = translate_line(line)
-                if code:
-                    out.write(f"    {code}\n")
-                    if "return;" in code and "if (" not in code:
-                        out.write("}\n")
-                        in_function = False
-        if in_function: out.write("}\n")
+                if code: out.write(f"        {code}\n")
+                if code and "return;" in code and "if (" not in code:
+                    out.write("    }\n\n")
+                    in_func = False
+        if in_func: out.write("    }\n")
+        out.write('}\n')
 
 for f in os.listdir(ASM_DIR):
-    if f.endswith('.asm'):
-        convert_file(f)
+    if f.endswith('.asm'): convert_file(f)
