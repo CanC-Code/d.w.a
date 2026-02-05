@@ -66,7 +66,6 @@ def convert_file(filename):
 
         out.write(f'namespace {bank_name} {{\n')
         
-        # Pass 1: Collect and declare labels
         for line in lines:
             l_match = re.search(r'^\s*(\w+):', line)
             if l_match:
@@ -91,20 +90,19 @@ def convert_file(filename):
         if in_func: out.write("    }\n")
         out.write('}\n\n')
 
-        # Pass 2: Global Bridge - Search for common NES entry point names
+        # GLOBAL BRIDGES with inline to prevent duplicate symbol errors
         out.write('extern "C" {\n')
-        # Map common ASM labels to the expected C symbols
         reset_labels = ['power_on_reset', 'RESET', 'START', 'Reset']
         nmi_labels = ['nmi_handler', 'NMI', 'VBlank', 'VBLANK']
         
         for r in reset_labels:
             if r in found_labels:
-                out.write(f'    void power_on_reset() {{ {bank_name}::{r}(); }}\n')
+                out.write(f'    inline void power_on_reset() {{ {bank_name}::{r}(); }}\n')
                 break
         
         for n in nmi_labels:
             if n in found_labels:
-                out.write(f'    void nmi_handler() {{ {bank_name}::{n}(); }}\n')
+                out.write(f'    inline void nmi_handler() {{ {bank_name}::{n}(); }}\n')
                 break
         out.write('}\n')
 
