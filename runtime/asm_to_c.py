@@ -27,13 +27,8 @@ def translate_line(line):
     opcode, operand = match.groups()
     opcode = opcode.upper()
 
-    # --- Arithmetic (The Hard Stuff) ---
-    if opcode == 'ADC':
-        return f"cpu_adc({parse_address(operand)});"
-    if opcode == 'SBC':
-        return f"cpu_sbc({parse_address(operand)});"
-    
-    # --- Standard Instructions ---
+    if opcode == 'ADC': return f"cpu_adc({parse_address(operand)});"
+    if opcode == 'SBC': return f"cpu_sbc({parse_address(operand)});"
     if opcode == 'LDA': return f"reg_A = {parse_address(operand)}; update_nz(reg_A);"
     if opcode == 'LDX': return f"reg_X = {parse_address(operand)}; update_nz(reg_X);"
     if opcode == 'LDY': return f"reg_Y = {parse_address(operand)}; update_nz(reg_Y);"
@@ -41,15 +36,13 @@ def translate_line(line):
         reg = opcode[-1]
         addr = operand.replace('$', '0x').split(',')[0]
         return f"bus_write({addr}, reg_{reg});"
-    
-    # --- Control Flow ---
     if opcode == 'JSR': return f"{operand}();"
     if opcode == 'JMP': return f"{operand}(); return;"
     if opcode == 'RTS': return "return;"
     if opcode == 'BNE': return f"if (!(reg_P & 0x02)) {{ {operand}(); return; }}"
     if opcode == 'BEQ': return f"if (reg_P & 0x02) {{ {operand}(); return; }}"
-    if opcode == 'SEC': return "reg_P |= 0x01; // Set Carry"
-    if opcode == 'CLC': return "reg_P &= ~0x01; // Clear Carry"
+    if opcode == 'SEC': return "reg_P |= 0x01;"
+    if opcode == 'CLC': return "reg_P &= ~0x01;"
 
     return f"// {opcode} {operand}"
 
@@ -59,14 +52,29 @@ def convert_file(filename):
     with open(os.path.join(ASM_DIR, filename), 'r', encoding='utf-8', errors='ignore') as f:
         lines = f.readlines()
 
+    os.makedirs(OUT_DIR, exist_ok=True)
     with open(os.path.join(OUT_DIR, f"{bank_name}.cpp"), 'w') as out:
-        out.write('#include <stdint.h>\n')
-        out.write('extern uint8_t reg_A, reg_X, reg_Y, reg_P, reg_S;\n')
-        out.write('extern void update_nz(uint8_t val);\n')
-        out.write('extern void cpu_adc(uint8_t val);\n')
-        out.write('extern void cpu_sbc(uint8_t val);\n')
-        out.write('extern uint8_t bus_read(uint16_t addr);\n')
-        out.write('extern void bus_write(uint16_t addr, uint8_t val);\n\n')
+        out.write('#include <stdint.h>\n\n')
+        # Force C-linkage for all shared engine state
+        out.write('extern "C" {\n')
+        out.write('    extern uint8_t reg_A, reg_X, reg_Y, reg_P, reg_S;\n')
+        out.write('    extern void update_nz(uint8_t val);\n')
+        out.write('    extern void cpu_adc(uint8_t val);\n')
+        out.write('    extern void cpu_sbc(uint8_t val);\n')
+        out.write('    extern uint8_t bus_read(uint16_t addr);\n')
+        out.write('    extern void bus_write(uint16_t addr, uint8_t val);\n')
+        out.write('    extern uint16_t read_pointer(uint16_t addr);\n')
+        
+        # Forward declarations for other labels in this file (so they don't need to be in order)
+        for line in lines:
+            l_match = re.match(r'^(\w+):', line.strip())
+            if l_match:
+                label = l_match.group(1)
+                if label not in ['power_on_reset', 'nmi_handler']:
+                    out.write(f'    static void {label}();\n')
+                else:
+                    out.write(f'    void {label}();\n')
+        out.write('}\n\n')
 
         for line in lines:
             label_match = re.match(r'^(\w+):', line.strip())
@@ -74,7 +82,8 @@ def convert_file(filename):
                 if in_function: out.write("}\n")
                 label = label_match.group(1)
                 is_global = label in ['power_on_reset', 'nmi_handler']
-                prefix = "" if is_global else "static "
+                # Wrap every function definition in extern "C"
+                prefix = 'extern "C" ' if is_global else 'static '
                 out.write(f"{prefix}void {label}() {{\n")
                 in_function = True
             elif line.strip():
@@ -86,7 +95,6 @@ def convert_file(filename):
                         in_function = False
         if in_function: out.write("}\n")
 
-# Run for all files
 for f in os.listdir(ASM_DIR):
     if f.endswith('.asm'):
         convert_file(f)
