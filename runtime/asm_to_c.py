@@ -28,6 +28,7 @@ def translate_line(line):
     opcode, operand = match.groups()
     opcode = opcode.upper()
 
+    # Opcode logic remains the same
     if opcode == 'ADC': return f"cpu_adc({parse_address(operand)});"
     if opcode == 'SBC': return f"cpu_sbc({parse_address(operand)});"
     if opcode == 'LDA': return f"reg_A = {parse_address(operand)}; update_nz(reg_A);"
@@ -47,22 +48,29 @@ def translate_line(line):
     return f"// {opcode} {operand}"
 
 def convert_file(filename):
-    bank_name = os.path.splitext(filename)[0]
+    bank_name = os.path.splitext(filename)[0].replace("-", "_")
     os.makedirs(OUT_DIR, exist_ok=True)
     with open(os.path.join(ASM_DIR, filename), 'r', encoding='utf-8', errors='ignore') as f:
         lines = f.readlines()
 
     with open(os.path.join(OUT_DIR, f"{bank_name}.cpp"), 'w') as out:
-        out.write('#include <stdint.h>\n\nextern "C" {\n')
+        out.write('#include <stdint.h>\n\n')
+        
+        # External NES CPU state (shared)
+        out.write('extern "C" {\n')
         out.write('    extern uint8_t reg_A, reg_X, reg_Y, reg_P, reg_S;\n')
         out.write('    extern void update_nz(uint8_t val);\n')
         out.write('    extern void cpu_adc(uint8_t val);\n')
         out.write('    extern void cpu_sbc(uint8_t val);\n')
         out.write('    extern uint8_t bus_read(uint16_t addr);\n')
         out.write('    extern void bus_write(uint16_t addr, uint8_t val);\n')
-        out.write('    extern uint16_t read_pointer(uint16_t addr);\n\n')
+        out.write('    extern uint16_t read_pointer(uint16_t addr);\n')
+        out.write('}\n\n')
 
-        # Declare all labels first so functions can jump to each other
+        # Put this bank's logic in its own namespace
+        out.write(f'namespace {bank_name} {{\n')
+        
+        # Forward declare internal labels
         for line in lines:
             l_match = re.search(r'^\s*(\w+):', line)
             if l_match: out.write(f'    void {l_match.group(1)}();\n')
@@ -82,6 +90,14 @@ def convert_file(filename):
                     out.write("    }\n\n")
                     in_func = False
         if in_func: out.write("    }\n")
+        out.write('}\n\n')
+
+        # GLOBAL BRIDGES: Only export the specific symbols the engine needs
+        out.write('extern "C" {\n')
+        if "reset" in filename.lower() or "bank00" in filename.lower():
+             out.write(f'    void power_on_reset() {{ {bank_name}::power_on_reset(); }}\n')
+        if "nmi" in filename.lower() or "bank00" in filename.lower():
+             out.write(f'    void nmi_handler() {{ {bank_name}::nmi_handler(); }}\n')
         out.write('}\n')
 
 for f in os.listdir(ASM_DIR):
