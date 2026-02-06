@@ -131,8 +131,7 @@ bool is_paused = false;
 
 uint16_t ntable_mirror(uint16_t addr) {
     addr = (addr - 0x2000) % 0x1000;
-    // Simple vertical mirroring assumption
-    return addr % 0x0800;
+    return addr % 0x0800; // Vertical Mirroring
 }
 
 uint8_t read_palette(uint16_t addr) {
@@ -147,7 +146,7 @@ extern "C" uint8_t bus_read(uint16_t addr) {
         uint16_t reg = addr % 8;
         if (reg == 2) {
             uint8_t s = ppu_status;
-            ppu_status &= ~0x80; // Clear VBlank on read
+            ppu_status &= ~0x80; 
             ppu_addr_latch = 0;
             return s;
         }
@@ -161,12 +160,10 @@ extern "C" uint8_t bus_read(uint16_t addr) {
             return data;
         }
     }
-    if (addr >= 0x4016 && addr <= 0x4017) {
-        if (addr == 0x4016) {
-            uint8_t ret = (controller_shift & 0x80) >> 7;
-            controller_shift <<= 1;
-            return 0x40 | ret;
-        }
+    if (addr == 0x4016) {
+        uint8_t ret = (controller_shift & 0x80) >> 7;
+        controller_shift <<= 1;
+        return 0x40 | ret;
     }
     if (addr >= 0x6000) return mapper.read_prg(addr);
     return 0;
@@ -200,9 +197,7 @@ extern "C" void bus_write(uint16_t addr, uint8_t val) {
         for (int i = 0; i < 256; i++) oam_ram[i] = bus_read(base + i);
     }
     else if (addr == 0x4016) {
-        if ((val & 0x01) == 0 && (last_strobe & 0x01) == 1) {
-            controller_shift = controller_state;
-        }
+        if ((val & 0x01) == 0 && (last_strobe & 0x01) == 1) controller_shift = controller_state;
         last_strobe = val;
     }
     else if (addr >= 0x6000) mapper.write(addr, val);
@@ -233,25 +228,28 @@ void draw_frame() {
 // --- CPU Entry ---
 extern "C" void power_on_reset() {
     mapper.reset();
+    // MMC1 Specific: Initial state usually maps the last bank to $C000
+    // Force a known valid state for Dragon Warrior
+    mapper.control = 0x1C; 
+    
     uint8_t lo = bus_read(0xFFFC);
     uint8_t hi = bus_read(0xFFFD);
     reg_PC = (hi << 8) | lo;
 
-    if (reg_PC == 0) reg_PC = 0xFF8E; 
+    if (reg_PC < 0x8000) reg_PC = 0xFF8E; 
     reg_S = 0xFD;
     reg_P = 0x24;
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Reset! PC: %04X", reg_PC);
 }
 
 extern "C" void nmi_handler() {
-    ppu_status |= 0x80; // Set VBlank bit
+    ppu_status |= 0x80; 
     push_stack(reg_PC >> 8);
     push_stack(reg_PC & 0xFF);
     push_stack(reg_P);
     
-    uint8_t lo = mapper.read_prg(0xFFFA);
-    uint8_t hi = mapper.read_prg(0xFFFB);
-    reg_PC = (hi << 8) | lo;
+    uint16_t nmi_vector = bus_read(0xFFFA) | (bus_read(0xFFFB) << 8);
+    reg_PC = nmi_vector;
 }
 
 void engine_loop() {
@@ -263,12 +261,18 @@ void engine_loop() {
             continue;
         }
         auto start = std::chrono::steady_clock::now();
-        // Dragon Warrior 1 approx cycle count per frame
         for (int i = 0; i < 29780; i++) {
             execute_instruction();
             if (!is_running) break;
         }
-        nmi_handler();
+        
+        // Trigger NMI if enabled by software
+        if (ppu_ctrl & 0x80) {
+            nmi_handler();
+        } else {
+            ppu_status |= 0x80; // Still set VBlank flag for manual polling
+        }
+        
         draw_frame();
         std::this_thread::sleep_until(start + std::chrono::microseconds(16666));
     }
@@ -279,14 +283,13 @@ void engine_loop() {
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstring romPath, jstring outDir) {
     const char *path = env->GetStringUTFChars(romPath, nullptr);
-
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {
         env->ReleaseStringUTFChars(romPath, path);
         return env->NewStringUTF("Error: Could not open file");
     }
 
-    file.seekg(16, std::ios::beg); // Skip iNES header
+    file.seekg(16, std::ios::beg); 
     for (int i = 0; i < 4; i++) file.read((char*)mapper.prg_rom[i], 16384);
     for (int i = 0; i < 2; i++) file.read((char*)mapper.chr_rom[i], 4096);
 
@@ -324,11 +327,9 @@ Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv *env, jobject thiz, jo
     void* pixels;
     if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) return;
     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
-
     {
         std::lock_guard<std::mutex> lock(buffer_mutex);
         memcpy(pixels, screen_buffer, 256 * 240 * 4);
     }
-
     AndroidBitmap_unlockPixels(env, bitmap);
 }
