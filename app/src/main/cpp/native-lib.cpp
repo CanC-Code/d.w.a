@@ -12,6 +12,7 @@
 #include "recompiled/cpu_shared.h"
 
 #define LOG_TAG "DWA_NATIVE"
+#define LOG_CPU(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 // --- Recompiled Bank Dispatcher ---
 namespace Dispatcher {
@@ -79,14 +80,14 @@ extern "C" {
     }
 
     uint8_t cpu_asl(uint8_t val) {
-        reg_P = (reg_P & ~FLAG_C) | ((val >> 7) & FLAG_C);
+        reg_P = (reg_P & ~FLAG_C) | ((val >> 7) & 0x01);
         uint8_t res = val << 1;
         update_nz(res);
         return res;
     }
 
     uint8_t cpu_lsr(uint8_t val) {
-        reg_P = (reg_P & ~FLAG_C) | (val & FLAG_C);
+        reg_P = (reg_P & ~FLAG_C) | (val & 0x01);
         uint8_t res = val >> 1;
         update_nz(res);
         return res;
@@ -94,7 +95,7 @@ extern "C" {
 
     uint8_t cpu_rol(uint8_t val) {
         uint8_t old_c = (reg_P & FLAG_C);
-        reg_P = (reg_P & ~FLAG_C) | ((val >> 7) & FLAG_C);
+        reg_P = (reg_P & ~FLAG_C) | ((val >> 7) & 0x01);
         uint8_t res = (val << 1) | old_c;
         update_nz(res);
         return res;
@@ -102,7 +103,7 @@ extern "C" {
 
     uint8_t cpu_ror(uint8_t val) {
         uint8_t old_c = (reg_P & FLAG_C);
-        reg_P = (reg_P & ~FLAG_C) | (val & FLAG_C);
+        reg_P = (reg_P & ~FLAG_C) | (val & 0x01);
         uint8_t res = (val >> 1) | (old_c << 7);
         update_nz(res);
         return res;
@@ -135,7 +136,6 @@ uint16_t ntable_mirror(uint16_t addr) {
 
 uint8_t read_palette(uint16_t addr) {
     uint8_t p_idx = addr & 0x1F;
-    // Mirrors $3F10, $3F14, $3F18, $3F1C to $3F00, $3F04, $3F08, $3F0C
     if (p_idx >= 0x10 && (p_idx % 4 == 0)) p_idx -= 0x10; 
     return palette_ram[p_idx];
 }
@@ -155,7 +155,7 @@ extern "C" uint8_t bus_read(uint16_t addr) {
             uint16_t p_addr = ppu_addr_reg & 0x3FFF;
             if (p_addr < 0x2000) ppu_data_buffer = mapper.read_chr(p_addr);
             else if (p_addr < 0x3F00) ppu_data_buffer = ppu_vram[ntable_mirror(p_addr)];
-            else data = read_palette(p_addr); // Direct read for palette
+            else data = read_palette(p_addr);
             ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
             return data;
         }
@@ -224,6 +224,8 @@ void draw_frame() {
 
 // --- CPU Entry ---
 extern "C" void power_on_reset() {
+    // Initial bank setup to ensure fixed bank at $C000 is visible
+    mapper.reset(); 
     reg_PC = (bus_read(0xFFFD) << 8) | bus_read(0xFFFC);
     LOG_CPU("Reset! PC set to: %04X", reg_PC);
 }
@@ -245,7 +247,11 @@ void engine_loop() {
             continue;
         }
         auto start = std::chrono::steady_clock::now();
-        for (int i = 0; i < 29780; i += 3) { execute_instruction(); }
+        // Execute approx 29780 cycles per frame
+        for (int i = 0; i < 10000; i++) { 
+            execute_instruction(); 
+            if (reg_PC == 0) break; // Safety break
+        }
         nmi_handler();
         draw_frame();
         std::this_thread::sleep_until(start + std::chrono::microseconds(16666));
@@ -253,6 +259,31 @@ void engine_loop() {
 }
 
 // --- JNI Lifecycle ---
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_dwa_NativeLib_loadROM(JNIEnv *env, jobject thiz, jbyteArray rom_data) {
+    jbyte* bytes = env->GetByteArrayElements(rom_data, nullptr);
+    jsize len = env->GetArrayLength(rom_data);
+
+    // iNES Header (16 bytes) + PRG (64KB)
+    if (len >= (16 + 65536)) {
+        for (int i = 0; i < 4; i++) {
+            memcpy(mapper.prg_rom[i], &bytes[16 + (i * 16384)], 16384);
+        }
+        LOG_CPU("ROM Loaded successfully: 64KB PRG mapped.");
+    }
+
+    // Load CHR (8KB) if present
+    if (len >= (16 + 65536 + 8192)) {
+        for (int i = 0; i < 2; i++) {
+            memcpy(mapper.chr_rom[i], &bytes[16 + 65536 + (i * 4096)], 4096);
+        }
+    }
+
+    env->ReleaseByteArrayElements(rom_data, bytes, JNI_ABORT);
+    // PC is set during startEngine -> power_on_reset
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_dwa_NativeLib_startEngine(JNIEnv *env, jobject thiz) {
     if (!is_running) {
@@ -269,6 +300,6 @@ Java_com_example_dwa_NativeLib_updateSurface(JNIEnv *env, jobject thiz, jobject 
 
     std::lock_guard<std::mutex> lock(buffer_mutex);
     memcpy(pixels, screen_buffer, 256 * 240 * 4);
-    
+
     AndroidBitmap_unlockPixels(env, bitmap);
 }
