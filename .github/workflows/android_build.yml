@@ -1,5 +1,5 @@
 name: Android CI
-on: 
+on:
   push:
     branches: [ main, master ]
   pull_request:
@@ -32,10 +32,15 @@ jobs:
 
       - name: Execute Static Recompilation
         run: |
-          # Create the directory for recompiled C++ code
           mkdir -p app/src/main/cpp/recompiled
-          # Run the converter script
           python3 runtime/asm_to_c.py
+
+      # --- NEW STEP: Archive the generated C++ files for review ---
+      - name: Upload Recompiled Source for Review
+        uses: actions/upload-artifact@v4
+        with:
+          name: recompiled-cpp-source
+          path: app/src/main/cpp/recompiled/
 
       - name: Execute Runtime Asset Generation
         run: |
@@ -43,7 +48,6 @@ jobs:
           mkdir -p app/src/main/res/mipmap-xxxhdpi
           chmod +x runtime/*.sh
           for script in runtime/*.sh; do
-            # Skip python scripts if they were accidentally placed here
             if [[ "$script" == *.sh ]]; then
               /bin/bash ./"$script"
             fi
@@ -51,19 +55,18 @@ jobs:
 
       - name: Inject Source Files for Internal Extraction
         run: |
-          # Move ASM source files into the APK assets folder
           mkdir -p app/src/main/assets/source_files
-          cp source_files/*.asm app/src/main/assets/source_files/
+          # Use -r in case there are subdirectories
+          cp -r source_files/*.asm app/src/main/assets/source_files/ || true
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
       - name: Build with Gradle
-        # Using :app:assembleDebug ensures we trigger the correct module
         run: ./gradlew :app:assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: dw-native-port
+          name: dw-native-port-apk
           path: app/build/outputs/apk/debug/*.apk
