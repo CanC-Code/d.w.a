@@ -5,48 +5,67 @@ project("dwa")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 1. Automatic Source Discovery
-# This finds all .cpp files in the root and the recompiled folder automatically
-file(GLOB_RECURSE DWA_SOURCES 
-    "*.cpp" 
-    "recompiled/*.cpp"
+# 1. Core Source Files
+# Listing these explicitly ensures CMake tracks dependencies accurately.
+set(CORE_SOURCES
+    native-lib.cpp
+    MapperMMC1.cpp
+    PPU.cpp
 )
 
-# 2. Define the main native library
-add_library(dwa SHARED ${DWA_SOURCES})
+# 2. Recompiled Bank Discovery
+# We use CONFIGURE_DEPENDS so CMake checks for new files during every build.
+# This ensures that when your Python script adds a new Bank file, it gets compiled.
+file(GLOB RECOMPILED_SOURCES CONFIGURE_DEPENDS
+    "recompiled/Dispatcher.cpp"
+    "recompiled/Bank00.cpp"
+    "recompiled/Bank01.cpp"
+    "recompiled/Bank02.cpp"
+    "recompiled/Bank03.cpp"
+    "recompiled/Header.cpp"
+)
 
-# 3. Include Directories
+# 3. Define the Shared Library
+add_library(dwa SHARED 
+    ${CORE_SOURCES} 
+    ${RECOMPILED_SOURCES}
+)
+
+# 4. Include Directories
 target_include_directories(dwa PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/recompiled
 )
 
-# 4. Performance & Compatibility Flags
-# Added -Wno-switch to ignore warnings from the massive switch-cases in Bank files
-# Added -fno-plt for faster calls between shared logic
+# 5. Optimization & Performance Flags
+# -O3: Maximum optimization.
+# -flto: Link-Time Optimization (CRITICAL for performance across recompiled banks).
+# -Wno-switch: The Bank files have thousands of cases; this keeps logs clean.
 target_compile_options(dwa PRIVATE 
     -O3 
-    -fexceptions 
-    -frtti
-    -ffast-math
     -flto
-    -fomit-frame-pointer
     -fno-plt
+    -fomit-frame-pointer
+    -ffast-math
     -Wno-switch
+    -Wno-unused-label
 )
 
-# 5. Linker Flags (Critical for LTO)
-# Ensure the linker uses LTO to inline functions across Bank03 and Dispatcher
+
+
+# 6. Linker Flags
+# --gc-sections removes unused code from the final .so to reduce size.
 target_link_options(dwa PRIVATE 
     -flto
     -Wl,--gc-sections
+    -Wl,--as-needed
 )
 
-# 6. System Libraries
+# 7. System Libraries
 find_library(log-lib log)
 find_library(graphics-lib jnigraphics)
 
-# 7. Final Linkage
+# 8. Final Linkage
 target_link_libraries(dwa 
     ${log-lib} 
     ${graphics-lib}
