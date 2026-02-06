@@ -13,10 +13,12 @@
 #include "recompiled/cpu_shared.h"
 
 #define LOG_TAG "DWA_NATIVE"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// Constants for shared RAM locations in Dragon Warrior
-#define VBlankFlag   0x002D
-#define FrameCounter 0x003C
+// Renamed to avoid conflicts with definitions in cpu_shared.h
+#define DW_RAM_VBLANK_FLAG   0x002D
+#define DW_RAM_FRAME_COUNTER 0x003C
 
 namespace Dispatcher { 
     void execute(); 
@@ -155,8 +157,8 @@ extern "C" {
 // --- Interrupt Handling ---
 void nmi_handler() {
     // 1. Update Game Engine RAM variables to signal VBlank has occurred
-    cpu_ram[VBlankFlag] = 1; 
-    cpu_ram[FrameCounter]++;
+    cpu_ram[DW_RAM_VBLANK_FLAG] = 1; 
+    cpu_ram[DW_RAM_FRAME_COUNTER]++;
 
     // 2. Request the Dispatcher to jump to the NMI vector on the next cycle
     Dispatcher::request_nmi();
@@ -164,6 +166,7 @@ void nmi_handler() {
 
 // --- Main Engine Loop ---
 void engine_loop() {
+    LOGI("Engine Thread Started");
     memset(cpu_ram, 0, sizeof(cpu_ram));
     mapper.reset();
     ppu.reset();
@@ -174,6 +177,7 @@ void engine_loop() {
     
     // Jump to Hardware Reset Vector found in Bank03.asm
     reg_PC = 0xFFD8; 
+    LOGI("CPU Booting at 0x%04X", reg_PC);
 
     is_running = true;
     while (is_running) {
@@ -181,33 +185,27 @@ void engine_loop() {
         
         auto frame_start = std::chrono::steady_clock::now();
 
-        // EXECUTION: 29780 cycles per frame
-        // Interleaved to allow PPU Status bit to be seen by boot-up loops
+        // EXECUTION: ~29780 cycles per frame
         for (int step = 0; step < 2; step++) {
             for (int i = 0; i < 14890; i++) {
                 uint16_t prev_pc = reg_PC;
                 execute_instruction();
-                // Failsafe: If no case matches, move forward to prevent deadlock
                 if (reg_PC == prev_pc) reg_PC++; 
             }
-            if (step == 0) ppu.status |= 0x80; // Set VBlank bit mid-frame
+            if (step == 0) ppu.status |= 0x80; // Interleaved VBlank bit for boot-loops
         }
 
-        // Trigger NMI if PPU Control register has bit 7 set
         if (ppu.ctrl & 0x80) nmi_handler();
-        
-        // Final frame status clearing
         ppu.status &= ~0x80;
 
-        // Render to Screen Buffer
         {
             std::lock_guard<std::mutex> lock(buffer_mutex);
             ppu.render_frame(mapper, nes_palette);
         }
 
-        // Sync to ~60FPS
         std::this_thread::sleep_until(frame_start + std::chrono::microseconds(16666));
     }
+    LOGI("Engine Thread Stopped");
 }
 
 // --- JNI Interface ---
@@ -217,15 +215,17 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstri
     const char *path = env->GetStringUTFChars(romPath, nullptr);
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {
+        LOGE("Failed to open ROM at %s", path);
         env->ReleaseStringUTFChars(romPath, path);
         return env->NewStringUTF("Error: Could not open ROM");
     }
 
-    file.seekg(16, std::ios::beg); // Skip Header
+    file.seekg(16, std::ios::beg); // Skip iNES Header
     for (int i = 0; i < 4; i++) file.read((char*)mapper.prg_rom[i], 16384);
     for (int i = 0; i < 2; i++) file.read((char*)mapper.chr_rom[i], 4096);
 
     file.close();
+    LOGI("ROM Extracted successfully");
     env->ReleaseStringUTFChars(romPath, path);
     return env->NewStringUTF("Success");
 }
