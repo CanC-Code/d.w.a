@@ -146,6 +146,9 @@ extern "C" uint8_t bus_read(uint16_t addr) {
         uint16_t reg = addr % 8;
         if (reg == 2) {
             uint8_t s = ppu_status;
+            // FORCE VBLANK HACK: If bit 7 isn't set, the game may hang at boot.
+            // We ensure it's readable to move the game past initialization.
+            s |= 0x80; 
             ppu_status &= ~0x80; 
             ppu_addr_latch = 0;
             return s;
@@ -228,17 +231,19 @@ void draw_frame() {
 // --- CPU Entry ---
 extern "C" void power_on_reset() {
     mapper.reset();
-    // MMC1 Specific: Initial state usually maps the last bank to $C000
-    // Force a known valid state for Dragon Warrior
+    // MMC1 Specific: Set PRG Bank 3 to fixed ($C000) and Bank 0 to switchable ($8000)
     mapper.control = 0x1C; 
-    
-    uint8_t lo = bus_read(0xFFFC);
-    uint8_t hi = bus_read(0xFFFD);
+    mapper.prg_bank = 0;
+
+    uint8_t lo = mapper.read_prg(0xFFFC);
+    uint8_t hi = mapper.read_prg(0xFFFD);
     reg_PC = (hi << 8) | lo;
 
-    if (reg_PC < 0x8000) reg_PC = 0xFF8E; 
+    // DW1 Failsafe: $FF8E is a common reset entry point for the US version.
+    if (reg_PC == 0x0000 || reg_PC == 0xFFFF) reg_PC = 0xFF8E; 
+    
     reg_S = 0xFD;
-    reg_P = 0x24;
+    reg_P = 0x34; // Start with interrupts disabled
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Reset! PC: %04X", reg_PC);
 }
 
@@ -261,16 +266,18 @@ void engine_loop() {
             continue;
         }
         auto start = std::chrono::steady_clock::now();
+        
+        // Ensure VBlank bit is visible to CPU during the frame execution
+        ppu_status |= 0x80; 
+
         for (int i = 0; i < 29780; i++) {
             execute_instruction();
             if (!is_running) break;
         }
         
-        // Trigger NMI if enabled by software
+        // Trigger NMI if enabled by software (PPUCTRL bit 7)
         if (ppu_ctrl & 0x80) {
             nmi_handler();
-        } else {
-            ppu_status |= 0x80; // Still set VBlank flag for manual polling
         }
         
         draw_frame();
@@ -289,7 +296,7 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstri
         return env->NewStringUTF("Error: Could not open file");
     }
 
-    file.seekg(16, std::ios::beg); 
+    file.seekg(16, std::ios::beg); // Skip iNES header
     for (int i = 0; i < 4; i++) file.read((char*)mapper.prg_rom[i], 16384);
     for (int i = 0; i < 2; i++) file.read((char*)mapper.chr_rom[i], 4096);
 
