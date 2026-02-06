@@ -14,11 +14,9 @@
 
 #define LOG_TAG "DWA_NATIVE"
 
-namespace Dispatcher {
-    void execute();
-}
+namespace Dispatcher { void execute(); }
 
-// --- Hardware ---
+// --- Hardware State ---
 uint8_t cpu_ram[0x0800] = {0};
 MapperMMC1 mapper;
 PPU ppu;
@@ -39,12 +37,13 @@ uint32_t nes_palette[64] = {
     0xFFBCBE00, 0xFF88D100, 0xFF5CE430, 0xFF45E082, 0xFF48CDDE, 0xFF4F4F4F, 0xFF000000, 0xFF000000
 };
 
+// --- CPU Implementation (Shared with Recompiled Code) ---
 extern "C" {
     uint16_t reg_PC = 0;
     uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
 
     void execute_instruction() { Dispatcher::execute(); }
-    
+
     void update_nz(uint8_t val) {
         reg_P &= ~(FLAG_N | FLAG_Z);
         if (val == 0) reg_P |= FLAG_Z;
@@ -109,9 +108,9 @@ extern "C" {
         if (addr < 0x2000) return cpu_ram[addr % 0x0800];
         if (addr >= 0x2000 && addr <= 0x3FFF) return ppu.cpu_read(addr, mapper);
         if (addr == 0x4016) {
-            uint8_t ret = (controller_shift & 0x80) >> 7;
+            uint8_t r = (controller_shift & 0x80) >> 7;
             controller_shift <<= 1;
-            return 0x40 | ret;
+            return 0x40 | r;
         }
         if (addr >= 0x6000) return mapper.read_prg(addr);
         return 0;
@@ -120,13 +119,18 @@ extern "C" {
     void bus_write(uint16_t addr, uint8_t val) {
         if (addr < 0x2000) cpu_ram[addr % 0x0800] = val;
         else if (addr >= 0x2000 && addr <= 0x3FFF) ppu.cpu_write(addr, val, mapper);
-        else if (addr == 0x4014) {
-            uint16_t base = val << 8;
-            for (int i = 0; i < 256; i++) ppu.oam_ram[i] = bus_read(base + i);
+        else if (addr == 0x4014) { // OAM DMA
+            uint16_t b = val << 8;
+            for(int i=0; i<256; i++) ppu.oam_ram[i] = bus_read(b + i);
         }
         else if (addr == 0x4016) {
             if ((val & 0x01) == 0 && (last_strobe & 0x01) == 1) controller_shift = controller_state;
             last_strobe = val;
+        }
+        else if (addr == MusicTrack) {
+            // Logic to trigger native Android Audio track based on 'val'
+            LOG_CPU("Music Change Requested: %02X", val);
+            cpu_ram[MusicTrack] = val;
         }
         else if (addr >= 0x6000) mapper.write(addr, val);
     }
@@ -147,59 +151,62 @@ extern "C" {
 }
 
 void nmi_handler() {
-    // IMPORTANT: Dragon Warrior looks for this flag in its NMI routine
+    // Set Dragon Warrior specific VBlank flag in RAM
     cpu_ram[VBlankFlag] = 1; 
+    cpu_ram[FrameCounter]++;
 
-    push_stack(reg_PC >> 8);
-    push_stack(reg_PC & 0xFF);
+    push_stack(reg_PC >> 8); 
+    push_stack(reg_PC & 0xFF); 
     push_stack(reg_P);
-    uint16_t nmi_vector = bus_read(0xFFFA) | (bus_read(0xFFFB) << 8);
-    reg_PC = nmi_vector;
+    
+    uint16_t vector = bus_read(0xFFFA) | (bus_read(0xFFFB) << 8);
+    reg_PC = vector;
 }
 
 void engine_loop() {
-    // Reset Hardware cleanly
     memset(cpu_ram, 0, sizeof(cpu_ram));
     mapper.reset();
     ppu.reset();
-    
+
+    // Initial Vector Load
     uint8_t lo = mapper.read_prg(0xFFFC);
     uint8_t hi = mapper.read_prg(0xFFFD);
     reg_PC = (hi << 8) | lo;
     if (reg_PC < 0x8000) reg_PC = 0xFF8E; 
 
-    reg_S = 0xFD;
-    reg_P = 0x24; 
-    
     is_running = true;
     while (is_running) {
-        if (is_paused) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(16));
-            continue;
-        }
-        auto start = std::chrono::steady_clock::now();
+        if (is_paused) { std::this_thread::sleep_for(std::chrono::milliseconds(16)); continue; }
+        auto frame_start = std::chrono::steady_clock::now();
 
+        // 29780 cycles per frame approx
         for (int i = 0; i < 29780; i++) {
             uint16_t prev_pc = reg_PC;
             execute_instruction();
-            // Failsafe: if the dispatcher is stuck on an unimplemented address, skip it
-            if (reg_PC == prev_pc) reg_PC++; 
-            if (!is_running) break;
+            if (reg_PC == prev_pc) reg_PC++; // Failsafe
         }
 
-        ppu.status |= 0x80; 
+        ppu.status |= 0x80; // PPU VBlank bit
         if (ppu.ctrl & 0x80) nmi_handler();
 
         {
             std::lock_guard<std::mutex> lock(buffer_mutex);
             ppu.render_frame(mapper, nes_palette);
         }
-
-        std::this_thread::sleep_until(start + std::chrono::microseconds(16666));
+        std::this_thread::sleep_until(frame_start + std::chrono::microseconds(16666));
     }
 }
 
-// --- JNI Bridge ---
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv *env, jobject thiz, jobject bitmap) {
+    void* pixels;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
+    {
+        std::lock_guard<std::mutex> lock(buffer_mutex);
+        memcpy(pixels, ppu.screen_buffer, 256 * 240 * 4);
+    }
+    AndroidBitmap_unlockPixels(env, bitmap);
+}
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstring romPath, jstring outDir) {
@@ -210,7 +217,7 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstri
         return env->NewStringUTF("Error: Could not open file");
     }
 
-    file.seekg(16, std::ios::beg); // Skip iNES
+    file.seekg(16, std::ios::beg); // Skip iNES Header
     for (int i = 0; i < 4; i++) file.read((char*)mapper.prg_rom[i], 16384);
     for (int i = 0; i < 2; i++) file.read((char*)mapper.chr_rom[i], 4096);
 
@@ -226,26 +233,9 @@ Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv *env, jobject thiz, jstri
     }
 }
 
-extern "C" JNIEXPORT void JNICALL
-Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv *env, jobject thiz, jobject bitmap) {
-    AndroidBitmapInfo info;
-    void* pixels;
-    if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) return;
-    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
-    {
-        std::lock_guard<std::mutex> lock(buffer_mutex);
-        memcpy(pixels, ppu.screen_buffer, 256 * 240 * 4);
-    }
-    AndroidBitmap_unlockPixels(env, bitmap);
-}
-
-extern "C" JNIEXPORT void JNICALL 
-Java_com_canc_dwa_MainActivity_injectInput(JNIEnv *env, jobject thiz, jint bit, jboolean p) {
+extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_injectInput(JNIEnv *env, jobject thiz, jint bit, jboolean p) {
     if (p) controller_state |= (uint8_t)bit; else controller_state &= ~((uint8_t)bit);
 }
 
-extern "C" JNIEXPORT void JNICALL 
-Java_com_canc_dwa_MainActivity_nativePauseEngine(JNIEnv *env, jobject thiz) { is_paused = true; }
-
-extern "C" JNIEXPORT void JNICALL 
-Java_com_canc_dwa_MainActivity_nativeResumeEngine(JNIEnv *env, jobject thiz) { is_paused = false; }
+extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativePauseEngine(JNIEnv *env, jobject thiz) { is_paused = true; }
+extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeResumeEngine(JNIEnv *env, jobject thiz) { is_paused = false; }
