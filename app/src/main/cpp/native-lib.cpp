@@ -18,6 +18,7 @@ uint8_t ppu_vram[2048] = {0};
 uint8_t palette_ram[32] = {0};
 uint32_t screen_buffer[256 * 240] = {0};
 uint8_t controller_state = 0;
+uint8_t controller_shift = 0; // Added for correct strobe logic
 uint8_t ppu_data_buffer = 0;
 std::mutex buffer_mutex;
 MapperMMC1 mapper;
@@ -29,7 +30,6 @@ extern "C" {
     uint8_t bus_read(uint16_t addr);
     void bus_write(uint16_t addr, uint8_t val);
 
-    // --- STACK ---
     void push_stack(uint8_t val) {
         cpu_ram[0x0100 | reg_S] = val;
         reg_S--;
@@ -40,7 +40,6 @@ extern "C" {
         return cpu_ram[0x0100 | reg_S];
     }
 
-    // --- FLAGS ---
     void update_nz(uint8_t val) { 
         reg_P &= ~0x82; 
         if (val == 0) reg_P |= 0x02;
@@ -55,7 +54,6 @@ extern "C" {
         if (res & 0x80) reg_P |= 0x80; 
     }
 
-    // --- MATH & LOGIC ---
     void cpu_adc(uint8_t val) {
         uint16_t carry = (reg_P & 0x01);
         uint16_t sum = reg_A + val + carry;
@@ -69,16 +67,13 @@ extern "C" {
 
     void cpu_sbc(uint8_t val) { cpu_adc(~val); }
 
-    // Required for bitwise assembly instructions
     void cpu_bit(uint8_t val) {
-        reg_P &= ~0xC2; // Clear N, V, Z
+        reg_P &= ~0xC2; 
         if ((val & reg_A) == 0) reg_P |= 0x02;
-        reg_P |= (val & 0xC0); // Copy bits 7 and 6 to N and V
+        reg_P |= (val & 0xC0); 
     }
 
-    // --- ADDRESSING HELPERS ---
     uint16_t read_pointer(uint16_t addr) {
-        // Zero-page wrap-around is a 6502 quirk often used in Dragon Warrior
         uint8_t lo = bus_read(addr);
         uint8_t hi = bus_read((addr & 0xFF00) | ((addr + 1) & 0x00FF));
         return (hi << 8) | lo;
@@ -89,7 +84,6 @@ extern "C" {
         return read_pointer(ptr);
     }
 
-    // Recompiled Entry Points
     void power_on_reset();
     void nmi_handler();
 }
@@ -108,28 +102,33 @@ uint32_t nes_palette[64] = {
     0xFFBCBE00, 0xFF88D100, 0xFF5CE430, 0xFF45E082, 0xFF48CDDE, 0xFF4F4F4F, 0xFF000000, 0xFF000000
 };
 
-// --- BUS ---
+// --- BUS Implementation ---
 extern "C" uint8_t bus_read(uint16_t addr) {
     if (addr < 0x2000) return cpu_ram[addr % 0x0800];
     if (addr >= 0x2000 && addr <= 0x3FFF) {
-        if (addr % 8 == 2) { 
+        uint16_t reg = addr % 8;
+        if (reg == 2) { 
             uint8_t s = ppu_status; 
-            ppu_status &= ~0x80; 
+            ppu_status &= ~0x80; // Clear VBlank on read
             ppu_addr_latch = 0; 
             return s; 
         }
-        if (addr % 8 == 7) {
+        if (reg == 7) {
             uint8_t data = ppu_data_buffer;
             uint16_t p_addr = ppu_addr_reg & 0x3FFF;
+            // Read buffered data, then update buffer with current VRAM value
             if (p_addr < 0x3F00) ppu_data_buffer = (p_addr >= 0x2000) ? ppu_vram[p_addr % 2048] : mapper.read_chr(p_addr);
-            else { data = palette_ram[p_addr & 0x1F]; ppu_data_buffer = ppu_vram[p_addr % 2048]; }
+            else { 
+                data = palette_ram[p_addr & 0x1F]; // Palettes are not buffered
+                ppu_data_buffer = ppu_vram[p_addr % 2048]; 
+            }
             ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
             return data;
         }
     }
     if (addr == 0x4016) { 
-        uint8_t ret = (controller_state & 0x80) >> 7;
-        controller_state <<= 1;
+        uint8_t ret = (controller_shift & 0x80) >> 7;
+        controller_shift <<= 1;
         return ret;
     }
     if (addr >= 0x8000) return mapper.read_prg(addr);
@@ -152,14 +151,18 @@ extern "C" void bus_write(uint16_t addr, uint8_t val) {
             ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
         }
     }
+    else if (addr == 0x4016) {
+        if ((val & 0x01) == 0) controller_shift = controller_state; // Latch input on strobe
+    }
     else if (addr >= 0x8000) mapper.write(addr, val);
 }
 
-// --- GRAPHICS ---
+// --- GRAPHICS Rendering ---
 void draw_frame() {
     std::lock_guard<std::mutex> lock(buffer_mutex);
     uint16_t nt_base = (ppu_ctrl & 0x03) * 1024;
     uint16_t pat_base = (ppu_ctrl & 0x10) ? 0x1000 : 0x0000;
+
     for (int ty = 0; ty < 30; ty++) {
         for (int tx = 0; tx < 32; tx++) {
             uint8_t tile = ppu_vram[(nt_base + ty * 32 + tx) % 2048];
@@ -168,7 +171,13 @@ void draw_frame() {
                 uint8_t p2 = mapper.read_chr(pat_base + tile * 16 + y + 8);
                 for (int x = 0; x < 8; x++) {
                     uint8_t pix = ((p1 >> (7 - x)) & 0x01) | (((p2 >> (7 - x)) & 0x01) << 1);
-                    screen_buffer[(ty * 8 + y) * 256 + (tx * 8 + x)] = (pix != 0) ? nes_palette[palette_ram[pix] & 0x3F] : 0xFF000000;
+                    uint32_t color = 0xFF000000;
+                    if (pix != 0) {
+                        // Palette indices for background: 0-3, 4-7, 8-11, 12-15
+                        // For now, using basic palette index 0 for all background
+                        color = nes_palette[palette_ram[pix] & 0x3F];
+                    }
+                    screen_buffer[(ty * 8 + y) * 256 + (tx * 8 + x)] = color;
                 }
             }
         }
@@ -179,24 +188,34 @@ void engine_loop() {
     power_on_reset();
     while (is_running) {
         auto start = std::chrono::steady_clock::now();
-        ppu_status |= 0x80; // Set VBlank
+        
+        // PPU Status Logic
+        ppu_status |= 0x80; // Set VBlank bit
         if (ppu_ctrl & 0x80) nmi_handler();
+        
         draw_frame();
+        
+        // Simulating NTSC 60Hz
         std::this_thread::sleep_until(start + std::chrono::milliseconds(16));
     }
 }
 
-// --- JNI ---
+// --- JNI Implementation ---
 extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv* env, jobject thiz, jstring filesDir) {
     if (is_running) return;
     const char* cPath = env->GetStringUTFChars(filesDir, 0); 
     std::string pathStr(cPath);
+    
+    // Ensure Mapper is starting fresh
+    mapper.reset();
+
     for(int i = 0; i < 4; i++) {
         std::ifstream in(pathStr + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
         if (in) in.read((char*)mapper.prg_rom[i], 16384);
     }
     std::ifstream c_in(pathStr + "/chr_rom.bin", std::ios::binary); 
     if (c_in) c_in.read((char*)mapper.chr_rom, 16384);
+    
     is_running = true; 
     std::thread(engine_loop).detach();
     env->ReleaseStringUTFChars(filesDir, cPath);
@@ -205,7 +224,10 @@ extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeInitEngin
 extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv* env, jobject thiz, jobject bitmap) {
     void* pixels; 
     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
-    { std::lock_guard<std::mutex> lock(buffer_mutex); memcpy(pixels, screen_buffer, 256 * 240 * 4); }
+    { 
+        std::lock_guard<std::mutex> lock(buffer_mutex); 
+        memcpy(pixels, screen_buffer, 256 * 240 * 4); 
+    }
     AndroidBitmap_unlockPixels(env, bitmap);
 }
 
@@ -214,19 +236,26 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_canc_dwa_MainActivity_nativeExtrac
     const char* cOut = env->GetStringUTFChars(outDir, 0);
     std::ifstream nes(cPath, std::ios::binary);
     if (!nes) return env->NewStringUTF("File Error");
+    
+    // Basic iNES header skip (16 bytes)
     nes.seekg(16);
     for (int i = 0; i < 4; i++) {
-        std::vector<char> buf(16384); nes.read(buf.data(), 16384);
+        std::vector<char> buf(16384); 
+        nes.read(buf.data(), 16384);
         std::ofstream out(std::string(cOut) + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
         out.write(buf.data(), 16384);
     }
-    std::vector<char> chr(16384); nes.read(chr.data(), 16384);
+    std::vector<char> chr(16384); 
+    nes.read(chr.data(), 16384);
     std::ofstream c_out(std::string(cOut) + "/chr_rom.bin", std::ios::binary);
     c_out.write(chr.data(), 16384);
-    env->ReleaseStringUTFChars(romPath, cPath); env->ReleaseStringUTFChars(outDir, cOut);
+    
+    env->ReleaseStringUTFChars(romPath, cPath); 
+    env->ReleaseStringUTFChars(outDir, cOut);
     return env->NewStringUTF("Success");
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_injectInput(JNIEnv* env, jobject thiz, jint bit, jboolean pressed) {
-    if (pressed) controller_state |= bit; else controller_state &= ~bit;
+    if (pressed) controller_state |= bit; 
+    else controller_state &= ~bit;
 }
