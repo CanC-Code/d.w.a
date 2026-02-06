@@ -26,7 +26,7 @@
 #define MapHeight          0x0014
 #define PlayerFlags        0x00CF 
 
-// --- Missing Directional & Audio Aliases (from Bank01/Bank03 errors) ---
+// --- Directional & Audio Engine Aliases ---
 #define DIR_UP             0x00
 #define DIR_RIGHT          0x01
 #define DIR_DOWN           0x02
@@ -41,8 +41,51 @@
 #define MCTL_NOIS_SW       0x06
 #define MCTL_DMC_HW        0x07
 
-// --- Function Entry Points (Targets for JSR/JMP) ---
-// These resolve the "undeclared identifier" errors in Bank00-Bank03
+// --- Map Data Pointers (Required for Bank 00) ---
+[span_0](start_span)// Extracted from MapDatTbl in Bank 00[span_0](end_span)
+#define DLCstlGFDat        0x80B0
+#define HauksnessDat       0x8178
+#define TantGFDat          0x8240
+#define ThrnRoomDat        0x8402
+#define DgnLrdBLDat        0x8434
+#define KolDat             0x85F6
+#define BrecconaryDat      0x8716
+#define CantlinDat         0x88D8
+#define GarinhamDat        0x8A9A
+#define RimuldarDat        0x8B62
+#define TantSLDat          0x8D24
+#define RainCaveDat        0x8D56
+#define DropCaveDat        0x8D88
+#define DgnLrdSL1Dat       0x8DBA
+#define DgnLrdSL2Dat       0x8E82
+#define DgnLrdSL3Dat       0x8EB4
+#define DgnLrdSL4Dat       0x8EE6
+#define DgnLrdSL5Dat       0x8F18
+#define DgnLrdSL6Dat       0x8F4A
+#define SwampCaveDat       0x8F7C
+#define RckMtnB1Dat        0x8FD6
+#define RckMtnB2Dat        0x9038
+#define GarinCaveB1Dat     0x909A
+#define GarinCaveB2Dat     0x925C
+#define GarinCaveB3Dat     0x9162
+#define GarinCaveB4Dat     0x922A
+#define ErdCaveB1Dat       0x92B0
+#define ErdCaveB2Dat       0x92E2
+
+// --- Text Block Aliases (Required for Dialog/Strings) ---
+[span_1](start_span)// Text Block 1 (found at 0x8000 in its respective bank segment)[span_1](end_span)
+#define TextBlock1         0x8000
+#define TB1E0              0x8000
+#define TB1E1              0x8039
+#define TB1E2              0x804A
+[span_2](start_span)// Text Block 8 (found at 0x8000 in Bank 02 segment)[span_2](end_span)
+#define TextBlock8         0x8000
+#define TB8E0              0x8000
+[span_3](start_span)// Text Block 14 (found at 0xAA6C region)[span_3](end_span)
+#define TB14E2             0xAA6C
+#define TB14E3             0xAA8F
+
+// --- Global Function Entry Points ---
 #define BankPointers       0x8000
 #define ModAttribBits      0xC006
 #define GetNPCSpriteIndex  0xC0F4
@@ -61,40 +104,6 @@
 #define CheckForTriggers   0xCBF7
 #define ChangeMaps         0xD9E2
 #define WaitForNMI         0xFF74
-
-// Missing labels discovered during compilation
-#define C5E0               0xC5E0
-#define C009               0xC009
-#define CalcAttribAddr     0xAF70
-#define SetAttribBits      0xAFB0
-#define AttribLoop         0xAF8C
-#define NPCNewDir          0xB1A0
-#define ChkPlayerRight     0xB1C4
-#define UpdateSound        0x8040
-#define GetNextNote        0x80C0
-#define SoundUpdateEnd     0x8110
-#define MusicReturn        0x8140
-#define ProcessAudioByte   0x8150
-
-// Data Pointers (Bank00)
-#define MapDatTbl          0x8042
-#define BrecCvrdDatPtr     0x8026
-#define GarinCvrdDatPtr    0x802A
-#define CantCvrdDatPtr     0x802E
-#define RimCvrdDatPtr      0x8032
-#define DLCstlGFDat        0x8284
-#define HauksnessDat       0x8326
-#define TantGFDat          0x8368
-#define ThrnRoomDat        0x8430
-#define DgnLrdBLDat        0x8452
-#define KolDat             0x8514
-#define BrecconaryDat      0x8564
-#define CantlinDat         0x8626
-#define GarinhamDat        0x8688
-#define RimuldarDat        0x8730
-#define TantSLDat          0x8792
-#define RainCaveDat        0x8814
-#define DropCaveDat        0x8836
 
 extern "C" {
     // --- CPU Registers ---
@@ -118,7 +127,7 @@ extern "C" {
     extern void cpu_sbc(uint8_t val);
     extern void cpu_bit(uint8_t val);
     
-    // FIX: cpu_asl must return uint8_t to support "reg_A = cpu_asl(reg_A);"
+    // Updated to support return values for Accumulator-mode shifts
     extern uint8_t cpu_asl(uint8_t val);
     extern uint8_t cpu_lsr(uint8_t val);
     extern uint8_t cpu_rol(uint8_t val);
@@ -127,8 +136,6 @@ extern "C" {
     // --- Addressing Helpers ---
     extern uint16_t read_pointer(uint16_t addr);
     extern uint16_t read_pointer_x(uint16_t addr);
-    
-    // FIX: Added for "LDA ($ZP),Y" support in recompiled files
     extern uint16_t read_pointer_indexed_y(uint16_t zp_addr);
 
     // --- Execution Control ---
