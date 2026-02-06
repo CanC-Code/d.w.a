@@ -37,12 +37,14 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     private View gameContainer, setupContainer, menuOverlay;
     private SurfaceView gameSurface;
     private Bitmap screenBitmap;
-    private boolean isEngineRunning = false;
+    
+    // Lifecycle States
+    private boolean isEngineInitialized = false; 
     private boolean isSurfaceReady = false; 
+    private boolean isPaused = false;
     private boolean isEditMode = false;
+    
     private final Rect destRect = new Rect();
-
-    // Layout State for Customization
     private float gameScreenYOffset = 0;
     private float gameScaleFactor = 1.0f;
     private ScaleGestureDetector scaleDetector;
@@ -57,17 +59,14 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         gameSurface = findViewById(R.id.game_surface);
         menuOverlay = findViewById(R.id.menu_overlay);
 
-        // Standard NES resolution (256x240)
         screenBitmap = Bitmap.createBitmap(256, 240, Bitmap.Config.ARGB_8888);
         gameSurface.getHolder().addCallback(this);
 
-        // Load saved layout preferences
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         gameScreenYOffset = prefs.getFloat("screen_y_offset", 0);
         gameScaleFactor = prefs.getFloat("screen_scale", 1.0f);
 
         setupScaleDetector();
-
         findViewById(R.id.btn_select_rom).setOnClickListener(v -> openFilePicker());
 
         if (isRomExtracted()) {
@@ -75,43 +74,96 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         }
     }
 
-    private void setupScaleDetector() {
-        scaleDetector = new ScaleGestureDetector(this, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
-            @Override
-            public boolean onScale(ScaleGestureDetector detector) {
-                if (isEditMode) {
-                    gameScaleFactor *= detector.getScaleFactor();
-                    gameScaleFactor = Math.max(0.5f, Math.min(gameScaleFactor, 3.0f));
-                    saveLayout();
-                    return true;
-                }
-                return false;
-            }
-        });
-    }
-
     @Override
     protected void onPause() {
         super.onPause();
-        if (isEngineRunning) nativePauseEngine();
+        isPaused = true;
+        if (isEngineInitialized) {
+            nativePauseEngine();
+        }
+        // Choreographer callback will naturally stop because we stop posting the next frame
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (isEngineRunning) nativeResumeEngine();
+        isPaused = false;
+        if (isEngineInitialized) {
+            nativeResumeEngine();
+            // Restart the drawing loop if the surface is already there
+            if (isSurfaceReady) {
+                Choreographer.getInstance().removeFrameCallback(this);
+                Choreographer.getInstance().postFrameCallback(this);
+            }
+        }
     }
 
+    /**
+     * Centralized Drawing Loop
+     */
     @Override
-    public void onBackPressed() {
-        if (isEditMode) exitEditMode();
-        else if (gameContainer != null && gameContainer.getVisibility() == View.VISIBLE) showSettingsMenu();
-        else super.onBackPressed();
+    public void doFrame(long frameTimeNanos) {
+        // Stop the loop if the surface is gone or the app is in background
+        if (isPaused || !isSurfaceReady || !isEngineInitialized) return;
+
+        nativeUpdateSurface(screenBitmap);
+
+        SurfaceHolder holder = gameSurface.getHolder();
+        Canvas canvas = holder.lockCanvas();
+        if (canvas != null) {
+            try {
+                canvas.drawColor(0xFF000000); 
+                
+                float baseScale = Math.min((float)gameSurface.getWidth() / 256f, (float)gameSurface.getHeight() / 240f);
+                float finalScale = baseScale * gameScaleFactor;
+
+                int w = (int)(256 * finalScale);
+                int h = (int)(240 * finalScale);
+                int left = (gameSurface.getWidth() - w) / 2;
+                int top = ((gameSurface.getHeight() - h) / 2) + (int)gameScreenYOffset;
+
+                destRect.set(left, top, left + w, top + h);
+                canvas.drawBitmap(screenBitmap, null, destRect, null);
+            } finally { 
+                holder.unlockCanvasAndPost(canvas); 
+            }
+        }
+        
+        // Re-schedule next frame
+        Choreographer.getInstance().postFrameCallback(this);
+    }
+
+    private void startNativeEngine() {
+        if (!isEngineInitialized) {
+            nativeInitEngine(getFilesDir().getAbsolutePath());
+            isEngineInitialized = true;
+        }
+        
+        showGameLayout();
+        
+        // Kickstart the rendering loop
+        if (isSurfaceReady && !isPaused) {
+            Choreographer.getInstance().removeFrameCallback(this);
+            Choreographer.getInstance().postFrameCallback(this);
+        }
+    }
+
+    @Override 
+    public void surfaceCreated(@NonNull SurfaceHolder h) { 
+        isSurfaceReady = true; 
+        if (isRomExtracted()) { 
+            startNativeEngine(); 
+        }
+    }
+
+    @Override 
+    public void surfaceDestroyed(@NonNull SurfaceHolder h) { 
+        isSurfaceReady = false; 
     }
 
     private void showSettingsMenu() {
         nativePauseEngine();
-        String[] options = {"Toggle Orientation", "Edit Layout (Drag/Pinch)", "Reset Layout", "Resume"};
+        String[] options = {"Toggle Orientation", "Edit Layout", "Reset Layout", "Resume"};
         new AlertDialog.Builder(this)
                 .setTitle("Settings")
                 .setItems(options, (dialog, which) -> {
@@ -124,177 +176,32 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
                 .show();
     }
 
-    private void toggleOrientation() {
-        int current = getResources().getConfiguration().orientation;
-        setRequestedOrientation(current == Configuration.ORIENTATION_LANDSCAPE ? 
-                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT : ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
-    }
-
     private void resumeGame() {
         if (menuOverlay != null) menuOverlay.setVisibility(View.GONE);
-        nativeResumeEngine();
+        if (!isPaused) nativeResumeEngine();
     }
 
-    private void enterEditMode() {
-        isEditMode = true;
-        Toast.makeText(this, "Drag buttons/screen. Pinch screen to scale.", Toast.LENGTH_LONG).show();
-        setupTouchControls(); 
-    }
+    // --- Implementation of existing methods (trimmed for brevity) ---
 
-    private void exitEditMode() {
-        isEditMode = false;
-        saveLayout();
-        setupTouchControls(); 
-        resumeGame();
-    }
-
-    private void saveLayout() {
-        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
-                .putFloat("screen_y_offset", gameScreenYOffset)
-                .putFloat("screen_scale", gameScaleFactor)
-                .apply();
-    }
-
-    private void savePosition(String key, float x, float y) {
-        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
-                .putFloat(key + "_x", x).putFloat(key + "_y", y).apply();
-    }
-
-    private void loadPosition(View v, String key) {
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-        float x = prefs.getFloat(key + "_x", -1);
-        float y = prefs.getFloat(key + "_y", -1);
-        if (x != -1 && y != -1) { v.setX(x); v.setY(y); }
-    }
-
-    private void resetPositions() {
-        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().clear().apply();
-        recreate(); 
-    }
-
-    /**
-     * The FrameCallback is triggered by the Android System V-Sync.
-     * It fetches the latest rendered buffer from the C++ PPU and draws it to the Surface.
-     */
-    @Override
-    public void doFrame(long frameTimeNanos) {
-        if (!isEngineRunning || !isSurfaceReady) return;
-
-        // Fetch pixels from C++ engine
-        nativeUpdateSurface(screenBitmap);
-
-        SurfaceHolder holder = gameSurface.getHolder();
-        Canvas canvas = holder.lockCanvas();
-        if (canvas != null) {
-            try {
-                canvas.drawColor(0xFF000000); // Clear to black
-                
-                // Aspect ratio correction (256:240)
-                float baseScale = Math.min((float)gameSurface.getWidth() / 256f, (float)gameSurface.getHeight() / 240f);
-                float finalScale = baseScale * gameScaleFactor;
-
-                int w = (int)(256 * finalScale);
-                int h = (int)(240 * finalScale);
-                int left = (gameSurface.getWidth() - w) / 2;
-                int top = ((gameSurface.getHeight() - h) / 2) + (int)gameScreenYOffset;
-
-                destRect.set(left, top, left + w, top + h);
-                canvas.drawBitmap(screenBitmap, null, destRect, null);
-            } finally { holder.unlockCanvasAndPost(canvas); }
-        }
-        
-        // Request the next frame
-        Choreographer.getInstance().postFrameCallback(this);
-    }
-
-    @SuppressLint("ClickableViewAccessibility")
-    private void setupTouchControls() {
-        // NES masks: A=0x80, B=0x40, Select=0x20, Start=0x10, Up=0x08, Down=0x04, Left=0x02, Right=0x01
-        View[] dpad = { findViewById(R.id.btn_up), findViewById(R.id.btn_down), 
-                        findViewById(R.id.btn_left), findViewById(R.id.btn_right) };
-        String[] keys = {"up", "down", "left", "right"};
-        int[] masks = {0x08, 0x04, 0x02, 0x01};
-
-        for (int i = 0; i < dpad.length; i++) {
-            if (dpad[i] != null) bindDpadGroup(dpad[i], masks[i], keys[i], dpad, keys);
-        }
-
-        bindButton(R.id.btn_a, 0x80, "a"); 
-        bindButton(R.id.btn_b, 0x40, "b");
-        bindButton(R.id.btn_start, 0x10, "start"); 
-        bindButton(R.id.btn_select, 0x20, "select");
-
-        gameSurface.setOnTouchListener((v, event) -> {
-            scaleDetector.onTouchEvent(event);
-            if (isEditMode && event.getAction() == MotionEvent.ACTION_MOVE && !scaleDetector.isInProgress()) {
-                gameScreenYOffset = event.getRawY() - (gameSurface.getHeight() / 2f);
-                return true;
-            }
-            return isEditMode;
-        });
-    }
-
-    @SuppressLint("ClickableViewAccessibility")
-    private void bindDpadGroup(View v, int mask, String key, View[] group, String[] keys) {
-        loadPosition(v, key);
-        v.setOnTouchListener((v1, event) -> {
-            if (isEditMode && event.getAction() == MotionEvent.ACTION_MOVE) {
-                float dx = event.getRawX() - (v1.getWidth() / 2f) - v1.getX();
-                float dy = event.getRawY() - (v1.getHeight() / 2f) - v1.getY();
-                for (int i = 0; i < group.length; i++) {
-                    group[i].setX(group[i].getX() + dx);
-                    group[i].setY(group[i].getY() + dy);
-                    savePosition(keys[i], group[i].getX(), group[i].getY());
+    private void setupScaleDetector() {
+        scaleDetector = new ScaleGestureDetector(this, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            @Override public boolean onScale(ScaleGestureDetector d) {
+                if (isEditMode) {
+                    gameScaleFactor = Math.max(0.5f, Math.min(gameScaleFactor * d.getScaleFactor(), 3.0f));
+                    saveLayout();
+                    return true;
                 }
-                return true;
+                return false;
             }
-            return handleInput(v1, event, mask);
         });
     }
 
-    @SuppressLint("ClickableViewAccessibility")
-    private void bindButton(int resId, int mask, String key) {
-        View v = findViewById(resId);
-        if (v == null) return;
-        loadPosition(v, key);
-        v.setOnTouchListener((v1, event) -> {
-            if (isEditMode && event.getAction() == MotionEvent.ACTION_MOVE) {
-                v1.setX(event.getRawX() - (v1.getWidth() / 2f));
-                v1.setY(event.getRawY() - (v1.getHeight() / 2f));
-                savePosition(key, v1.getX(), v1.getY());
-                return true;
-            }
-            return handleInput(v1, event, mask);
-        });
-    }
-
-    private boolean handleInput(View v, MotionEvent e, int mask) {
-        if (e.getAction() == MotionEvent.ACTION_DOWN) { 
-            injectInput(mask, true); 
-            v.setPressed(true); 
-        } else if (e.getAction() == MotionEvent.ACTION_UP || e.getAction() == MotionEvent.ACTION_CANCEL) { 
-            injectInput(mask, false); 
-            v.setPressed(false); 
-        }
-        return true;
-    }
+    private boolean isRomExtracted() { return new File(getFilesDir(), "base.nes").exists(); }
 
     private void showGameLayout() {
         if (setupContainer != null) setupContainer.setVisibility(View.GONE);
         if (gameContainer != null) gameContainer.setVisibility(View.VISIBLE);
         setupTouchControls();
-    }
-
-    private void startNativeEngine() {
-        if (isEngineRunning) return;
-        showGameLayout();
-        nativeInitEngine(getFilesDir().getAbsolutePath());
-        isEngineRunning = true;
-        if (isSurfaceReady) Choreographer.getInstance().postFrameCallback(this);
-    }
-
-    private boolean isRomExtracted() {
-        return new File(getFilesDir(), "base.nes").exists();
     }
 
     private void openFilePicker() {
@@ -323,26 +230,75 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             os.close(); is.close();
 
             String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
-            if ("Success".equals(result)) {
-                startNativeEngine();
-            } else {
-                Toast.makeText(this, "ROM Error: " + result, Toast.LENGTH_SHORT).show();
+            if ("Success".equals(result)) startNativeEngine();
+            else Toast.makeText(this, "ROM Error: " + result, Toast.LENGTH_SHORT).show();
+        } catch (Exception e) { Log.e("DWA", "File error", e); }
+    }
+
+    // Input Handling
+    private boolean handleInput(View v, MotionEvent e, int mask) {
+        if (e.getAction() == MotionEvent.ACTION_DOWN) { injectInput(mask, true); v.setPressed(true); } 
+        else if (e.getAction() == MotionEvent.ACTION_UP || e.getAction() == MotionEvent.ACTION_CANCEL) { 
+            injectInput(mask, false); v.setPressed(false); 
+        }
+        return true;
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private void setupTouchControls() {
+        int[] masks = {0x08, 0x04, 0x02, 0x01}; // U, D, L, R
+        View[] dpad = { findViewById(R.id.btn_up), findViewById(R.id.btn_down), findViewById(R.id.btn_left), findViewById(R.id.btn_right) };
+        String[] keys = {"up", "down", "left", "right"};
+        for (int i = 0; i < dpad.length; i++) if (dpad[i] != null) bindDpadGroup(dpad[i], masks[i], keys[i], dpad, keys);
+        bindButton(R.id.btn_a, 0x80, "a"); bindButton(R.id.btn_b, 0x40, "b");
+        bindButton(R.id.btn_start, 0x10, "start"); bindButton(R.id.btn_select, 0x20, "select");
+        gameSurface.setOnTouchListener((v, event) -> {
+            scaleDetector.onTouchEvent(event);
+            if (isEditMode && event.getAction() == MotionEvent.ACTION_MOVE && !scaleDetector.isInProgress()) {
+                gameScreenYOffset = event.getRawY() - (gameSurface.getHeight() / 2f); return true;
             }
-        } catch (Exception e) { 
-            Log.e("DWA", "File error", e); 
-        }
+            return isEditMode;
+        });
     }
 
-    @Override public void surfaceCreated(@NonNull SurfaceHolder h) { 
-        isSurfaceReady = true; 
-        if (isRomExtracted()) { 
-            startNativeEngine(); 
-        }
+    private void bindDpadGroup(View v, int mask, String key, View[] group, String[] keys) {
+        loadPosition(v, key);
+        v.setOnTouchListener((v1, event) -> {
+            if (isEditMode && event.getAction() == MotionEvent.ACTION_MOVE) {
+                float dx = event.getRawX() - (v1.getWidth() / 2f) - v1.getX();
+                float dy = event.getRawY() - (v1.getHeight() / 2f) - v1.getY();
+                for (int i = 0; i < group.length; i++) {
+                    group[i].setX(group[i].getX() + dx); group[i].setY(group[i].getY() + dy);
+                    savePosition(keys[i], group[i].getX(), group[i].getY());
+                }
+                return true;
+            }
+            return handleInput(v1, event, mask);
+        });
     }
+
+    private void bindButton(int resId, int mask, String key) {
+        View v = findViewById(resId); if (v == null) return; loadPosition(v, key);
+        v.setOnTouchListener((v1, event) -> {
+            if (isEditMode && event.getAction() == MotionEvent.ACTION_MOVE) {
+                v1.setX(event.getRawX() - (v1.getWidth() / 2f)); v1.setY(event.getRawY() - (v1.getHeight() / 2f));
+                savePosition(key, v1.getX(), v1.getY()); return true;
+            }
+            return handleInput(v1, event, mask);
+        });
+    }
+
+    private void saveLayout() { getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().putFloat("screen_y_offset", gameScreenYOffset).putFloat("screen_scale", gameScaleFactor).apply(); }
+    private void savePosition(String k, float x, float y) { getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().putFloat(k + "_x", x).putFloat(k + "_y", y).apply(); }
+    private void loadPosition(View v, String k) { SharedPreferences p = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE); float x = p.getFloat(k + "_x", -1); float y = p.getFloat(k + "_y", -1); if (x != -1 && y != -1) { v.setX(x); v.setY(y); } }
+    private void toggleOrientation() { setRequestedOrientation(getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE ? ActivityInfo.SCREEN_ORIENTATION_PORTRAIT : ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE); }
+    private void enterEditMode() { isEditMode = true; setupTouchControls(); }
+    private void exitEditMode() { isEditMode = false; saveLayout(); setupTouchControls(); resumeGame(); }
+    private void resetPositions() { getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().clear().apply(); recreate(); }
     @Override public void surfaceChanged(@NonNull SurfaceHolder h, int f, int w, int h1) {}
-    @Override public void surfaceDestroyed(@NonNull SurfaceHolder h) { isSurfaceReady = false; }
+    @Override public void onBackPressed() { if (isEditMode) exitEditMode(); else if (gameContainer.getVisibility() == View.VISIBLE) showSettingsMenu(); else super.onBackPressed(); }
 
-    // JNI Declarations
+    // Native Methods
     public native String nativeExtractRom(String romPath, String outDir);
     public native void nativeInitEngine(String filesDir);
     public native void nativeUpdateSurface(Bitmap bitmap);
