@@ -30,16 +30,16 @@ def pre_parse_symbols():
                     alias_match = re.match(r'^\.alias\s+(\w+)\s+\$?([0-9A-Fa-f]+)', clean)
                     if alias_match:
                         name, val = alias_match.groups()
-                        global_symbols[name] = f"0x{val.upper()}"
+                        global_symbols[name] = f"0x{val.lower()}" # Force lowercase hex
                         continue
 
                     label_match = re.match(r'^(\w+):', clean)
                     if label_match:
                         name = label_match.group(1)
                         if re.match(r'^L[0-9A-Fa-f]{4}$', name):
-                            global_symbols[name] = f"0x{name[1:].upper()}"
+                            global_symbols[name] = f"0x{name[1:].lower()}"
                         else:
-                            global_symbols[name] = hex(current_pc).upper().replace('X', 'x')
+                            global_symbols[name] = hex(current_pc).lower()
 
                     ins_match = re.match(r'^\s*(\w{3})\s*(.*)$', clean)
                     if ins_match:
@@ -54,42 +54,38 @@ def resolve_symbol(symbol):
     if clean_sym in global_symbols:
         return global_symbols[clean_sym]
     if all(c in "0123456789ABCDEFabcdef" for c in clean_sym) and len(clean_sym) >= 2:
-        return f"0x{clean_sym.upper()}"
+        return f"0x{clean_sym.lower()}"
     return f"0x0 /* UNRESOLVED: {clean_sym} */"
 
 def get_ins_size(opcode, op):
     if not op or op.strip() == "": return 1
     if op.startswith('#'): return 2
     if '(' in op: return 2
-    # If the operand is a 4-digit hex or a known label > 0xFF, it's 3 bytes
     res = resolve_symbol(op)
     if "0x" in res and not "UNRESOLVED" in res:
-        val = int(res.split(' ')[0], 16)
-        if val > 0xFF: return 3
+        try:
+            val = int(res.split(' ')[0], 16)
+            if val > 0xFF: return 3
+        except: return 2
     return 2
 
 def parse_addr(opcode, op):
     op = op.strip()
     if not op: return "0"
     if op.startswith('#'): return resolve_symbol(op)
-
     is_write = opcode in ['STA', 'STX', 'STY', 'INC', 'DEC', 'ASL', 'LSR', 'ROL', 'ROR']
-    
     if '(' in op and '),Y' in op.upper():
         return f"read_pointer_indexed_y({resolve_symbol(op)})"
-
     resolved = resolve_symbol(op)
     if ',X' in op.upper(): addr_calc = f"({resolved} + reg_X)"
     elif ',Y' in op.upper(): addr_calc = f"({resolved} + reg_Y)"
     else: addr_calc = resolved
-
     return addr_calc if is_write else f"bus_read({addr_calc})"
 
 def translate_line(line):
     clean = line.split(';')[0].strip()
     match = re.match(r'^(?:\w+:)?\s*(\w{3})\s*(.*)$', clean)
     if not match: return None, 0
-
     opcode, op = match.groups()
     opcode = opcode.upper()
     target_hex = resolve_symbol(op)
@@ -146,12 +142,16 @@ def translate_line(line):
         'TXS': "reg_S = reg_X;",
         'TSX': "reg_X = reg_S; update_nz(reg_X);",
     }
-
     code = mapping.get(opcode, f"/* {opcode} {op} */")
     return code, size
 
 def convert_file(filename):
+    # Ensure bank name matches the Dispatcher (Bank00, Bank01, etc)
     bank_name = os.path.splitext(filename)[0].replace("-", "_")
+    # Force 'BankXX' format if it starts with 'Bank'
+    if bank_name.lower().startswith("bank"):
+        bank_name = "Bank" + bank_name[4:]
+
     with open(os.path.join(ASM_DIR, filename), 'r') as f:
         lines = f.readlines()
 
@@ -159,28 +159,26 @@ def convert_file(filename):
 
     with open(os.path.join(OUT_DIR, f"{bank_name}.cpp"), 'w') as out:
         out.write('#include "cpu_shared.h"\n\n')
-        # Use extern "C" to match the linkage of your core helper functions
-        out.write('extern "C" {\n')
-        out.write('    namespace ' + bank_name + ' {\n')
-        out.write('        void execute() {\n            switch(reg_PC) {\n')
+        out.write(f'namespace {bank_name} {{\n')
+        out.write('    void execute() {\n        switch(reg_PC) {\n')
 
         for line in lines:
             label_match = re.search(r'^\s*(\w+):', line)
             if label_match:
                 label_name = label_match.group(1)
-                addr = resolve_symbol(label_name)
+                addr = resolve_symbol(label_name).lower() # Force lowercase to avoid duplicate cases
 
-                if addr not in used_addresses and "UNRESOLVED" not in addr:
-                    out.write(f'                case {addr}:\n')
+                if addr not in used_addresses and "unresolved" not in addr:
+                    out.write(f'            case {addr}:\n')
                     used_addresses.add(addr)
 
                 code, size = translate_line(line)
                 if code:
-                    prefix = "                    " if addr in used_addresses else f"                    /* Alias: {label_name} */ "
+                    prefix = "                "
                     suffix = "" if "return" in code else f" reg_PC += {size}; return;"
                     out.write(f'{prefix}{code}{suffix}\n')
 
-        out.write('                default: reg_PC++; return;\n            }\n        }\n    }\n}\n')
+        out.write('            default: reg_PC++; return;\n        }\n    }\n}\n')
 
 if __name__ == "__main__":
     os.makedirs(OUT_DIR, exist_ok=True)
