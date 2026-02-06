@@ -1,6 +1,7 @@
 #include "cpu_shared.h"
 #include "../MapperMMC1.h"
 #include <android/log.h>
+#include <sched.h>
 
 #define LOG_TAG "DWA_DISPATCHER"
 
@@ -8,7 +9,6 @@ extern MapperMMC1 mapper;
 extern uint8_t cpu_ram[0x0800];
 
 // Define recompiled bank entry points
-// These correspond to the four 16KB PRG-ROM banks in Dragon Warrior
 namespace Bank00 { void execute(); }
 namespace Bank01 { void execute(); }
 namespace Bank02 { void execute(); }
@@ -16,7 +16,7 @@ namespace Bank03 { void execute(); }
 
 namespace Dispatcher {
 
-    // Atomic boolean to ensure thread safety between PPU and Engine threads
+    // volatile to ensure the UI/PPU thread and Engine thread see the same value
     volatile bool nmi_pending = false;
 
     void request_nmi() {
@@ -24,8 +24,8 @@ namespace Dispatcher {
     }
 
     /**
-     * Redirects execution to the appropriate recompiled C++ function 
-     * based on the mapper's current bank index.
+     * Executes the recompiled C++ function corresponding to the 
+     * current PRG-ROM bank mapped by the MMC1.
      */
     inline void call_bank(uint8_t bank_index) {
         switch (bank_index & 0x03) {
@@ -38,22 +38,23 @@ namespace Dispatcher {
 
     void execute() {
         // --- 1. HARDWARE INTERRUPT HANDLING ---
-        // NMI has priority over instruction execution.
         if (nmi_pending) {
             nmi_pending = false;
 
-            // 6502 NMI Sequence: 
-            // 1. Push PC_high, PC_low, and Status (P) to stack.
-            // 2. Set Interrupt Inhibit (I).
-            // 3. Set PC to address stored at $FFFA.
+            // 6502 NMI hardware sequence
             push_stack((uint8_t)(reg_PC >> 8));
             push_stack((uint8_t)(reg_PC & 0xFF));
             
-            // Note: Bit 4 (B flag) is always pushed as 0 during hardware NMIs
-            push_stack(reg_P & ~0x10); 
+            /* * CRITICAL BITMASK FIX:
+             * When pushing P to stack during NMI:
+             * - Bit 4 (Break) must be 0
+             * - Bit 5 (Unused) must be 1
+             */
+            push_stack((reg_P & ~0x10) | 0x20); 
 
-            reg_P |= 0x04; // Set I flag (Interrupt Inhibit)
+            reg_P |= FLAG_I; // Set Interrupt Inhibit
 
+            // Load NMI Vector from the end of Bank 3 ($FFFA)
             uint16_t lo = bus_read(0xFFFA);
             uint16_t hi = bus_read(0xFFFB);
             reg_PC = (hi << 8) | lo;
@@ -62,8 +63,16 @@ namespace Dispatcher {
 
         uint16_t entry_pc = reg_PC;
 
-        // --- 2. PRG BANKING LOGIC ---
-        // MMC1 provides flexible mapping of the $8000-$FFFF address space.
+        // --- 2. SPECIAL CASE: ENGINE WAIT LOOP ---
+        // Dragon Warrior loops at $FF74 waiting for the NMI to set $2D to 1.
+        // We yield to the Android OS to prevent 100% CPU usage during this idle time.
+        if (reg_PC == 0xFF74 && !nmi_pending) {
+            sched_yield(); 
+        }
+
+        
+
+        // --- 3. PRG BANKING LOGIC ---
         uint8_t prg_mode = mapper.get_prg_mode();
         uint8_t bank_reg = mapper.prg_bank & 0x0F;
 
@@ -71,44 +80,39 @@ namespace Dispatcher {
             switch (prg_mode) {
                 case 0:
                 case 1:
-                    // 32KB Mode: $8000 maps to bank_reg (even), $C000 to bank_reg + 1
+                    // 32KB Mode
                     if (reg_PC < 0xC000) call_bank(bank_reg & 0x0E);
                     else call_bank((bank_reg & 0x0E) | 0x01);
                     break;
                 case 2:
-                    // Fix first bank at $8000, switch second at $C000
+                    // Fix first bank at $8000
                     if (reg_PC < 0xC000) Bank00::execute();
                     else call_bank(bank_reg);
                     break;
                 case 3:
                 default:
-                    // Switch first bank at $8000, fix last bank at $C000 (Dragon Warrior Standard)
+                    // Fix last bank at $C000 (Standard for most MMC1 games)
                     if (reg_PC < 0xC000) call_bank(bank_reg);
                     else Bank03::execute();
                     break;
             }
         } 
         else if (reg_PC < 0x2000) {
-            // RAM Execution: Used for transient code or data-copying routines.
-            // We usually default to Bank 03 as it contains the kernel logic 
-            // capable of interpreting RAM-based jumps.
+            // Internal RAM Execution (Trampolines)
             Bank03::execute(); 
         }
-        else if (reg_PC >= 0x2000 && reg_PC < 0x6000) {
-            // Execution in I/O space or unmapped memory is illegal.
-            __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "CPU TRAP: Execution attempted at I/O address 0x%04X", reg_PC);
-            reg_PC = bus_read(0xFFFC) | (bus_read(0xFFFD) << 8); // Force Reset
+        else {
+            // CPU TRAP: PC is in I/O space or unmapped memory ($2000-$5FFF)
+            __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "CPU TRAP at 0x%04X. Forcing Reset.", reg_PC);
+            uint16_t reset_lo = bus_read(0xFFFC);
+            uint16_t reset_hi = bus_read(0xFFFD);
+            reg_PC = (reset_hi << 8) | reset_lo;
         }
 
-        // --- 3. SAFETY GAP DETECTION ---
-        // If the PC hasn't moved, the recompiled code has "lost" the CPU.
+        // --- 4. SAFETY GAP DETECTION ---
         if (reg_PC == entry_pc) {
-            __android_log_print(ANDROID_LOG_WARN, LOG_TAG, 
-                "RECOMPILER GAP: 0x%04X (Bank: %d, Mode: %d)", 
-                entry_pc, bank_reg, prg_mode);
-
-            // Manual fallback: Read opcode and advance (Very slow, but prevents freezing)
-            reg_PC++; 
+            __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "RECOMPILER GAP: 0x%04X", entry_pc);
+            reg_PC++; // Force advance to prevent thread lockup
         }
     }
 }
