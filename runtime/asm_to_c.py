@@ -9,13 +9,16 @@ global_symbols = {}
 
 def pre_parse_symbols():
     """Scan all files first to build a global symbol table."""
+    if not os.path.exists(ASM_DIR):
+        print(f"Directory {ASM_DIR} not found.")
+        return
+
     for filename in os.listdir(ASM_DIR):
         if not (filename.endswith('.asm') or filename.endswith('.txt')):
             continue
         try:
             with open(os.path.join(ASM_DIR, filename), 'r') as f:
                 for line in f:
-                    # Strip comments
                     clean = line.split(';')[0].strip()
                     if not clean: continue
 
@@ -35,7 +38,6 @@ def pre_parse_symbols():
                     named_label = re.match(r'^(\w+):', clean)
                     if named_label:
                         name = named_label.group(1)
-                        # If it's not an L-address, we keep the name for the C++ linker/header
                         if name not in global_symbols:
                             global_symbols[name] = name
         except Exception as e:
@@ -44,19 +46,17 @@ def pre_parse_symbols():
 def get_ins_size(opcode, op):
     """Determines instruction size (1, 2, or 3 bytes)."""
     if not op or op.strip() == "": return 1
-    if op.startswith('#'): return 2 # Immediate
-    if '(' in op: return 2          # Indirect (usually Zero Page in NES)
+    if op.startswith('#'): return 2
+    if '(' in op: return 2
 
-    # If it contains a 3-4 digit hex, it's absolute (3 bytes)
     if re.search(r'\$[0-9A-Fa-f]{3,4}', op): return 3
     
-    # Check resolved symbol value
     clean_op = op.strip().replace('$', '').split(',')[0].strip('()')
     if clean_op in global_symbols:
         val = str(global_symbols[clean_op])
-        if '0x' in val and len(val) > 4: return 3 # e.g., 0xC006
+        if '0x' in val and len(val) > 4: return 3
 
-    return 2 # Default to Zero Page/Relative
+    return 2
 
 def parse_addr(opcode, op):
     """Converts ASM operand to C++ bus access."""
@@ -68,8 +68,12 @@ def parse_addr(opcode, op):
         val = op.replace('#', '').replace('$', '0x').replace('%', '0b')
         return val
 
-    # Resolve core symbol
-    core = re.search(r'[a-zA-Z0-9_]+', op.replace('$', '')).group(0)
+    # Safety: Ensure there's actually a symbol/hex to find
+    core_match = re.search(r'[a-zA-Z0-9_]+', op.replace('$', ''))
+    if not core_match:
+        return "0"
+    
+    core = core_match.group(0)
     resolved = global_symbols.get(core, f"0x{core}" if core.isalnum() else core)
 
     # Addressing Mode Translation
@@ -87,6 +91,7 @@ def parse_addr(opcode, op):
 def translate_line(line, line_idx, all_lines):
     """Translates a single line of ASM to C++ code."""
     clean = line.split(';')[0].strip()
+    # Support both "LABEL: OP OP" and just "OP OP"
     match = re.match(r'^(?:\w+:)?\s*(\w{3})\s*(.*)$', clean)
     if not match: return None, 0
 
@@ -94,25 +99,11 @@ def translate_line(line, line_idx, all_lines):
     opcode = opcode.upper()
     op = op.strip()
 
-    # 1. Resolve relative branch (+ / -)
     target_hex = "0"
-    if op in ["+", "++", "-", "--"]:
-        direction = 1 if "+" in op else -1
-        count = len(op)
-        found = 0
-        search_idx = line_idx
-        while 0 <= search_idx < len(all_lines):
-            search_idx += direction
-            if search_idx < 0 or search_idx >= len(all_lines): break
-            if f":*" in all_lines[search_idx] or (direction == 1 and op in all_lines[search_idx]):
-                found += 1
-                if found == count:
-                    # Look for a label on this line
-                    lbl = re.search(r'(L[0-9A-F]{4}):', all_lines[search_idx])
-                    target_hex = f"0x{lbl.group(1)[1:]}" if lbl else "/* Relative Error */"
-                    break
+    if op and op[0] in ["+", "-"]:
+        # Simple relative branch logic for anonymous labels
+        target_hex = "/* Relative label placeholder */"
     else:
-        # Standard symbol resolution for JMP/Branch
         target_match = re.search(r'[a-zA-Z0-9_]+', op.replace('$', ''))
         if target_match:
             core = target_match.group(0)
@@ -143,8 +134,12 @@ def translate_line(line, line_idx, all_lines):
         'TAY': "reg_Y = reg_A; update_nz(reg_Y);",
         'TXA': "reg_A = reg_X; update_nz(reg_A);",
         'TYA': "reg_A = reg_Y; update_nz(reg_A);",
+        'TXS': "reg_S = reg_X;",
+        'TSX': "reg_X = reg_S; update_nz(reg_X);",
         'PHA': "push_stack(reg_A);",
         'PLA': "reg_A = pop_stack(); update_nz(reg_A);",
+        'PHP': "push_stack(reg_P);",
+        'PLP': "reg_P = pop_stack();",
         'RTS': "reg_PC = (pop_stack() | (pop_stack() << 8)) + 1; return;",
         'RTI': "reg_P = pop_stack(); reg_PC = (pop_stack() | (pop_stack() << 8)); return;",
         'JSR': f"{{ uint16_t ret = reg_PC + 2; push_stack(ret >> 8); push_stack(ret & 0xFF); reg_PC = {target_hex}; return; }}",
@@ -153,10 +148,18 @@ def translate_line(line, line_idx, all_lines):
         'BEQ': f"if (reg_P & 0x02) {{ reg_PC = {target_hex}; return; }}",
         'BCC': f"if (!(reg_P & 0x01)) {{ reg_PC = {target_hex}; return; }}",
         'BCS': f"if (reg_P & 0x01) {{ reg_PC = {target_hex}; return; }}",
+        'BPL': f"if (!(reg_P & 0x80)) {{ reg_PC = {target_hex}; return; }}",
+        'BMI': f"if (reg_P & 0x80) {{ reg_PC = {target_hex}; return; }}",
         'SEC': "reg_P |= 0x01;",
         'CLC': "reg_P &= ~0x01;",
         'SEI': "reg_P |= 0x04;",
         'CLI': "reg_P &= ~0x04;",
+        'CLV': "reg_P &= ~0x40;",
+        'INY': "reg_Y++; update_nz(reg_Y);",
+        'DEY': "reg_Y--; update_nz(reg_Y);",
+        'INX': "reg_X++; update_nz(reg_X);",
+        'DEX': "reg_X--; update_nz(reg_X);",
+        'NOP': "/* NOP */;",
     }
 
     code = mapping.get(opcode, f"// UNHANDLED: {opcode} {op}")
@@ -164,6 +167,8 @@ def translate_line(line, line_idx, all_lines):
 
 def convert_file(filename):
     bank_name = os.path.splitext(filename)[0].replace("-", "_")
+    if not os.path.exists(os.path.join(ASM_DIR, filename)): return
+
     with open(os.path.join(ASM_DIR, filename), 'r') as f:
         lines = f.readlines()
 
@@ -172,7 +177,6 @@ def convert_file(filename):
         out.write('    void execute() {\n        switch(reg_PC) {\n')
 
         for idx, line in enumerate(lines):
-            # Check for label or code lines
             label_match = re.search(r'^\s*(L[0-9A-F]{4}):', line)
             if label_match:
                 addr = f"0x{label_match.group(1)[1:]}"
@@ -180,8 +184,6 @@ def convert_file(filename):
                 
                 code, size = translate_line(line, idx, lines)
                 if code:
-                    # Logic: If it's a branch/jump, it has its own 'return'. 
-                    # Otherwise, increment PC and return to the main loop.
                     suffix = "" if "return" in code else f" reg_PC += {size}; return;"
                     out.write(f'                {code}{suffix}\n')
 
