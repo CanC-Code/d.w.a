@@ -35,17 +35,18 @@
         <SurfaceView
             android:id="@+id/game_surface"
             android:layout_width="match_parent"
-            android:layout_height="match_parent" />
+            android:layout_height="match_parent"
+            android:layout_centerInParent="true" />
 
         <RelativeLayout
             android:layout_width="180dp"
             android:layout_height="180dp"
             android:layout_alignParentBottom="true"
             android:layout_margin="20dp">
-            <ImageButton android:id="@+id/btn_up" android:layout_width="60dp" android:layout_height="60dp" android:layout_centerHorizontal="true" android:background="@android:color/transparent" android:src="@drawable/dpad_up" android:scaleType="fitCenter" />
-            <ImageButton android:id="@+id/btn_down" android:layout_width="60dp" android:layout_height="60dp" android:layout_alignParentBottom="true" android:layout_centerHorizontal="true" android:background="@android:color/transparent" android:src="@drawable/dpad_down" android:scaleType="fitCenter" />
-            <ImageButton android:id="@+id/btn_left" android:layout_width="60dp" android:layout_height="60dp" android:layout_centerVertical="true" android:background="@android:color/transparent" android:src="@drawable/dpad_left" android:scaleType="fitCenter" />
-            <ImageButton android:id="@+id/btn_right" android:layout_width="60dp" android:layout_height="60dp" android:layout_alignParentEnd="true" android:layout_centerVertical="true" android:background="@android:color/transparent" android:src="@drawable/dpad_right" android:scaleType="fitCenter" />
+            <ImageButton android:id="@+id/btn_up" android:layout_width="60dp" android:layout_height="60dp" android:layout_centerHorizontal="true" android:background="@android:color/transparent" android:src="@drawable/dpad_up" android:scaleType="fitCenter" android:contentDescription="Up" />
+            <ImageButton android:id="@+id/btn_down" android:layout_width="60dp" android:layout_height="60dp" android:layout_alignParentBottom="true" android:layout_centerHorizontal="true" android:background="@android:color/transparent" android:src="@drawable/dpad_down" android:scaleType="fitCenter" android:contentDescription="Down" />
+            <ImageButton android:id="@+id/btn_left" android:layout_width="60dp" android:layout_height="60dp" android:layout_centerVertical="true" android:background="@android:color/transparent" android:src="@drawable/dpad_left" android:scaleType="fitCenter" android:contentDescription="Left" />
+            <ImageButton android:id="@+id/btn_right" android:layout_width="60dp" android:layout_height="60dp" android:layout_alignParentEnd="true" android:layout_centerVertical="true" android:background="@android:color/transparent" android:src="@drawable/dpad_right" android:scaleType="fitCenter" android:contentDescription="Right" />
         </RelativeLayout>
 
         <LinearLayout
@@ -54,8 +55,8 @@
             android:layout_alignParentBottom="true"
             android:layout_alignParentEnd="true"
             android:layout_margin="40dp">
-            <ImageButton android:id="@+id/btn_b" android:layout_width="70dp" android:layout_height="70dp" android:background="@android:color/transparent" android:src="@drawable/button_b" android:scaleType="fitCenter" android:layout_marginEnd="10dp"/>
-            <ImageButton android:id="@+id/btn_a" android:layout_width="80dp" android:layout_height="80dp" android:background="@android:color/transparent" android:src="@drawable/button_a" android:scaleType="fitCenter" />
+            <ImageButton android:id="@+id/btn_b" android:layout_width="70dp" android:layout_height="70dp" android:background="@android:color/transparent" android:src="@drawable/button_b" android:scaleType="fitCenter" android:layout_marginEnd="10dp" android:contentDescription="B" />
+            <ImageButton android:id="@+id/btn_a" android:layout_width="80dp" android:layout_height="80dp" android:background="@android:color/transparent" android:src="@drawable/button_a" android:scaleType="fitCenter" android:contentDescription="A" />
         </LinearLayout>
 
         <LinearLayout
@@ -64,8 +65,8 @@
             android:layout_alignParentBottom="true"
             android:layout_centerHorizontal="true"
             android:layout_marginBottom="20dp">
-            <ImageButton android:id="@+id/btn_select" android:layout_width="80dp" android:layout_height="40dp" android:background="@android:color/transparent" android:src="@drawable/button_select" android:scaleType="fitCenter" android:layout_marginEnd="10dp" />
-            <ImageButton android:id="@+id/btn_start" android:layout_width="80dp" android:layout_height="40dp" android:background="@android:color/transparent" android:src="@drawable/button_start" android:scaleType="fitCenter" />
+            <ImageButton android:id="@+id/btn_select" android:layout_width="80dp" android:layout_height="40dp" android:background="@android:color/transparent" android:src="@drawable/button_select" android:scaleType="fitCenter" android:layout_marginEnd="10dp" android:contentDescription="Select" />
+            <ImageButton android:id="@+id/btn_start" android:layout_width="80dp" android:layout_height="40dp" android:background="@android:color/transparent" android:src="@drawable/button_start" android:scaleType="fitCenter" android:contentDescription="Start" />
         </LinearLayout>
     </RelativeLayout>
 </FrameLayout>
