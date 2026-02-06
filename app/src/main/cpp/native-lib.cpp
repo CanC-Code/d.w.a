@@ -14,11 +14,13 @@
 #define LOG_TAG "DWA_NATIVE"
 
 // --- Recompiled Bank Dispatcher ---
+// This is the bridge to your recompiled C files
 namespace Dispatcher {
     void execute();
 }
 
 // --- Global Hardware State ---
+// These are likely marked 'extern' in your recompiled C files
 uint8_t cpu_ram[0x0800] = {0};
 uint8_t ppu_vram[2048] = {0};
 uint8_t palette_ram[32] = {0};
@@ -30,6 +32,12 @@ uint8_t last_strobe = 0;
 uint8_t ppu_data_buffer = 0;
 std::mutex buffer_mutex;
 MapperMMC1 mapper;
+
+// PPU Register State
+uint8_t ppu_status = 0, ppu_ctrl = 0, ppu_mask = 0, ppu_addr_latch = 0, oam_addr = 0;
+uint16_t ppu_addr_reg = 0;
+bool is_running = false;
+bool is_paused = false;
 
 uint32_t nes_palette[64] = {
     0xFF666666, 0xFF002A88, 0xFF1412A7, 0xFF3B00A4, 0xFF5C007E, 0xFF6E0040, 0xFF6C0600, 0xFF561D00,
@@ -45,10 +53,12 @@ extern "C" {
     uint16_t reg_PC = 0;
     uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
 
+    // The game logic calls this to step the recompiled instructions
     void execute_instruction() {
         Dispatcher::execute();
     }
 
+    // Standard 6502 Support Functions required by recompiled code
     void update_nz(uint8_t val) {
         reg_P &= ~(FLAG_N | FLAG_Z);
         if (val == 0) reg_P |= FLAG_Z;
@@ -123,12 +133,7 @@ extern "C" {
     uint8_t pop_stack() { reg_S++; return cpu_ram[0x0100 | (reg_S & 0xFF)]; }
 }
 
-// --- PPU & Bus Logic ---
-uint8_t ppu_status = 0, ppu_ctrl = 0, ppu_mask = 0, ppu_addr_latch = 0, oam_addr = 0;
-uint16_t ppu_addr_reg = 0;
-bool is_running = false;
-bool is_paused = false;
-
+// --- Bus Logic ---
 uint16_t ntable_mirror(uint16_t addr) {
     addr = (addr - 0x2000) % 0x1000;
     return addr % 0x0800; // Vertical Mirroring
@@ -144,16 +149,13 @@ extern "C" uint8_t bus_read(uint16_t addr) {
     if (addr < 0x2000) return cpu_ram[addr % 0x0800];
     if (addr >= 0x2000 && addr <= 0x3FFF) {
         uint16_t reg = addr % 8;
-        if (reg == 2) {
-            uint8_t s = ppu_status;
-            // FORCE VBLANK HACK: If bit 7 isn't set, the game may hang at boot.
-            // We ensure it's readable to move the game past initialization.
-            s |= 0x80; 
+        if (reg == 2) { // PPUSTATUS
+            uint8_t s = ppu_status | 0x80; // Always provide VBlank for native boot
             ppu_status &= ~0x80; 
             ppu_addr_latch = 0;
             return s;
         }
-        if (reg == 7) {
+        if (reg == 7) { // PPUDATA
             uint8_t data = ppu_data_buffer;
             uint16_t p_addr = ppu_addr_reg & 0x3FFF;
             if (p_addr < 0x2000) ppu_data_buffer = mapper.read_chr(p_addr);
@@ -195,7 +197,7 @@ extern "C" void bus_write(uint16_t addr, uint8_t val) {
             ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
         }
     }
-    else if (addr == 0x4014) {
+    else if (addr == 0x4014) { // OAM DMA
         uint16_t base = val << 8;
         for (int i = 0; i < 256; i++) oam_ram[i] = bus_read(base + i);
     }
@@ -206,7 +208,7 @@ extern "C" void bus_write(uint16_t addr, uint8_t val) {
     else if (addr >= 0x6000) mapper.write(addr, val);
 }
 
-// --- Rendering ---
+// --- Native Rendering Bridge ---
 void draw_frame() {
     std::lock_guard<std::mutex> lock(buffer_mutex);
     uint16_t nt_base = (ppu_ctrl & 0x03) * 1024;
@@ -228,23 +230,22 @@ void draw_frame() {
     }
 }
 
-// --- CPU Entry ---
+// --- Entry Logic ---
 extern "C" void power_on_reset() {
     mapper.reset();
-    // MMC1 Specific: Set PRG Bank 3 to fixed ($C000) and Bank 0 to switchable ($8000)
     mapper.control = 0x1C; 
     mapper.prg_bank = 0;
 
+    // Read the reset vector from Bank 3
     uint8_t lo = mapper.read_prg(0xFFFC);
     uint8_t hi = mapper.read_prg(0xFFFD);
     reg_PC = (hi << 8) | lo;
 
-    // DW1 Failsafe: $FF8E is a common reset entry point for the US version.
-    if (reg_PC == 0x0000 || reg_PC == 0xFFFF) reg_PC = 0xFF8E; 
-    
+    if (reg_PC < 0x8000) reg_PC = 0xFF8E; 
+
     reg_S = 0xFD;
-    reg_P = 0x34; // Start with interrupts disabled
-    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Reset! PC: %04X", reg_PC);
+    reg_P = 0x34; 
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Native Reset at PC: %04X", reg_PC);
 }
 
 extern "C" void nmi_handler() {
@@ -252,7 +253,7 @@ extern "C" void nmi_handler() {
     push_stack(reg_PC >> 8);
     push_stack(reg_PC & 0xFF);
     push_stack(reg_P);
-    
+
     uint16_t nmi_vector = bus_read(0xFFFA) | (bus_read(0xFFFB) << 8);
     reg_PC = nmi_vector;
 }
@@ -266,20 +267,19 @@ void engine_loop() {
             continue;
         }
         auto start = std::chrono::steady_clock::now();
-        
-        // Ensure VBlank bit is visible to CPU during the frame execution
-        ppu_status |= 0x80; 
 
+        // RUN RECOMPILED LOGIC: 
+        // We execute a block of cycles per frame
         for (int i = 0; i < 29780; i++) {
             execute_instruction();
             if (!is_running) break;
         }
-        
-        // Trigger NMI if enabled by software (PPUCTRL bit 7)
+
+        // Trigger the recompiled NMI handler (the game's main drawing routine)
         if (ppu_ctrl & 0x80) {
             nmi_handler();
         }
-        
+
         draw_frame();
         std::this_thread::sleep_until(start + std::chrono::microseconds(16666));
     }
@@ -296,7 +296,8 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstri
         return env->NewStringUTF("Error: Could not open file");
     }
 
-    file.seekg(16, std::ios::beg); // Skip iNES header
+    // Skip 16-byte iNES header and load into mapper memory
+    file.seekg(16, std::ios::beg); 
     for (int i = 0; i < 4; i++) file.read((char*)mapper.prg_rom[i], 16384);
     for (int i = 0; i < 2; i++) file.read((char*)mapper.chr_rom[i], 4096);
 
@@ -313,22 +314,6 @@ Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv *env, jobject thiz, jstri
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_canc_dwa_MainActivity_injectInput(JNIEnv *env, jobject thiz, jint buttonBit, jboolean isPressed) {
-    if (isPressed) controller_state |= (uint8_t)buttonBit;
-    else controller_state &= ~((uint8_t)buttonBit);
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_canc_dwa_MainActivity_nativePauseEngine(JNIEnv *env, jobject thiz) {
-    is_paused = true;
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_canc_dwa_MainActivity_nativeResumeEngine(JNIEnv *env, jobject thiz) {
-    is_paused = false;
-}
-
-extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv *env, jobject thiz, jobject bitmap) {
     AndroidBitmapInfo info;
     void* pixels;
@@ -340,3 +325,10 @@ Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv *env, jobject thiz, jo
     }
     AndroidBitmap_unlockPixels(env, bitmap);
 }
+
+// Standard lifecycle hooks
+extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_injectInput(JNIEnv *env, jobject thiz, jint bit, jboolean p) {
+    if (p) controller_state |= (uint8_t)bit; else controller_state &= ~((uint8_t)bit);
+}
+extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativePauseEngine(JNIEnv *env, jobject thiz) { is_paused = true; }
+extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeResumeEngine(JNIEnv *env, jobject thiz) { is_paused = false; }
