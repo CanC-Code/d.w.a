@@ -14,7 +14,7 @@
 
 // --- Global Hardware State ---
 uint8_t cpu_ram[0x0800] = {0};
-uint8_t ppu_vram[2048] = {0};
+uint8_t ppu_vram[2048] = {0}; // 2KB for Nametables
 uint8_t palette_ram[32] = {0};
 uint8_t oam_ram[256] = {0}; 
 uint32_t screen_buffer[256 * 240] = {0};
@@ -26,7 +26,12 @@ MapperMMC1 mapper;
 
 // --- Shared 6502 CPU State ---
 extern "C" {
+    uint16_t reg_PC = 0; // Program Counter
     uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
+    
+    // IMPORT from recompiled code
+    void execute_instruction(); 
+
     uint8_t bus_read(uint16_t addr);
     void bus_write(uint16_t addr, uint8_t val);
 
@@ -56,6 +61,7 @@ extern "C" {
     }
 
     void cpu_sbc(uint8_t val) { cpu_adc(~val); }
+    
     void cpu_bit(uint8_t val) {
         reg_P &= ~0xC2; 
         if ((val & reg_A) == 0) reg_P |= 0x02;
@@ -67,31 +73,20 @@ extern "C" {
         uint8_t hi = bus_read((addr & 0xFF00) | ((addr + 1) & 0x00FF));
         return (hi << 8) | lo;
     }
-    uint16_t read_pointer_x(uint16_t addr) { return read_pointer((addr + reg_X) & 0xFF); }
-
-    void power_on_reset();
-    void nmi_handler();
 }
 
-// --- PPU Hardware ---
+// --- PPU & Mirroring Helpers ---
 uint8_t ppu_status = 0, ppu_ctrl = 0, ppu_mask = 0, ppu_addr_latch = 0, oam_addr = 0;
 uint16_t ppu_addr_reg = 0;
 bool is_running = false;
 bool is_paused = false;
 
-uint32_t nes_palette[64] = {
-    0xFF666666, 0xFF002A88, 0xFF1412A7, 0xFF3B00A4, 0xFF5C007E, 0xFF6E0040, 0xFF6C0600, 0xFF561D00,
-    0xFF333500, 0xFF0B4800, 0xFF005200, 0xFF004F08, 0xFF00404D, 0xFF000000, 0xFF000000, 0xFF000000,
-    0xFFADADAD, 0xFF155FD9, 0xFF4240FF, 0xFF7527FE, 0xFFA01ACC, 0xFFB71E7B, 0xFFB53120, 0xFF994E00,
-    0xFF6B6D00, 0xFF388700, 0xFF0C9300, 0xFF008F32, 0xFF007C8D, 0xFF000000, 0xFF000000, 0xFF000000,
-    0xFFEFB0FF, 0xFF64B0FF, 0xFF9290FF, 0xFFC676FF, 0xFFF36AFF, 0xFFFE6ECC, 0xFFFE8170, 0xFFEA9E22,
-    0xFFBCBE00, 0xFF88D100, 0xFF5CE430, 0xFF45E082, 0xFF48CDDE, 0xFF4F4F4F, 0xFF000000, 0xFF000000
-};
-
-uint8_t read_palette(uint16_t addr) {
-    uint8_t p_idx = addr & 0x1F;
-    if (p_idx >= 0x10 && (p_idx % 4 == 0)) p_idx -= 0x10; 
-    return palette_ram[p_idx];
+// NES hardware uses mirroring to map 4 Nametables into 2KB of RAM
+uint16_t ntable_mirror(uint16_t addr) {
+    addr = (addr - 0x2000) % 0x1000;
+    // Dragon Warrior (MMC1) typically uses Vertical or Horizontal mirroring
+    // This is a simplified Vertical Mirroring check
+    return addr % 0x0800; 
 }
 
 extern "C" uint8_t bus_read(uint16_t addr) {
@@ -100,30 +95,27 @@ extern "C" uint8_t bus_read(uint16_t addr) {
         uint16_t reg = addr % 8;
         if (reg == 2) { 
             uint8_t s = ppu_status; 
-            ppu_status &= ~0x80; // Clear VBlank flag on read
+            ppu_status &= ~0x80; 
             ppu_addr_latch = 0; 
             return s; 
         }
         if (reg == 7) {
             uint8_t data = ppu_data_buffer;
             uint16_t p_addr = ppu_addr_reg & 0x3FFF;
-            if (p_addr < 0x3F00) ppu_data_buffer = (p_addr >= 0x2000) ? ppu_vram[p_addr % 2048] : mapper.read_chr(p_addr);
-            else { 
-                data = read_palette(p_addr); 
-                ppu_data_buffer = ppu_vram[p_addr % 2048]; 
-            }
+            if (p_addr < 0x2000) ppu_data_buffer = mapper.read_chr(p_addr);
+            else if (p_addr < 0x3F00) ppu_data_buffer = ppu_vram[ntable_mirror(p_addr)];
+            else data = palette_ram[p_addr & 0x1F];
+            
             ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
-            ppu_addr_reg &= 0x3FFF;
             return data;
         }
     }
-    if (addr >= 0x6000) {
-        if (addr >= 0xFFFC && addr <= 0xFFFD) {
-            __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, "CPU fetching Reset Vector at %04X", addr);
-        }
-        return mapper.read_prg(addr);
+    if (addr >= 0x6000) return mapper.read_prg(addr);
+    if (addr == 0x4016) { 
+        uint8_t ret = (controller_shift & 0x80) >> 7; 
+        controller_shift <<= 1; 
+        return ret; 
     }
-    if (addr == 0x4016) { uint8_t ret = (controller_shift & 0x80) >> 7; controller_shift <<= 1; return ret; }
     return 0;
 }
 
@@ -136,135 +128,65 @@ extern "C" void bus_write(uint16_t addr, uint8_t val) {
         else if (reg == 3) oam_addr = val;
         else if (reg == 4) oam_ram[oam_addr++] = val;
         else if (reg == 6) {
-            if (ppu_addr_latch == 0) { ppu_addr_reg = (ppu_addr_reg & 0x00FF) | ((val & 0x3F) << 8); ppu_addr_latch = 1; }
+            if (ppu_addr_latch == 0) { ppu_addr_reg = (ppu_addr_reg & 0x00FF) | (val << 8); ppu_addr_latch = 1; }
             else { ppu_addr_reg = (ppu_addr_reg & 0xFF00) | val; ppu_addr_latch = 0; }
         }
         else if (reg == 7) {
             uint16_t p_addr = ppu_addr_reg & 0x3FFF;
-            if (p_addr >= 0x2000 && p_addr < 0x3F00) ppu_vram[p_addr % 2048] = val;
-            else if (p_addr >= 0x3F00) {
-                uint8_t p_idx = p_addr & 0x1F;
-                if (p_idx >= 0x10 && (p_idx % 4 == 0)) p_idx -= 0x10;
-                palette_ram[p_idx] = val;
-            }
+            if (p_addr < 0x2000) { /* CHR ROM is usually read only */ }
+            else if (p_addr < 0x3F00) ppu_vram[ntable_mirror(p_addr)] = val;
+            else palette_ram[p_addr & 0x1F] = val;
             ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
-            ppu_addr_reg &= 0x3FFF;
         }
     }
-    else if (addr == 0x4014) { 
+    else if (addr == 0x4014) { // OAM DMA
         uint16_t base = val << 8;
         for (int i = 0; i < 256; i++) oam_ram[i] = bus_read(base + i);
     }
     else if (addr == 0x4016) { if ((val & 0x01) == 0) controller_shift = controller_state; }
-    else if (addr >= 0x6000 && addr <= 0x7FFF) mapper.write_prg_ram(addr, val);
-    else if (addr >= 0x8000) mapper.write(addr, val);
+    else if (addr >= 0x6000) mapper.write(addr, val);
 }
 
-void draw_frame() {
-    std::lock_guard<std::mutex> lock(buffer_mutex);
-    uint16_t nt_base = (ppu_ctrl & 0x03) * 1024;
-    uint16_t bg_pat_base = (ppu_ctrl & 0x10) ? 0x1000 : 0x0000;
-    uint16_t spr_pat_base = (ppu_ctrl & 0x08) ? 0x1000 : 0x0000;
+// --- Core Loop Enhancements ---
 
-    for (int ty = 0; ty < 30; ty++) {
-        for (int tx = 0; tx < 32; tx++) {
-            uint8_t tile = ppu_vram[(nt_base + ty * 32 + tx) % 2048];
-            for (int y = 0; y < 8; y++) {
-                uint8_t p1 = mapper.read_chr(bg_pat_base + tile * 16 + y);
-                uint8_t p2 = mapper.read_chr(bg_pat_base + tile * 16 + y + 8);
-                for (int x = 0; x < 8; x++) {
-                    uint8_t pix = ((p1 >> (7 - x)) & 0x01) | (((p2 >> (7 - x)) & 0x01) << 1);
-                    uint32_t color = (pix != 0) ? nes_palette[read_palette(pix) & 0x3F] : nes_palette[read_palette(0) & 0x3F];
-                    screen_buffer[(ty * 8 + y) * 256 + (tx * 8 + x)] = color;
-                }
-            }
-        }
-    }
-    // Simple Sprite Rendering
-    for (int i = 63; i >= 0; i--) {
-        uint8_t y = oam_ram[i * 4] + 1; uint8_t tile = oam_ram[i * 4 + 1]; uint8_t x = oam_ram[i * 4 + 3];
-        if (y >= 240 || y == 0) continue;
-        for (int sy = 0; sy < 8; sy++) {
-            uint8_t p1 = mapper.read_chr(spr_pat_base + tile * 16 + sy);
-            uint8_t p2 = mapper.read_chr(spr_pat_base + tile * 16 + sy + 8);
-            for (int sx = 0; sx < 8; sx++) {
-                uint8_t pix = ((p1 >> (7 - sx)) & 0x01) | (((p2 >> (7 - sx)) & 0x01) << 1);
-                if (pix != 0 && (x + sx) < 256 && (y + sy) < 240) {
-                    screen_buffer[(y + sy) * 256 + (x + sx)] = nes_palette[read_palette(0x10 + pix) & 0x3F];
-                }
-            }
-        }
-    }
+void power_on_reset() {
+    reg_PC = (bus_read(0xFFFD) << 8) | bus_read(0xFFFC);
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Reset! PC set to: %04X", reg_PC);
+}
+
+void nmi_handler() {
+    push_stack(reg_PC >> 8);
+    push_stack(reg_PC & 0xFF);
+    push_stack(reg_P);
+    reg_PC = (bus_read(0xFFFB) << 8) | bus_read(0xFFFA);
 }
 
 void engine_loop() {
     power_on_reset();
+    
     while (is_running) {
         if (is_paused) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
             continue;
         }
 
-        auto start = std::chrono::steady_clock::now();
-        
-        // PPU Clear VBlank at start of frame
-        ppu_status &= ~0x80; 
+        auto start_time = std::chrono::steady_clock::now();
 
-        // Simulate frame time (CPU work)
-        std::this_thread::sleep_for(std::chrono::microseconds(14500));
-
-        // Trigger VBlank
-        ppu_status |= 0x80; 
-        if (ppu_ctrl & 0x80) {
-            nmi_handler();
+        // 1. Execute CPU instructions for one frame (approx 29780 cycles)
+        // For recompiled logic, we execute until the code hits a "Wait for VBlank" loop
+        // or a specific cycle count.
+        for (int i = 0; i < 15000; i++) { 
+            execute_instruction(); 
         }
 
+        // 2. Trigger VBlank / NMI
+        ppu_status |= 0x80; 
+        if (ppu_ctrl & 0x80) nmi_handler();
+
+        // 3. Render
         draw_frame();
 
-        std::this_thread::sleep_until(start + std::chrono::milliseconds(16));
+        // 4. Sync to 60 FPS
+        std::this_thread::sleep_until(start_time + std::chrono::microseconds(16666));
     }
-}
-
-extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativePauseEngine(JNIEnv* env, jobject thiz) { is_paused = true; }
-extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeResumeEngine(JNIEnv* env, jobject thiz) { is_paused = false; }
-
-extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv* env, jobject thiz, jstring filesDir) {
-    if (is_running) return;
-    const char* cPath = env->GetStringUTFChars(filesDir, 0); std::string pathStr(cPath);
-    mapper.reset();
-    for(int i = 0; i < 4; i++) {
-        std::ifstream in(pathStr + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
-        if (in) in.read((char*)mapper.prg_rom[i], 16384);
-    }
-    std::ifstream c_in(pathStr + "/chr_rom.bin", std::ios::binary); 
-    if (c_in) c_in.read((char*)mapper.chr_rom, 16384);
-    is_running = true; is_paused = false;
-    std::thread(engine_loop).detach();
-    env->ReleaseStringUTFChars(filesDir, cPath);
-}
-
-extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv* env, jobject thiz, jobject bitmap) {
-    if (is_paused) return;
-    void* pixels; if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
-    { std::lock_guard<std::mutex> lock(buffer_mutex); memcpy(pixels, screen_buffer, 256 * 240 * 4); }
-    AndroidBitmap_unlockPixels(env, bitmap);
-}
-
-extern "C" JNIEXPORT jstring JNICALL Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstring romPath, jstring outDir) {
-    const char* cPath = env->GetStringUTFChars(romPath, 0); const char* cOut = env->GetStringUTFChars(outDir, 0);
-    std::ifstream nes(cPath, std::ios::binary); if (!nes) return env->NewStringUTF("File Error");
-    nes.seekg(16);
-    for (int i = 0; i < 4; i++) {
-        std::vector<char> buf(16384); nes.read(buf.data(), 16384);
-        std::ofstream out(std::string(cOut) + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
-        out.write(buf.data(), 16384);
-    }
-    std::vector<char> chr(16384); nes.read(chr.data(), 16384);
-    std::ofstream c_out(std::string(cOut) + "/chr_rom.bin", std::ios::binary); c_out.write(chr.data(), 16384);
-    env->ReleaseStringUTFChars(romPath, cPath); env->ReleaseStringUTFChars(outDir, cOut);
-    return env->NewStringUTF("Success");
-}
-
-extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_injectInput(JNIEnv* env, jobject thiz, jint bit, jboolean pressed) {
-    if (pressed) controller_state |= bit; else controller_state &= ~bit;
 }
