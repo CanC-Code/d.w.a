@@ -24,51 +24,59 @@ MapperMMC1 mapper;
 
 // --- Shared 6502 CPU State (Extern "C" for Linker Compatibility) ---
 extern "C" {
+    // Standard NES Reset State
     uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
-    uint8_t tmp_val = 0;
-    uint16_t target_addr = 0;
-
-    // Bus accessors called by recompiled code
+    
+    // Bus accessors
     uint8_t bus_read(uint16_t addr);
     void bus_write(uint16_t addr, uint8_t val);
 
-    // Updates Negative (N) and Zero (Z) flags
+    // --- STACK IMPLEMENTATION ---
+    // The stack in 6502 lives at $0100 - $01FF
+    void push_stack(uint8_t val) {
+        bus_write(0x0100 | reg_S, val);
+        reg_S--;
+    }
+
+    uint8_t pop_stack() {
+        reg_S++;
+        return bus_read(0x0100 | reg_S);
+    }
+
+    // --- FLAG HELPERS ---
     void update_nz(uint8_t val) { 
-        reg_P &= ~0x82; 
+        reg_P &= ~0x82; // Clear Negative and Zero
         if (val == 0) reg_P |= 0x02;
         if (val & 0x80) reg_P |= 0x80;
     }
 
-    // Standard 6502 Add with Carry logic
+    void update_flags_cmp(uint8_t reg, uint8_t val) {
+        reg_P &= ~0x83; // Clear N, Z, C
+        if (reg >= val) reg_P |= 0x01; // Carry
+        if (reg == val) reg_P |= 0x02; // Zero
+        uint8_t res = reg - val;
+        if (res & 0x80) reg_P |= 0x80; // Negative
+    }
+
+    // --- MATH HELPERS ---
     void cpu_adc(uint8_t val) {
         uint16_t carry = (reg_P & 0x01);
         uint16_t sum = reg_A + val + carry;
-        
-        // Overflow flag logic: (Input ^ Sum) & (Accumulator ^ Sum)
-        if (~(reg_A ^ val) & (reg_A ^ sum) & 0x80) reg_P |= 0x40; 
+        if (~(reg_A ^ val) & (reg_A ^ sum) & 0x80) reg_P |= 0x40; // V
         else reg_P &= ~0x40;
-        
-        // Carry flag logic
-        if (sum > 0xFF) reg_P |= 0x01; 
+        if (sum > 0xFF) reg_P |= 0x01; // C
         else reg_P &= ~0x01;
-        
         reg_A = (uint8_t)sum;
         update_nz(reg_A);
     }
 
-    // Standard 6502 Subtract with Carry logic
-    void cpu_sbc(uint8_t val) { 
-        cpu_adc(~val); 
-    }
+    void cpu_sbc(uint8_t val) { cpu_adc(~val); }
 
-    // Helper for Indirect Addressing: LDA ($12),Y
     uint16_t read_pointer(uint16_t addr) {
-        uint8_t lo = bus_read(addr);
-        uint8_t hi = bus_read(addr + 1);
-        return (hi << 8) | lo;
+        return bus_read(addr) | (bus_read(addr + 1) << 8);
     }
 
-    // Recompiled Entry Points
+    // Recompiled Entry Points (Linker will find these in Bankxx.cpp)
     void power_on_reset();
     void nmi_handler();
 }
@@ -84,7 +92,7 @@ uint32_t nes_palette[64] = {
     0xFFADADAD, 0xFF155FD9, 0xFF4240FF, 0xFF7527FE, 0xFFA01ACC, 0xFFB71E7B, 0xFFB53120, 0xFF994E00,
     0xFF6B6D00, 0xFF388700, 0xFF0C9300, 0xFF008F32, 0xFF007C8D, 0xFF000000, 0xFF000000, 0xFF000000,
     0xFFEFB0FF, 0xFF64B0FF, 0xFF9290FF, 0xFFC676FF, 0xFFF36AFF, 0xFFFE6ECC, 0xFFFE8170, 0xFFEA9E22,
-    0xFFBCBE00, 0xFF88D100, 0xFF5CE430, 0xFF45E082, 0xFF45E082, 0xFF48CDDE, 0xFF4F4F4F, 0xFF000000
+    0xFFBCBE00, 0xFF88D100, 0xFF5CE430, 0xFF45E082, 0xFF48CDDE, 0xFF4F4F4F, 0xFF000000, 0xFF000000
 };
 
 // --- Memory Bus Implementation ---
@@ -154,11 +162,8 @@ void draw_frame() {
                 uint8_t p2 = mapper.read_chr(pat_base + tile * 16 + y + 8);
                 for (int x = 0; x < 8; x++) {
                     uint8_t pix = ((p1 >> (7 - x)) & 0x01) | (((p2 >> (7 - x)) & 0x01) << 1);
-                    if (pix != 0) {
-                        screen_buffer[(ty * 8 + y) * 256 + (tx * 8 + x)] = nes_palette[palette_ram[pix] & 0x3F];
-                    } else {
-                        screen_buffer[(ty * 8 + y) * 256 + (tx * 8 + x)] = 0xFF000000;
-                    }
+                    uint32_t color = (pix != 0) ? nes_palette[palette_ram[pix] & 0x3F] : 0xFF000000;
+                    screen_buffer[(ty * 8 + y) * 256 + (tx * 8 + x)] = color;
                 }
             }
         }
@@ -168,17 +173,16 @@ void draw_frame() {
 // --- Emulator Life Cycle ---
 
 void engine_loop() {
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Starting Engine Loop...");
     power_on_reset();
     while (is_running) {
         auto start = std::chrono::steady_clock::now();
         
-        // Signal Vertical Blank to the recompiled code
+        // Signal Vertical Blank
         ppu_status |= 0x80;
         if (ppu_ctrl & 0x80) nmi_handler();
-        
+
         draw_frame();
-        
-        // Target 60 FPS
         std::this_thread::sleep_until(start + std::chrono::milliseconds(16));
     }
 }
