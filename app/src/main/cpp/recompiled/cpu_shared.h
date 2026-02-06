@@ -1,133 +1,198 @@
-#ifndef CPU_SHARED_H
-#define CPU_SHARED_H
-
-#include <stdint.h>
+#include <jni.h>
+#include <string>
+#include <fstream>
 #include <android/log.h>
+#include <android/bitmap.h>
+#include <thread>
+#include <chrono>
+#include <mutex>
+#include <cstring>
+#include "MapperMMC1.h"
+#include "recompiled/cpu_shared.h"
 
-// Log helper for debugging recompiled execution
-#define LOG_CPU(...) __android_log_print(ANDROID_LOG_DEBUG, "DWA_RECOMPILED", __VA_ARGS__)
+#define LOG_TAG "DWA_NATIVE"
 
-// --- 6502 Status Flag Bitmask ---
-#define FLAG_C 0x01 // Carry
-#define FLAG_Z 0x02 // Zero
-#define FLAG_I 0x04 // Interrupt Disable
-#define FLAG_D 0x08 // Decimal Mode
-#define FLAG_B 0x10 // Break
-#define FLAG_U 0x20 // Unused/Always 1
-#define FLAG_V 0x40 // Overflow
-#define FLAG_N 0x80 // Negative
+// --- Global Hardware State ---
+uint8_t cpu_ram[0x0800] = {0};
+uint8_t ppu_vram[2048] = {0};
+uint8_t palette_ram[32] = {0};
+uint8_t oam_ram[256] = {0};
+uint32_t screen_buffer[256 * 240] = {0};
+uint8_t controller_state = 0;
+uint8_t controller_shift = 0;
+uint8_t last_strobe = 0;
+uint8_t ppu_data_buffer = 0;
+std::mutex buffer_mutex;
+MapperMMC1 mapper;
 
-// --- NES Hardware Constants & Memory Map ---
-#define SpriteRAM          0x0200
-#define PPU_CTRL           0x2000
-#define PPU_MASK           0x2001
-#define PPU_STATUS         0x2002
-#define OAM_ADDR           0x2003
-#define OAM_DATA           0x2004
-#define PPU_SCROLL         0x2005
-#define PPU_ADDR           0x2006
-#define PPU_DATA           0x2007
-#define SND_CHN            0x4015
-#define JOYPAD1            0x4016
-#define JOYPAD2            0x4017
+// PPU Internal State
+uint8_t ppu_status = 0, ppu_ctrl = 0, ppu_mask = 0, ppu_addr_latch = 0, oam_addr = 0;
+uint16_t ppu_addr_reg = 0;
+bool is_running = false;
+bool is_paused = false;
 
-// --- Dragon Warrior Internal RAM Aliases ---
-#define MapWidth           0x0013 
-#define MapHeight          0x0014
-#define PlayerFlags        0x00CF 
+// Recompiled Dispatcher Entrance
+namespace Dispatcher { void execute(); }
 
-// --- Directional & Audio Engine Aliases ---
-#define DIR_UP             0x00
-#define DIR_RIGHT          0x01
-#define DIR_DOWN           0x02
-#define DIR_LEFT           0x03
-
-// --- Map Data Pointers (Required for Bank 00) ---
-#define DLCstlGFDat        0x80B0
-#define HauksnessDat       0x8178
-#define TantGFDat          0x8240
-#define ThrnRoomDat        0x8402
-#define DgnLrdBLDat        0x8434
-#define KolDat             0x85F6
-#define BrecconaryDat      0x8716
-#define CantlinDat         0x88D8
-#define GarinhamDat        0x8A9A
-#define RimuldarDat        0x8B62
-#define TantSLDat          0x8D24
-#define RainCaveDat        0x8D56
-#define DropCaveDat        0x8D88
-#define DgnLrdSL1Dat       0x8DBA
-#define DgnLrdSL2Dat       0x8E82
-#define DgnLrdSL3Dat       0x8EB4
-#define DgnLrdSL4Dat       0x8EE6
-#define DgnLrdSL5Dat       0x8F18
-#define DgnLrdSL6Dat       0x8F4A
-#define SwampCaveDat       0x8F7C
-#define RckMtnB1Dat        0x8FD6
-#define RckMtnB2Dat        0x9038
-#define GarinCaveB1Dat     0x909A
-#define GarinCaveB2Dat     0x925C
-#define GarinCaveB3Dat     0x9162
-#define GarinCaveB4Dat     0x922A
-#define ErdCaveB1Dat       0x92B0
-#define ErdCaveB2Dat       0x92E2
-
-// --- Global Function Entry Points ---
-#define ModAttribBits      0xC006
-#define GetNPCSpriteIndex  0xC0F4
-#define WordMultiply       0xC1C9
-#define ByteDivide         0xC1F0
-#define PalFadeOut         0xC212
-#define PalFadeIn          0xC529
-#define ClearAttribByte    0xC244
-#define UpdateRandNum      0xC55B
-#define CalcPPUBufAddr     0xC596
-#define PrepSPPalLoad      0xC632
-#define PrepBGPalLoad      0xC63D
-#define AddPPUBufEntry     0xC690
-#define ClearSpriteRAM     0xC6BB
-#define IdleUpdate         0xCB30
-#define CheckForTriggers   0xCBF7
-#define ChangeMaps         0xD9E2
-#define WaitForNMI         0xFF74
-
-// Use extern "C" for linkage consistency between C++ files and the linker
+// --- Satisfying cpu_shared.h Externs ---
 extern "C" {
-    // --- CPU Registers ---
-    extern uint16_t reg_PC;
-    extern uint8_t reg_A, reg_X, reg_Y, reg_P, reg_S;
+    uint16_t reg_PC = 0;
+    uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x34;
 
-    // --- Memory Bus ---
-    extern uint8_t bus_read(uint16_t addr);
-    extern void bus_write(uint16_t addr, uint8_t val);
+    void update_nz(uint8_t val) {
+        reg_P &= ~(FLAG_N | FLAG_Z);
+        if (val == 0) reg_P |= FLAG_Z;
+        if (val & 0x80) reg_P |= FLAG_N;
+    }
 
-    // --- Stack Operations ---
-    extern void push_stack(uint8_t val);
-    extern uint8_t pop_stack();
+    void update_flags_cmp(uint8_t reg, uint8_t val) {
+        reg_P &= ~(FLAG_N | FLAG_Z | FLAG_C);
+        if (reg >= val) reg_P |= FLAG_C;
+        if (reg == val) reg_P |= FLAG_Z;
+        if ((uint8_t)(reg - val) & 0x80) reg_P |= FLAG_N;
+    }
 
-    // --- Flag Helpers ---
-    extern void update_nz(uint8_t val);
-    extern void update_flags_cmp(uint8_t reg, uint8_t val);
+    void cpu_adc(uint8_t val) {
+        uint16_t carry = (reg_P & FLAG_C) ? 1 : 0;
+        uint16_t sum = reg_A + val + carry;
+        if (~(reg_A ^ val) & (reg_A ^ sum) & 0x80) reg_P |= FLAG_V; else reg_P &= ~FLAG_V;
+        if (sum > 0xFF) reg_P |= FLAG_C; else reg_P &= ~FLAG_C;
+        reg_A = (uint8_t)sum;
+        update_nz(reg_A);
+    }
 
-    // --- Math & Logic Helpers ---
-    extern void cpu_adc(uint8_t val);
-    extern void cpu_sbc(uint8_t val);
-    extern void cpu_bit(uint8_t val);
+    void cpu_sbc(uint8_t val) { cpu_adc(~val); }
 
-    // --- Shift/Rotate Helpers (Crucial for Linker) ---
-    extern uint8_t cpu_asl(uint8_t val);
-    extern uint8_t cpu_lsr(uint8_t val);
-    extern uint8_t cpu_rol(uint8_t val);
-    extern uint8_t cpu_ror(uint8_t val);
+    void cpu_bit(uint8_t val) {
+        reg_P &= ~(FLAG_Z | FLAG_V | FLAG_N);
+        if ((val & reg_A) == 0) reg_P |= FLAG_Z;
+        reg_P |= (val & 0xC0);
+    }
 
-    // --- Addressing Helpers (Crucial for Linker) ---
-    extern uint16_t read_pointer(uint16_t addr);
-    extern uint16_t read_pointer_x(uint16_t addr);
-    extern uint16_t read_pointer_indexed_y(uint16_t zp_addr);
+    uint8_t cpu_asl(uint8_t val) {
+        reg_P = (reg_P & ~FLAG_C) | ((val >> 7) & 0x01);
+        uint8_t res = val << 1;
+        update_nz(res);
+        return res;
+    }
 
-    // --- Execution Control ---
-    void power_on_reset();
-    void nmi_handler();
+    uint8_t cpu_lsr(uint8_t val) {
+        reg_P = (reg_P & ~FLAG_C) | (val & 0x01);
+        uint8_t res = val >> 1;
+        update_nz(res);
+        return res;
+    }
+
+    uint8_t cpu_rol(uint8_t val) {
+        uint8_t old_c = (reg_P & FLAG_C) ? 1 : 0;
+        reg_P = (reg_P & ~FLAG_C) | ((val >> 7) & 0x01);
+        uint8_t res = (val << 1) | old_c;
+        update_nz(res);
+        return res;
+    }
+
+    uint8_t cpu_ror(uint8_t val) {
+        uint8_t old_c = (reg_P & FLAG_C) ? 1 : 0;
+        reg_P = (reg_P & ~FLAG_C) | (val & 0x01);
+        uint8_t res = (val >> 1) | (old_c << 7);
+        update_nz(res);
+        return res;
+    }
+
+    // --- Critical Addressing Helpers ---
+    uint16_t read_pointer(uint16_t addr) {
+        return bus_read(addr) | (bus_read(addr + 1) << 8);
+    }
+
+    uint16_t read_pointer_x(uint16_t addr) {
+        return bus_read((addr + reg_X) & 0xFF) | (bus_read((addr + reg_X + 1) & 0xFF) << 8);
+    }
+
+    uint16_t read_pointer_indexed_y(uint16_t zp_addr) {
+        uint16_t lo = bus_read(zp_addr);
+        uint16_t hi = bus_read((zp_addr + 1) & 0xFF);
+        return (lo | (hi << 8)) + reg_Y;
+    }
+
+    void push_stack(uint8_t val) { cpu_ram[0x0100 | reg_S] = val; reg_S--; }
+    uint8_t pop_stack() { reg_S++; return cpu_ram[0x0100 | reg_S]; }
 }
 
-#endif // CPU_SHARED_H
+// --- Bus Access ---
+extern "C" uint8_t bus_read(uint16_t addr) {
+    if (addr < 0x0800) return cpu_ram[addr];
+    if (addr >= 0x2000 && addr <= 0x3FFF) {
+        if ((addr % 8) == 2) {
+            uint8_t s = ppu_status | 0x80; // Always signal VBlank to keep logic moving
+            ppu_status &= ~0x80; ppu_addr_latch = 0; return s;
+        }
+        // ... other PPU regs ...
+    }
+    if (addr >= 0x8000) return mapper.read_prg(addr);
+    return 0;
+}
+
+extern "C" void bus_write(uint16_t addr, uint8_t val) {
+    if (addr < 0x0800) cpu_ram[addr] = val;
+    else if (addr >= 0x8000) mapper.write(addr, val);
+    // ... PPU write logic ...
+}
+
+// --- Entry Points ---
+extern "C" void power_on_reset() {
+    mapper.reset();
+    uint16_t v_lo = mapper.read_prg(0xFFFC);
+    uint16_t v_hi = mapper.read_prg(0xFFFD);
+    reg_PC = (v_hi << 8) | v_lo;
+    
+    // Failsafe: Dragon Warrior US entry
+    if (reg_PC == 0x0000 || reg_PC == 0xFFFF) reg_PC = 0xFF8E; 
+    
+    reg_S = 0xFD;
+    reg_P = 0x34;
+    LOG_CPU("Native Game Started at PC: %04X", reg_PC);
+}
+
+extern "C" void nmi_handler() {
+    ppu_status |= 0x80;
+    push_stack(reg_PC >> 8);
+    push_stack(reg_PC & 0xFF);
+    push_stack(reg_P);
+    reg_PC = read_pointer(0xFFFA);
+}
+
+void engine_loop() {
+    power_on_reset();
+    is_running = true;
+    while (is_running) {
+        if (is_paused) { std::this_thread::sleep_for(std::chrono::milliseconds(16)); continue; }
+        
+        // Execute block of recompiled instructions
+        for (int i = 0; i < 20000; i++) {
+            Dispatcher::execute();
+        }
+        
+        // Trigger recompiled VBlank logic
+        if (ppu_ctrl & 0x80) nmi_handler();
+        
+        // Render current VRAM state
+        // draw_frame(); 
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+}
+
+// --- JNI Surface Update ---
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv *env, jobject thiz, jobject bitmap) {
+    AndroidBitmapInfo info;
+    void* pixels;
+    if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) return;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
+    
+    // Simple copy to surface
+    std::lock_guard<std::mutex> lock(buffer_mutex);
+    memcpy(pixels, screen_buffer, 256 * 240 * 4);
+    
+    AndroidBitmap_unlockPixels(env, bitmap);
+}
