@@ -42,7 +42,7 @@
 #define MCTL_DMC_HW        0x07
 
 // --- Map Data Pointers (Required for Bank 00) ---
-[span_0](start_span)// Extracted from MapDatTbl in Bank 00[span_0](end_span)
+// Extracted from MapDatTbl in Bank 00
 #define DLCstlGFDat        0x80B0
 #define HauksnessDat       0x8178
 #define TantGFDat          0x8240
@@ -72,16 +72,13 @@
 #define ErdCaveB1Dat       0x92B0
 #define ErdCaveB2Dat       0x92E2
 
-// --- Text Block Aliases (Required for Dialog/Strings) ---
-[span_1](start_span)// Text Block 1 (found at 0x8000 in its respective bank segment)[span_1](end_span)
+// --- Text Block Aliases ---
 #define TextBlock1         0x8000
 #define TB1E0              0x8000
 #define TB1E1              0x8039
 #define TB1E2              0x804A
-[span_2](start_span)// Text Block 8 (found at 0x8000 in Bank 02 segment)[span_2](end_span)
 #define TextBlock8         0x8000
 #define TB8E0              0x8000
-[span_3](start_span)// Text Block 14 (found at 0xAA6C region)[span_3](end_span)
 #define TB14E2             0xAA6C
 #define TB14E3             0xAA8F
 
@@ -127,7 +124,6 @@ extern "C" {
     extern void cpu_sbc(uint8_t val);
     extern void cpu_bit(uint8_t val);
     
-    // Updated to support return values for Accumulator-mode shifts
     extern uint8_t cpu_asl(uint8_t val);
     extern uint8_t cpu_lsr(uint8_t val);
     extern uint8_t cpu_rol(uint8_t val);
