@@ -7,12 +7,13 @@
 class MapperMMC1 {
 public:
     // Dragon Warrior I: 64KB PRG (4x16KB) and 8KB-16KB CHR
+    // These are public so the loader in native-lib can fill them
     uint8_t prg_rom[4][16384]; 
     uint8_t chr_rom[8][4096];
     uint8_t prg_ram[8192]; 
 
     uint8_t shift_register;
-    uint8_t write_count; // Tracks 5 serial writes
+    uint8_t write_count; 
     uint8_t control;
     uint8_t chr_bank_0;
     uint8_t chr_bank_1;
@@ -21,6 +22,10 @@ public:
 
     MapperMMC1() {
         reset();
+        // Zero out memory to prevent garbage values
+        std::memset(prg_rom, 0, sizeof(prg_rom));
+        std::memset(chr_rom, 0, sizeof(chr_rom));
+        std::memset(prg_ram, 0, sizeof(prg_ram));
     }
 
     void reset() {
@@ -32,24 +37,20 @@ public:
         chr_bank_0 = 0;
         chr_bank_1 = 0;
         ram_enabled = true;
-        std::memset(prg_ram, 0, sizeof(prg_ram));
     }
 
     void write(uint16_t addr, uint8_t val) {
-        // If Bit 7 is set, reset the shift register
         if (val & 0x80) {
             shift_register = 0x10;
             write_count = 0;
-            control |= 0x0C; // Resetting usually sets PRG mode to 3
+            control |= 0x0C; 
         } else {
-            // Write LSB of val to shift register
             shift_register = ((val & 0x01) << 4) | (shift_register >> 1);
             write_count++;
 
-            // MMC1 registers are updated after 5 bits are shifted in
             if (write_count == 5) {
                 uint8_t data = shift_register & 0x1F;
-                
+
                 if (addr >= 0x8000 && addr <= 0x9FFF) {
                     control = data;
                 } else if (addr >= 0xA000 && addr <= 0xBFFF) {
@@ -58,7 +59,6 @@ public:
                     chr_bank_1 = data;
                 } else if (addr >= 0xE000) {
                     prg_bank = data & 0x0F;
-                    // Bit 4 of PRG register (on some boards) enables/disables RAM
                     ram_enabled = !(data & 0x10); 
                 }
 
@@ -69,7 +69,6 @@ public:
     }
 
     uint8_t read_prg(uint16_t addr) {
-        // Handle PRG RAM (SRAM) access ($6000-$7FFF)
         if (addr >= 0x6000 && addr <= 0x7FFF) {
             return ram_enabled ? prg_ram[addr - 0x6000] : 0x00;
         }
@@ -80,7 +79,6 @@ public:
         switch (mode) {
             case 0: case 1: // 32KB switching mode
             {
-                // Bit 0 of prg_bank is ignored in 32KB mode
                 uint8_t bank = (prg_bank & 0x0E); 
                 if (addr >= 0xC000) bank++;
                 return prg_rom[bank % 4][offset];
@@ -97,21 +95,13 @@ public:
 
     uint8_t read_chr(uint16_t addr) {
         uint16_t offset = addr & 0x0FFF;
-        // Control bit 4: 0 = 8KB mode, 1 = 4KB mode
-        if (control & 0x10) {
+        if (control & 0x10) { // 4KB Mode
             if (addr < 0x1000) return chr_rom[chr_bank_0 % 8][offset];
             return chr_rom[chr_bank_1 % 8][offset];
-        } else {
-            // 8KB Mode: bit 0 of chr_bank_0 is ignored
+        } else { // 8KB Mode
             uint8_t bank = (chr_bank_0 & 0x1E);
             if (addr >= 0x1000) bank++;
             return chr_rom[bank % 8][offset];
-        }
-    }
-
-    void write_prg_ram(uint16_t addr, uint8_t val) {
-        if (ram_enabled && addr >= 0x6000 && addr <= 0x7FFF) {
-            prg_ram[addr - 0x6000] = val;
         }
     }
 };
