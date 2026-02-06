@@ -16,7 +16,7 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// Dragon Warrior specific RAM addresses for synchronization
+// Dragon Warrior specific RAM addresses
 #define DW_RAM_VBLANK_FLAG   0x002D
 #define DW_RAM_FRAME_COUNTER 0x003C
 
@@ -33,7 +33,7 @@ std::mutex buffer_mutex;
 
 bool is_running = false;
 bool is_paused = false;
-bool rom_loaded = false; // NEW: Flag to prevent early boot
+bool rom_loaded = false; 
 uint8_t controller_state = 0;
 uint8_t controller_shift = 0;
 uint8_t last_strobe = 0;
@@ -141,16 +141,22 @@ extern "C" {
         else if (addr >= 0x6000) mapper.write(addr, val);
     }
 
-    uint16_t read_pointer(uint16_t addr) { return bus_read(addr) | (bus_read(addr + 1) << 8); }
+    uint16_t read_pointer(uint16_t addr) {
+        // NES is Little Endian
+        return bus_read(addr) | (bus_read(addr + 1) << 8); 
+    }
+    
     uint16_t read_pointer_indexed_x(uint16_t addr) {
         uint8_t zp = (uint8_t)(addr + reg_X);
         return bus_read(zp) | (bus_read((uint8_t)(zp + 1)) << 8);
     }
+    
     uint16_t read_pointer_indexed_y(uint16_t zp_addr) {
         uint16_t lo = bus_read((uint8_t)zp_addr);
         uint16_t hi = bus_read((uint8_t)(zp_addr + 1));
         return (uint16_t)((lo | (hi << 8)) + reg_Y);
     }
+    
     void push_stack(uint8_t val) { cpu_ram[0x0100 | (reg_S--)] = val; }
     uint8_t pop_stack() { return cpu_ram[0x0100 | (++reg_S)]; }
 }
@@ -159,46 +165,50 @@ void trigger_nmi() {
     push_stack(reg_PC >> 8);
     push_stack(reg_PC & 0xFF);
     push_stack(reg_P);
+    
+    // Dragon Warrior synchronization
     cpu_ram[DW_RAM_VBLANK_FLAG] = 1;
     cpu_ram[DW_RAM_FRAME_COUNTER]++;
+    
     Dispatcher::request_nmi(); 
 }
 
 // --- Main Engine Loop ---
 void engine_loop() {
     LOGI("Engine Thread Waiting for ROM...");
-    
-    // Safety Loop: Wait until the ROM is actually loaded via nativeExtractRom
+
     while (!rom_loaded && is_running) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
-    LOGI("ROM Detected. Initializing Hardware Reset.");
+    LOGI("ROM Detected. Performing Hardware Reset.");
     mapper.reset();
     ppu.reset();
 
+    // Reset Vector is at $FFFC-$FFFD
     reg_PC = read_pointer(0xFFFC);
-    
-    // If the reset vector is invalid, the engine shouldn't run.
+    LOGI("CPU Reset Vector read as: 0x%04X", reg_PC);
+
     if (reg_PC < 0x8000) {
-        LOGE("FATAL: Reset Vector (0x%04X) is outside PRG-ROM range!", reg_PC);
+        LOGE("FATAL: Reset Vector (0x%04X) invalid. ROM not mapped correctly!", reg_PC);
         is_running = false;
         return;
     }
 
-    LOGI("CPU Booting at: 0x%04X", reg_PC);
-
     while (is_running) {
-        if (is_paused) { std::this_thread::sleep_for(std::chrono::milliseconds(16)); continue; }
+        if (is_paused) { 
+            std::this_thread::sleep_for(std::chrono::milliseconds(16)); 
+            continue; 
+        }
 
         auto frame_start = std::chrono::steady_clock::now();
 
-        // 1. CPU Execution Slice (approx 29780 cycles per frame)
+        // 1. CPU Execution Slice
         for (int i = 0; i < 29780; i++) {
             execute_instruction();
         }
 
-        // 2. VBlank Trigger
+        // 2. VBlank Handshake
         ppu.status |= 0x80; 
         if (ppu.ctrl & 0x80) trigger_nmi();
 
@@ -211,7 +221,6 @@ void engine_loop() {
         ppu.status &= ~0x80;
         std::this_thread::sleep_until(frame_start + std::chrono::microseconds(16666));
     }
-    LOGI("Engine Thread Terminated.");
 }
 
 // --- JNI Implementation ---
@@ -220,17 +229,29 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstring romPath, jstring outDir) {
     const char *path = env->GetStringUTFChars(romPath, nullptr);
     std::ifstream file(path, std::ios::binary);
+    
     if (!file.is_open()) {
         env->ReleaseStringUTFChars(romPath, path);
         return env->NewStringUTF("Error: Could not open ROM");
     }
 
-    file.seekg(16, std::ios::beg); // Skip 16-byte iNES header
-    for (int i = 0; i < 4; i++) file.read((char*)mapper.prg_rom[i], 16384);
-    for (int i = 0; i < 2; i++) file.read((char*)mapper.chr_rom[i], 4096);
+    // Skip 16-byte iNES header
+    file.seekg(16, std::ios::beg); 
+    
+    // Dragon Warrior PRG is 64KB (4 banks of 16KB)
+    for (int i = 0; i < 4; i++) {
+        file.read((char*)mapper.prg_rom[i], 16384);
+    }
+    
+    // CHR is 16KB (2 banks of 8KB or 4 banks of 4KB depending on implementation)
+    // Most MMC1 PPU implementations use 4KB banking.
+    for (int i = 0; i < 4; i++) {
+        file.read((char*)mapper.chr_rom[i], 4096);
+    }
+    
     file.close();
-
-    rom_loaded = true; // Signal the engine thread it can now boot
+    rom_loaded = true; 
+    
     env->ReleaseStringUTFChars(romPath, path);
     return env->NewStringUTF("Success");
 }
