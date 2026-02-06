@@ -33,7 +33,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     private static final int PICK_ROM_REQUEST = 1;
     private static final String PREFS_NAME = "ControllerPrefs";
-    
+
     private View gameContainer, setupContainer, menuOverlay;
     private SurfaceView gameSurface;
     private Bitmap screenBitmap;
@@ -57,10 +57,10 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         gameSurface = findViewById(R.id.game_surface);
         menuOverlay = findViewById(R.id.menu_overlay);
 
+        // Standard NES resolution
         screenBitmap = Bitmap.createBitmap(256, 240, Bitmap.Config.ARGB_8888);
         gameSurface.getHolder().addCallback(this);
 
-        // Load screen settings
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         gameScreenYOffset = prefs.getFloat("screen_y_offset", 0);
         gameScaleFactor = prefs.getFloat("screen_scale", 1.0f);
@@ -80,13 +80,25 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             public boolean onScale(ScaleGestureDetector detector) {
                 if (isEditMode) {
                     gameScaleFactor *= detector.getScaleFactor();
-                    gameScaleFactor = Math.max(0.5f, Math.min(gameScaleFactor, 2.5f));
+                    gameScaleFactor = Math.max(0.5f, Math.min(gameScaleFactor, 3.0f));
                     saveLayout();
                     return true;
                 }
                 return false;
             }
         });
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        if (isEngineRunning) nativePauseEngine();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (isEngineRunning) nativeResumeEngine();
     }
 
     @Override
@@ -98,7 +110,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     private void showSettingsMenu() {
         nativePauseEngine();
-        if (menuOverlay != null) menuOverlay.setVisibility(View.VISIBLE);
         String[] options = {"Toggle Orientation", "Edit Layout (Drag/Pinch)", "Reset Layout", "Resume"};
         new AlertDialog.Builder(this)
                 .setTitle("Settings")
@@ -116,7 +127,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         int current = getResources().getConfiguration().orientation;
         setRequestedOrientation(current == Configuration.ORIENTATION_LANDSCAPE ? 
                 ActivityInfo.SCREEN_ORIENTATION_PORTRAIT : ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
-        resumeGame();
     }
 
     private void resumeGame() {
@@ -126,7 +136,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     private void enterEditMode() {
         isEditMode = true;
-        if (menuOverlay != null) menuOverlay.setVisibility(View.GONE);
         Toast.makeText(this, "Drag buttons/screen. Pinch screen to scale.", Toast.LENGTH_LONG).show();
         setupTouchControls(); 
     }
@@ -165,16 +174,17 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     @Override
     public void doFrame(long frameTimeNanos) {
         if (!isEngineRunning || !isSurfaceReady) return;
+        
         nativeUpdateSurface(screenBitmap);
 
         SurfaceHolder holder = gameSurface.getHolder();
         Canvas canvas = holder.lockCanvas();
         if (canvas != null) {
             try {
-                canvas.drawColor(0xFF000000);
+                canvas.drawColor(0xFF000000); // Clear screen black
                 float baseScale = Math.min((float)gameSurface.getWidth() / 256f, (float)gameSurface.getHeight() / 240f);
                 float finalScale = baseScale * gameScaleFactor;
-                
+
                 int w = (int)(256 * finalScale);
                 int h = (int)(240 * finalScale);
                 int left = (gameSurface.getWidth() - w) / 2;
@@ -189,7 +199,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     @SuppressLint("ClickableViewAccessibility")
     private void setupTouchControls() {
-        // Grouped D-Pad
+        // D-Pad Grouping (masks based on standard NES serial controller order)
         View[] dpad = { findViewById(R.id.btn_up), findViewById(R.id.btn_down), 
                         findViewById(R.id.btn_left), findViewById(R.id.btn_right) };
         String[] keys = {"up", "down", "left", "right"};
@@ -204,7 +214,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         bindButton(R.id.btn_start, 0x10, "start"); 
         bindButton(R.id.btn_select, 0x20, "select");
 
-        // Screen Adjustments
         gameSurface.setOnTouchListener((v, event) -> {
             scaleDetector.onTouchEvent(event);
             if (isEditMode && event.getAction() == MotionEvent.ACTION_MOVE && !scaleDetector.isInProgress()) {
@@ -250,9 +259,12 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     }
 
     private boolean handleInput(View v, MotionEvent e, int mask) {
-        if (e.getAction() == MotionEvent.ACTION_DOWN) { injectInput(mask, true); v.setPressed(true); }
-        else if (e.getAction() == MotionEvent.ACTION_UP || e.getAction() == MotionEvent.ACTION_CANCEL) { 
-            injectInput(mask, false); v.setPressed(false); 
+        if (e.getAction() == MotionEvent.ACTION_DOWN) { 
+            injectInput(mask, true); 
+            v.setPressed(true); 
+        } else if (e.getAction() == MotionEvent.ACTION_UP || e.getAction() == MotionEvent.ACTION_CANCEL) { 
+            injectInput(mask, false); 
+            v.setPressed(false); 
         }
         return true;
     }
@@ -272,7 +284,8 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     }
 
     private boolean isRomExtracted() {
-        return new File(getFilesDir(), "chr_rom.bin").exists() && new File(getFilesDir(), "prg_bank_0.bin").exists();
+        // Since we map directly to base.nes, we check for its existence
+        return new File(getFilesDir(), "base.nes").exists();
     }
 
     private void openFilePicker() {
@@ -299,17 +312,29 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             byte[] buf = new byte[16384]; int len;
             while ((len = is.read(buf)) > 0) os.write(buf, 0, len);
             os.close(); is.close();
-            if ("Success".equals(nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath()))) startNativeEngine();
-        } catch (Exception e) { Log.e("DWA", "File error", e); }
+            
+            // Extract and map
+            String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
+            if ("Success".equals(result)) {
+                startNativeEngine();
+            } else {
+                Toast.makeText(this, "ROM Error: " + result, Toast.LENGTH_SHORT).show();
+            }
+        } catch (Exception e) { 
+            Log.e("DWA", "File error", e); 
+        }
     }
 
     @Override public void surfaceCreated(@NonNull SurfaceHolder h) { 
         isSurfaceReady = true; 
-        if (isRomExtracted()) { startNativeEngine(); Choreographer.getInstance().postFrameCallback(this); }
+        if (isRomExtracted()) { 
+            startNativeEngine(); 
+        }
     }
     @Override public void surfaceChanged(@NonNull SurfaceHolder h, int f, int w, int h1) {}
     @Override public void surfaceDestroyed(@NonNull SurfaceHolder h) { isSurfaceReady = false; }
 
+    // JNI Declarations
     public native String nativeExtractRom(String romPath, String outDir);
     public native void nativeInitEngine(String filesDir);
     public native void nativeUpdateSurface(Bitmap bitmap);
