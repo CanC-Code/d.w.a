@@ -101,8 +101,8 @@ extern "C" uint8_t bus_read(uint16_t addr) {
             return data;
         }
     }
+    if (addr >= 0x6000) return mapper.read_prg(addr); // Handles PRG-RAM and PRG-ROM
     if (addr == 0x4016) { uint8_t ret = (controller_shift & 0x80) >> 7; controller_shift <<= 1; return ret; }
-    if (addr >= 0x8000) return mapper.read_prg(addr);
     return 0;
 }
 
@@ -130,6 +130,7 @@ extern "C" void bus_write(uint16_t addr, uint8_t val) {
         for (int i = 0; i < 256; i++) oam_ram[i] = bus_read(base + i);
     }
     else if (addr == 0x4016) { if ((val & 0x01) == 0) controller_shift = controller_state; }
+    else if (addr >= 0x6000 && addr <= 0x7FFF) mapper.write_prg_ram(addr, val);
     else if (addr >= 0x8000) mapper.write(addr, val);
 }
 
@@ -139,6 +140,7 @@ void draw_frame() {
     uint16_t bg_pat_base = (ppu_ctrl & 0x10) ? 0x1000 : 0x0000;
     uint16_t spr_pat_base = (ppu_ctrl & 0x08) ? 0x1000 : 0x0000;
 
+    // Background Rendering
     for (int ty = 0; ty < 30; ty++) {
         for (int tx = 0; tx < 32; tx++) {
             uint8_t tile = ppu_vram[(nt_base + ty * 32 + tx) % 2048];
@@ -147,20 +149,25 @@ void draw_frame() {
                 uint8_t p2 = mapper.read_chr(bg_pat_base + tile * 16 + y + 8);
                 for (int x = 0; x < 8; x++) {
                     uint8_t pix = ((p1 >> (7 - x)) & 0x01) | (((p2 >> (7 - x)) & 0x01) << 1);
-                    screen_buffer[(ty * 8 + y) * 256 + (tx * 8 + x)] = (pix != 0) ? nes_palette[palette_ram[pix] & 0x3F] : 0xFF000000;
+                    // Use background palette 0 (indices 0-3)
+                    screen_buffer[(ty * 8 + y) * 256 + (tx * 8 + x)] = (pix != 0) ? nes_palette[palette_ram[pix] & 0x3F] : nes_palette[palette_ram[0] & 0x3F];
                 }
             }
         }
     }
+    // Sprite Rendering
     for (int i = 63; i >= 0; i--) {
         uint8_t y = oam_ram[i * 4] + 1; uint8_t tile = oam_ram[i * 4 + 1]; uint8_t x = oam_ram[i * 4 + 3];
-        if (y >= 240) continue;
+        if (y >= 240 || y == 0) continue;
         for (int sy = 0; sy < 8; sy++) {
             uint8_t p1 = mapper.read_chr(spr_pat_base + tile * 16 + sy);
             uint8_t p2 = mapper.read_chr(spr_pat_base + tile * 16 + sy + 8);
             for (int sx = 0; sx < 8; sx++) {
                 uint8_t pix = ((p1 >> (7 - sx)) & 0x01) | (((p2 >> (7 - sx)) & 0x01) << 1);
-                if (pix != 0 && (x + sx) < 256 && (y + sy) < 240) screen_buffer[(y + sy) * 256 + (x + sx)] = nes_palette[palette_ram[0x10 + pix] & 0x3F];
+                if (pix != 0 && (x + sx) < 256 && (y + sy) < 240) {
+                    // Sprite palette starts at index 0x10
+                    screen_buffer[(y + sy) * 256 + (x + sx)] = nes_palette[palette_ram[0x10 + pix] & 0x3F];
+                }
             }
         }
     }
@@ -170,12 +177,21 @@ void engine_loop() {
     power_on_reset();
     while (is_running) {
         auto start = std::chrono::steady_clock::now();
-        ppu_status &= ~0x40; ppu_status &= ~0x80; 
-        std::this_thread::sleep_for(std::chrono::milliseconds(10)); // Frame mid-point
-        ppu_status |= 0x40; // Fake Sprite 0 Hit
-        ppu_status |= 0x80; // VBlank
+        
+        // Reset flags for new frame
+        ppu_status &= ~0x40; // Sprite 0 Hit clear
+        ppu_status &= ~0x80; // VBlank clear
+        
+        // Wait for VBlank (roughly 14ms of a 16.6ms frame)
+        std::this_thread::sleep_for(std::chrono::microseconds(14500));
+        
+        ppu_status |= 0x40; // Simulate Sprite 0 Hit
+        ppu_status |= 0x80; // VBlank Set
+        
         if (ppu_ctrl & 0x80) nmi_handler();
+        
         draw_frame();
+        
         std::this_thread::sleep_until(start + std::chrono::milliseconds(16));
     }
 }
