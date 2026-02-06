@@ -33,6 +33,7 @@ std::mutex buffer_mutex;
 
 bool is_running = false;
 bool is_paused = false;
+bool rom_loaded = false; // NEW: Flag to prevent early boot
 uint8_t controller_state = 0;
 uint8_t controller_shift = 0;
 uint8_t last_strobe = 0;
@@ -48,7 +49,6 @@ uint32_t nes_palette[64] = {
 };
 
 // --- CPU Global State ---
-// All functions called by recompiled banks MUST be in this extern "C" block
 extern "C" {
     uint16_t reg_PC = 0;
     uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
@@ -56,13 +56,13 @@ extern "C" {
     void execute_instruction() { Dispatcher::execute(); }
 
     void update_nz(uint8_t val) {
-        reg_P &= ~(0x82); // Mask for Negative and Zero
+        reg_P &= ~(0x82);
         if (val == 0) reg_P |= 0x02;
         if (val & 0x80) reg_P |= 0x80;
     }
 
     void update_flags_cmp(uint8_t reg, uint8_t val) {
-        reg_P &= ~(0x83); // N, Z, C
+        reg_P &= ~(0x83);
         if (reg >= val) reg_P |= 0x01;
         if (reg == val) reg_P |= 0x02;
         if ((uint8_t)(reg - val) & 0x80) reg_P |= 0x80;
@@ -71,8 +71,8 @@ extern "C" {
     void cpu_adc(uint8_t val) {
         uint16_t carry = (reg_P & 0x01) ? 1 : 0;
         uint16_t sum = reg_A + val + carry;
-        if (~(reg_A ^ val) & (reg_A ^ sum) & 0x80) reg_P |= 0x40; else reg_P &= ~0x40; // V
-        if (sum > 0xFF) reg_P |= 0x01; else reg_P &= ~0x01; // C
+        if (~(reg_A ^ val) & (reg_A ^ sum) & 0x80) reg_P |= 0x40; else reg_P &= ~0x40;
+        if (sum > 0xFF) reg_P |= 0x01; else reg_P &= ~0x01;
         reg_A = (uint8_t)sum;
         update_nz(reg_A);
     }
@@ -80,12 +80,11 @@ extern "C" {
     void cpu_sbc(uint8_t val) { cpu_adc(~val); }
 
     void cpu_bit(uint8_t val) {
-        reg_P &= ~(0xC2); // N, V, Z
+        reg_P &= ~(0xC2);
         if ((val & reg_A) == 0) reg_P |= 0x02;
         reg_P |= (val & 0xC0);
     }
 
-    // Shift Operations - Fixed for Linker Visibility
     uint8_t cpu_asl(uint8_t val) {
         reg_P = (reg_P & ~0x01) | ((val >> 7) & 0x01);
         uint8_t res = val << 1;
@@ -116,7 +115,6 @@ extern "C" {
         return res;
     }
 
-    // Bus Access
     uint8_t bus_read(uint16_t addr) {
         if (addr < 0x0800) return cpu_ram[addr];
         if (addr < 0x2000) return cpu_ram[addr % 0x0800];
@@ -132,7 +130,7 @@ extern "C" {
     void bus_write(uint16_t addr, uint8_t val) {
         if (addr < 0x2000) cpu_ram[addr % 0x0800] = val;
         else if (addr < 0x4000) ppu.cpu_write(addr, val, mapper);
-        else if (addr == 0x4014) { // OAM DMA
+        else if (addr == 0x4014) {
             uint16_t b = val << 8;
             for(int i=0; i<256; i++) ppu.oam_ram[i] = bus_read(b + i);
         }
@@ -143,7 +141,6 @@ extern "C" {
         else if (addr >= 0x6000) mapper.write(addr, val);
     }
 
-    // Recompilation Support Functions
     uint16_t read_pointer(uint16_t addr) { return bus_read(addr) | (bus_read(addr + 1) << 8); }
     uint16_t read_pointer_indexed_x(uint16_t addr) {
         uint8_t zp = (uint8_t)(addr + reg_X);
@@ -158,55 +155,63 @@ extern "C" {
     uint8_t pop_stack() { return cpu_ram[0x0100 | (++reg_S)]; }
 }
 
-// --- Interrupt Logic ---
 void trigger_nmi() {
     push_stack(reg_PC >> 8);
     push_stack(reg_PC & 0xFF);
     push_stack(reg_P);
-    
     cpu_ram[DW_RAM_VBLANK_FLAG] = 1;
     cpu_ram[DW_RAM_FRAME_COUNTER]++;
-    
     Dispatcher::request_nmi(); 
 }
 
 // --- Main Engine Loop ---
 void engine_loop() {
-    LOGI("Engine Thread Started");
+    LOGI("Engine Thread Waiting for ROM...");
+    
+    // Safety Loop: Wait until the ROM is actually loaded via nativeExtractRom
+    while (!rom_loaded && is_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    LOGI("ROM Detected. Initializing Hardware Reset.");
     mapper.reset();
     ppu.reset();
 
     reg_PC = read_pointer(0xFFFC);
+    
+    // If the reset vector is invalid, the engine shouldn't run.
+    if (reg_PC < 0x8000) {
+        LOGE("FATAL: Reset Vector (0x%04X) is outside PRG-ROM range!", reg_PC);
+        is_running = false;
+        return;
+    }
+
     LOGI("CPU Booting at: 0x%04X", reg_PC);
 
-    is_running = true;
     while (is_running) {
-        if (is_paused) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); continue; }
+        if (is_paused) { std::this_thread::sleep_for(std::chrono::milliseconds(16)); continue; }
 
         auto frame_start = std::chrono::steady_clock::now();
 
-        // 1. CPU Execution Slice
+        // 1. CPU Execution Slice (approx 29780 cycles per frame)
         for (int i = 0; i < 29780; i++) {
-            uint16_t last_pc = reg_PC;
             execute_instruction();
-            if (reg_PC == last_pc) reg_PC++; 
         }
 
-        // 2. VBlank Handshake
+        // 2. VBlank Trigger
         ppu.status |= 0x80; 
         if (ppu.ctrl & 0x80) trigger_nmi();
 
-        // 3. Render and Swap
+        // 3. Render
         {
             std::lock_guard<std::mutex> lock(buffer_mutex);
             ppu.render_frame(mapper, nes_palette);
         }
 
-        // 4. End of VBlank
         ppu.status &= ~0x80;
-
         std::this_thread::sleep_until(frame_start + std::chrono::microseconds(16666));
     }
+    LOGI("Engine Thread Terminated.");
 }
 
 // --- JNI Implementation ---
@@ -215,20 +220,27 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstring romPath, jstring outDir) {
     const char *path = env->GetStringUTFChars(romPath, nullptr);
     std::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) return env->NewStringUTF("Error: Could not open ROM");
+    if (!file.is_open()) {
+        env->ReleaseStringUTFChars(romPath, path);
+        return env->NewStringUTF("Error: Could not open ROM");
+    }
 
-    file.seekg(16, std::ios::beg);
+    file.seekg(16, std::ios::beg); // Skip 16-byte iNES header
     for (int i = 0; i < 4; i++) file.read((char*)mapper.prg_rom[i], 16384);
     for (int i = 0; i < 2; i++) file.read((char*)mapper.chr_rom[i], 4096);
     file.close();
 
+    rom_loaded = true; // Signal the engine thread it can now boot
     env->ReleaseStringUTFChars(romPath, path);
     return env->NewStringUTF("Success");
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv *env, jobject thiz, jstring filesDir) {
-    if (!is_running) std::thread(engine_loop).detach();
+    if (!is_running) {
+        is_running = true;
+        std::thread(engine_loop).detach();
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL
