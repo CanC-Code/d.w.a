@@ -30,7 +30,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     private SurfaceView gameSurface;
     private Bitmap screenBitmap;
     private boolean isEngineRunning = false;
-    private boolean isSurfaceReady = false; // Lifecycle guard
+    private boolean isSurfaceReady = false; 
     private final Rect destRect = new Rect();
 
     @Override
@@ -46,10 +46,16 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         gameSurface.getHolder().addCallback(this);
 
         findViewById(R.id.btn_select_rom).setOnClickListener(v -> openFilePicker());
+
+        // Check if we should skip setup immediately
+        if (isRomExtracted()) {
+            showGameLayout();
+        }
     }
 
     @Override
     public void doFrame(long frameTimeNanos) {
+        // Guard against drawing to a destroyed surface
         if (!isEngineRunning || !isSurfaceReady) return;
 
         nativeUpdateSurface(screenBitmap);
@@ -75,19 +81,21 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         Choreographer.getInstance().postFrameCallback(this);
     }
 
+    private void showGameLayout() {
+        if (setupContainer != null) setupContainer.setVisibility(View.GONE);
+        if (gameContainer != null) gameContainer.setVisibility(View.VISIBLE);
+        setupTouchControls();
+    }
+
     private void startNativeEngine() {
         if (isEngineRunning) return; 
 
-        if (setupContainer != null) setupContainer.setVisibility(View.GONE);
-        if (gameContainer != null) gameContainer.setVisibility(View.VISIBLE);
+        showGameLayout();
 
-        setupTouchControls();
-        
         String filesPath = getFilesDir().getAbsolutePath();
         nativeInitEngine(filesPath);
 
         isEngineRunning = true;
-        // Only start the frame callback if the surface is already visible
         if (isSurfaceReady) {
             Choreographer.getInstance().postFrameCallback(this);
         }
@@ -95,7 +103,9 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     private boolean isRomExtracted() {
         File chrFile = new File(getFilesDir(), "chr_rom.bin");
-        return chrFile.exists() && chrFile.length() >= 16384;
+        // Check for at least one PRG bank too to be safe
+        File prgFile = new File(getFilesDir(), "prg_bank_0.bin");
+        return chrFile.exists() && prgFile.exists() && chrFile.length() > 0;
     }
 
     private void openFilePicker() {
@@ -139,7 +149,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
                 startNativeEngine();
             } else {
                 Toast.makeText(this, "Extraction failed: " + result, Toast.LENGTH_LONG).show();
-                new File(getFilesDir(), "chr_rom.bin").delete();
             }
         } catch (Exception e) {
             Log.e("DWA", "File error", e);
@@ -149,6 +158,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     @SuppressLint("ClickableViewAccessibility")
     private void setupTouchControls() {
+        // NES Controller Mapping: A=0x80, B=0x40, Select=0x20, Start=0x10, Up=0x08, Down=0x04, Left=0x02, Right=0x01
         safeBind(R.id.btn_up,    0x08); 
         safeBind(R.id.btn_down,  0x04);
         safeBind(R.id.btn_left,  0x02); 
@@ -179,21 +189,21 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     @Override 
     public void surfaceCreated(@NonNull SurfaceHolder h) {
         isSurfaceReady = true;
-        // If engine was already initialized (e.g., auto-start), start the loop now
-        if (isEngineRunning) {
-            Choreographer.getInstance().postFrameCallback(this);
-        } else if (isRomExtracted()) {
-            // Auto-start only once surface is valid
+        if (isRomExtracted()) {
             startNativeEngine();
+            // Ensure loop starts if engine was already running but surface was recreated
+            Choreographer.getInstance().removeFrameCallback(this);
+            Choreographer.getInstance().postFrameCallback(this);
         }
     }
 
     @Override public void surfaceChanged(@NonNull SurfaceHolder h, int f, int w, int h1) {}
-    
+
     @Override 
     public void surfaceDestroyed(@NonNull SurfaceHolder h) {
         isSurfaceReady = false;
-        isEngineRunning = false; 
+        // Do not set isEngineRunning to false here, or the native thread 
+        // will stop if the user simply rotates the screen.
     }
 
     public native String nativeExtractRom(String romPath, String outDir);
