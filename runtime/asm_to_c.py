@@ -3,133 +3,93 @@ import re
 
 ASM_DIR = "source_files"
 OUT_DIR = "app/src/main/cpp/recompiled"
-exported_globals = {"power_on_reset": False, "nmi_handler": False}
 
-def parse_addr(op):
+# Table to ensure reg_PC increments correctly based on 6502 addressing modes
+# This is a simplified map based on operand patterns
+def get_ins_size(opcode, op):
+    if not op or op.strip() == "": return 1
+    if op.startswith('#'): return 2
+    if '(' in op: return 2 # Indirect is usually ZP in NES
+    if len(op) > 4: return 3 # $1234
+    return 2 # $12
+
+def parse_addr(opcode, op):
     op = op.strip()
     if not op: return "0"
-    # Immediate: #$00
+    is_write = opcode in ['STA', 'STX', 'STY', 'INC', 'DEC', 'ASL', 'LSR', 'ROL', 'ROR']
     if op.startswith('#$'): return f"0x{op[2:]}"
-    # Absolute/ZeroPage Indexed: $1234,X or $12,X
-    if ',X' in op.upper():
-        base = op.split(',')[0].replace('$', '0x')
-        return f"bus_read({base} + reg_X)"
-    # Absolute/ZeroPage Indexed: $1234,Y or $12,Y
-    if ',Y' in op.upper():
-        base = op.split(',')[0].replace('$', '0x')
-        return f"bus_read({base} + reg_Y)"
-    # Indirect Y: ($12),Y
-    if op.startswith('(') and ',Y' in op.upper():
-        ptr = op.strip('()').split(',')[0].replace('$', '0x')
-        return f"bus_read(read_pointer({ptr}) + reg_Y)"
-    # Simple Absolute/ZeroPage: $1234
-    if op.startswith('$'): return f"bus_read(0x{op[1:]})"
-    return "0"
+    hex_addr = op.replace('$', '0x').split(',')[0].strip('()')
+    
+    if ',X' in op.upper(): addr_calc = f"({hex_addr} + reg_X)"
+    elif ',Y' in op.upper(): addr_calc = f"({hex_addr} + reg_Y)"
+    elif op.startswith('(') and ',Y' in op.upper(): addr_calc = f"(read_pointer({hex_addr}) + reg_Y)"
+    else: addr_calc = hex_addr
+
+    return addr_calc if is_write else f"bus_read({addr_calc})"
 
 def translate_line(line):
     clean = line.split(';')[0].strip()
-    if not clean or clean.startswith('.'): return None
-    match = re.match(r'^(\w{3})\s*(.*)$', clean)
-    if not match: return None
+    match = re.match(r'^(?:\w+:)?\s*(\w{3})\s*(.*)$', clean)
+    if not match: return None, 0
     opcode, op = match.groups()
     opcode = opcode.upper()
-
-    # Enhanced logic mapping
+    val = parse_addr(opcode, op)
+    size = get_ins_size(opcode, op)
+    
     mapping = {
-        'LDA': f"reg_A = {parse_addr(op)}; update_nz(reg_A);",
-        'LDX': f"reg_X = {parse_addr(op)}; update_nz(reg_X);",
-        'LDY': f"reg_Y = {parse_addr(op)}; update_nz(reg_Y);",
-        'STA': f"bus_write({op.replace('$','0x').split(',')[0].strip('()')}, reg_A);",
-        'STX': f"bus_write({op.replace('$','0x').split(',')[0].strip('()')}, reg_X);",
-        'STY': f"bus_write({op.replace('$','0x').split(',')[0].strip('()')}, reg_Y);",
-        'ADC': f"cpu_adc({parse_addr(op)});",
-        'SBC': f"cpu_sbc({parse_addr(op)});",
+        'LDA': f"reg_A = {val}; update_nz(reg_A);",
+        'LDX': f"reg_X = {val}; update_nz(reg_X);",
+        'LDY': f"reg_Y = {val}; update_nz(reg_Y);",
+        'STA': f"bus_write({val}, reg_A);",
+        'STX': f"bus_write({val}, reg_X);",
+        'STY': f"bus_write({val}, reg_Y);",
+        'ADC': f"cpu_adc({val});",
+        'SBC': f"cpu_sbc({val});",
+        'AND': f"reg_A &= {val}; update_nz(reg_A);",
+        'ORA': f"reg_A |= {val}; update_nz(reg_A);",
+        'EOR': f"reg_A ^= {val}; update_nz(reg_A);",
         'TAX': "reg_X = reg_A; update_nz(reg_X);",
         'TAY': "reg_Y = reg_A; update_nz(reg_Y);",
         'TXA': "reg_A = reg_X; update_nz(reg_A);",
         'TYA': "reg_A = reg_Y; update_nz(reg_A);",
-        'INX': "reg_X++; update_nz(reg_X);",
-        'INY': "reg_Y++; update_nz(reg_Y);",
-        'DEX': "reg_X--; update_nz(reg_X);",
-        'DEY': "reg_Y--; update_nz(reg_Y);",
-        'INC': f"{{ uint16_t a = {op.replace('$','0x')}; uint8_t v = bus_read(a)+1; bus_write(a,v); update_nz(v); }}",
-        'DEC': f"{{ uint16_t a = {op.replace('$','0x')}; uint8_t v = bus_read(a)-1; bus_write(a,v); update_nz(v); }}",
         'PHA': "push_stack(reg_A);",
         'PLA': "reg_A = pop_stack(); update_nz(reg_A);",
-        'JSR': f"{op}();",
-        'RTS': "return;",
-        'BNE': f"if (!(reg_P & 0x02)) {{ {op}(); return; }}",
-        'BEQ': f"if (reg_P & 0x02) {{ {op}(); return; }}",
-        'BCS': f"if (reg_P & 0x01) {{ {op}(); return; }}",
-        'BCC': f"if (!(reg_P & 0x01)) {{ {op}(); return; }}",
-        'BMI': f"if (reg_P & 0x80) {{ {op}(); return; }}",
-        'BPL': f"if (!(reg_P & 0x80)) {{ {op}(); return; }}",
-        'CMP': f"update_flags_cmp(reg_A, {parse_addr(op)});",
-        'CPX': f"update_flags_cmp(reg_X, {parse_addr(op)});",
-        'CPY': f"update_flags_cmp(reg_Y, {parse_addr(op)});",
+        'RTS': "reg_PC = (pop_stack() | (pop_stack() << 8)) + 1; return;",
+        'JSR': f"{{ uint16_t ret = reg_PC + 2; push_stack(ret >> 8); push_stack(ret & 0xFF); reg_PC = {op.replace('$','0x')}; return; }}",
+        'JMP': f"reg_PC = {op.replace('$','0x')}; return;",
+        'BNE': f"if (!(reg_P & 0x02)) {{ reg_PC = {op.replace('$','0x')}; return; }}",
+        'BEQ': f"if (reg_P & 0x02) {{ reg_PC = {op.replace('$','0x')}; return; }}",
         'SEC': "reg_P |= 0x01;",
         'CLC': "reg_P &= ~0x01;",
-        'SEI': "reg_P |= 0x04;",
-        'CLI': "reg_P &= ~0x04;"
+        'CMP': f"update_flags_cmp(reg_A, {val});",
     }
-    
-    if opcode in mapping:
-        return mapping[opcode]
-    return f"// Unsupported: {opcode} {op}"
+
+    code = mapping.get(opcode, f"// TODO: {opcode} {op}")
+    return code, size
 
 def convert_file(filename):
-    global exported_globals
     bank_name = os.path.splitext(filename)[0].replace("-", "_")
-    with open(os.path.join(ASM_DIR, filename), 'r', encoding='utf-8', errors='ignore') as f:
+    with open(os.path.join(ASM_DIR, filename), 'r') as f:
         lines = f.readlines()
 
-    # Map labels to their banks for cross-bank calling
-    found_labels = [m.group(1) for l in lines if (m := re.search(r'^\s*(\w+):', l))]
-
     with open(os.path.join(OUT_DIR, f"{bank_name}.cpp"), 'w') as out:
-        out.write('#include "cpu_shared.h"\n')
-        # Include other banks so JSR/JMP works
-        for i in range(4):
-            out.write(f'namespace Bank{i:02d} {{ void RESET(); void VBlank(); }}\n')
-        
-        out.write(f'\nnamespace {bank_name} {{\n')
+        out.write('#include "cpu_shared.h"\n\nnamespace ' + bank_name + ' {\n')
+        out.write('    void execute() {\n        switch(reg_PC) {\n')
 
-        # Forward declarations for local labels
-        for label in found_labels:
-            out.write(f'    void {label}();\n')
-
-        in_func = False
         for line in lines:
-            label_match = re.search(r'^\s*(\w+):', line)
+            label_match = re.search(r'^\s*L([0-9A-F]{4}):', line)
             if label_match:
-                if in_func: out.write("    }\n\n")
-                out.write(f"    void {label_match.group(1)}() {{\n")
-                in_func = True
-            elif in_func and line.strip():
-                code = translate_line(line)
-                if code: out.write(f"        {code}\n")
+                addr = label_match.group(1)
+                out.write(f'            case 0x{addr}:\n')
+                code, size = translate_line(line)
+                if code:
+                    # RTS, JMP, and Branches have 'return' inside them, others need to break
+                    suffix = "" if ("return" in code) else f" reg_PC += {size}; return;"
+                    out.write(f'                {code}{suffix}\n')
 
-        if in_func: out.write("    }\n")
-        out.write('}\n\nextern "C" {\n')
+        out.write('            default: reg_PC++; return;\n        }\n    }\n}\n')
 
-        # Critical: Bridge the hardware vectors correctly
-        # Based on Dragon Warrior ASM, Bank03 usually holds the fixed vectors
-        resets = ['RESET', 'START', 'Reset']
-        nmis = ['VBlank', 'NMI', 'nmi_handler']
-
-        if not exported_globals["power_on_reset"]:
-            for r in resets:
-                if r in found_labels:
-                    out.write(f'    void power_on_reset() {{ {bank_name}::{r}(); }}\n')
-                    exported_globals["power_on_reset"] = True; break
-
-        if not exported_globals["nmi_handler"]:
-            for n in nmis:
-                if n in found_labels:
-                    out.write(f'    void nmi_handler() {{ {bank_name}::{n}(); }}\n')
-                    exported_globals["nmi_handler"] = True; break
-        out.write('}\n')
-
+# Process
 os.makedirs(OUT_DIR, exist_ok=True)
-for f in sorted(os.listdir(ASM_DIR), reverse=True):
+for f in os.listdir(ASM_DIR):
     if f.endswith('.asm'): convert_file(f)
