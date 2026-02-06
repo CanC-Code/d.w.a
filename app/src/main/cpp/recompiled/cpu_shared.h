@@ -8,33 +8,44 @@
 #define LOG_CPU(...) __android_log_print(ANDROID_LOG_DEBUG, "DWA_RECOMPILED", __VA_ARGS__)
 
 // --- NES Hardware Constants & Memory Map ---
-// These resolve the "invalid suffix" errors for labels used as addresses
 #define SpriteRAM          0x0200
 #define PPU_CTRL           0x2000
 #define PPU_MASK           0x2001
 #define PPU_STATUS         0x2002
+#define OAM_ADDR           0x2003
+#define OAM_DATA           0x2004
 #define PPU_SCROLL         0x2005
 #define PPU_ADDR           0x2006
 #define PPU_DATA           0x2007
 #define SND_CHN            0x4015
 #define JOYPAD1            0x4016
+#define JOYPAD2            0x4017
 
-// --- Dragon Warrior Specific Aliases ---
-// Add these based on your Dragon_Warrior_Defines.asm
-#define IntroPalPtr1       0x83D6 
-#define IntroPalPtr2       0x83E1
-#define StarburstPtrTbl    0x8420
-#define MusicalNotesTbl    0x9600
-#define RegSPPalPtr        0xBC00
-#define OverworldPalPtr    0xBC10
+// --- Dragon Warrior Specific Aliases & Tables ---
+[span_5](start_span)[span_6](start_span)// Memory Aliases from Dragon_Warrior_Defines.asm[span_5](end_span)[span_6](end_span)
+#define MapWidth           0x0013 
+#define MapHeight          0x0014
+#define CoverDatPtr        0x0017
+[span_7](start_span)#define PlayerFlags        0x00CF //[span_7](end_span)
 
-// --- Function Entry Points (Targets for JSR/JMP) ---
-#define SetBlackBackDrop   0x8353
-#define ShowIntroText      0x8313
-#define GetNextNote        0x9100
-#define ProcessAudioByte   0x9150
-#define CalcAttribAddr     0xC000
-#define ClrWindowBlock     0xB869
+[span_8](start_span)// Pointers from BankPointers Table[span_8](end_span)
+#define LoadStartPals      0xAA7E 
+#define LoadEndBossGFX     0xBABD
+#define DoSprites          0xB6DA
+#define RemoveWindow       0xA7A2
+#define DoPalFadeIn        0xAA3D
+#define DoPalFadeOut       0xAA43
+
+// --- Function Entry Points (JSR/JMP Targets) ---
+[span_9](start_span)[span_10](start_span)[span_11](start_span)// Addresses verified from assembly labels[span_9](end_span)[span_10](end_span)[span_11](end_span)
+#define ModAttribBits      0xC006
+#define GetNPCSpriteIndex  0xC0F4
+#define UpdateRandNum      0xC55B
+#define CalcPPUBufAddr     0xC596
+#define ClearSpriteRAM     0xC6BB
+#define DoWindow           0xC6F0
+[span_12](start_span)#define GoldToBCD          0xA8BA //[span_12](end_span)
+[span_13](start_span)#define GetJoypadStatus    0xC608 //[span_13](end_span)
 
 extern "C" {
     // --- CPU Registers ---
