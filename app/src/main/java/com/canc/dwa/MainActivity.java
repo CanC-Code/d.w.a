@@ -42,7 +42,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     private boolean isEditMode = false;
     private final Rect destRect = new Rect();
 
-    // Layout State
+    // Layout State for Customization
     private float gameScreenYOffset = 0;
     private float gameScaleFactor = 1.0f;
     private ScaleGestureDetector scaleDetector;
@@ -57,10 +57,11 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         gameSurface = findViewById(R.id.game_surface);
         menuOverlay = findViewById(R.id.menu_overlay);
 
-        // Standard NES resolution
+        // Standard NES resolution (256x240)
         screenBitmap = Bitmap.createBitmap(256, 240, Bitmap.Config.ARGB_8888);
         gameSurface.getHolder().addCallback(this);
 
+        // Load saved layout preferences
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         gameScreenYOffset = prefs.getFloat("screen_y_offset", 0);
         gameScaleFactor = prefs.getFloat("screen_scale", 1.0f);
@@ -171,17 +172,24 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         recreate(); 
     }
 
+    /**
+     * The FrameCallback is triggered by the Android System V-Sync.
+     * It fetches the latest rendered buffer from the C++ PPU and draws it to the Surface.
+     */
     @Override
     public void doFrame(long frameTimeNanos) {
         if (!isEngineRunning || !isSurfaceReady) return;
-        
+
+        // Fetch pixels from C++ engine
         nativeUpdateSurface(screenBitmap);
 
         SurfaceHolder holder = gameSurface.getHolder();
         Canvas canvas = holder.lockCanvas();
         if (canvas != null) {
             try {
-                canvas.drawColor(0xFF000000); // Clear screen black
+                canvas.drawColor(0xFF000000); // Clear to black
+                
+                // Aspect ratio correction (256:240)
                 float baseScale = Math.min((float)gameSurface.getWidth() / 256f, (float)gameSurface.getHeight() / 240f);
                 float finalScale = baseScale * gameScaleFactor;
 
@@ -194,12 +202,14 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
                 canvas.drawBitmap(screenBitmap, null, destRect, null);
             } finally { holder.unlockCanvasAndPost(canvas); }
         }
+        
+        // Request the next frame
         Choreographer.getInstance().postFrameCallback(this);
     }
 
     @SuppressLint("ClickableViewAccessibility")
     private void setupTouchControls() {
-        // D-Pad Grouping (masks based on standard NES serial controller order)
+        // NES masks: A=0x80, B=0x40, Select=0x20, Start=0x10, Up=0x08, Down=0x04, Left=0x02, Right=0x01
         View[] dpad = { findViewById(R.id.btn_up), findViewById(R.id.btn_down), 
                         findViewById(R.id.btn_left), findViewById(R.id.btn_right) };
         String[] keys = {"up", "down", "left", "right"};
@@ -284,7 +294,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     }
 
     private boolean isRomExtracted() {
-        // Since we map directly to base.nes, we check for its existence
         return new File(getFilesDir(), "base.nes").exists();
     }
 
@@ -312,8 +321,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             byte[] buf = new byte[16384]; int len;
             while ((len = is.read(buf)) > 0) os.write(buf, 0, len);
             os.close(); is.close();
-            
-            // Extract and map
+
             String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
             if ("Success".equals(result)) {
                 startNativeEngine();
