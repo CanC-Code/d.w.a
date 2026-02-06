@@ -21,31 +21,35 @@
 #define JOYPAD1            0x4016
 #define JOYPAD2            0x4017
 
-// --- Dragon Warrior Specific Aliases & RAM ---
+// --- Dragon Warrior Internal RAM Aliases ---
 #define MapWidth           0x0013 
 #define MapHeight          0x0014
-#define CoverDatPtr        0x0017
 #define PlayerFlags        0x00CF 
 
 // --- Function Entry Points (Targets for JSR/JMP) ---
-[span_2](start_span)// These addresses are verified from the BankPointers table and Forward Declarations[span_2](end_span)
-[span_3](start_span)#define LoadStartPals      0xAA7E //[span_3](end_span)
-[span_4](start_span)#define LoadEndBossGFX     0xBABD //[span_4](end_span)
-[span_5](start_span)#define DoSprites          0xB6DA //[span_5](end_span)
-[span_6](start_span)#define RemoveWindow       0xA7A2 //[span_6](end_span)
-[span_7](start_span)#define DoPalFadeIn        0xAA3D //[span_7](end_span)
-[span_8](start_span)#define DoPalFadeOut       0xAA43 //[span_8](end_span)
-
-[span_9](start_span)// Verified Aliases[span_9](end_span)
+// These aliases are mapped directly from all_asm_contents.txt
 #define ModAttribBits      0xC006
 #define GetNPCSpriteIndex  0xC0F4
+#define WordMultiply       0xC1C9
+#define ByteDivide         0xC1F0
+#define PalFadeOut         0xC212
+#define PalFadeIn          0xC529
+#define ClearAttribByte    0xC244
 #define UpdateRandNum      0xC55B
 #define CalcPPUBufAddr     0xC596
+#define PrepSPPalLoad      0xC632
+#define PrepBGPalLoad      0xC63D
+#define AddPPUBufEntry     0xC690
 #define ClearSpriteRAM     0xC6BB
+#define IdleUpdate         0xCB30
+#define CheckForTriggers   0xCBF7
+#define ChangeMaps         0xD9E2
+#define WaitForNMI         0xFF74
 
-// Additional Common Routines
-#define GoldToBCD          0xA8BA 
-#define GetJoypadStatus    0xC608 
+// Bank Pointer Logic Targets
+#define LoadStartPals      0xAA7E 
+#define RemoveWindow       0xA7A2
+#define DoPalFadeIn        0xAA3D
 
 extern "C" {
     // --- CPU Registers ---
