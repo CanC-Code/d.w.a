@@ -1,5 +1,5 @@
 #include "cpu_shared.h"
-#include "../MapperMMC1.h" // Go up one level to find the header
+#include "../MapperMMC1.h"
 
 // Access the global mapper defined in native-lib.cpp
 extern MapperMMC1 mapper;
@@ -10,32 +10,37 @@ namespace Bank01 { void execute(); }
 namespace Bank02 { void execute(); }
 namespace Bank03 { void execute(); }
 
-extern "C" void execute_instruction() {
-    // 1. $C000-$FFFF is ALWAYS Fixed to the last bank (Bank 03) in Dragon Warrior
-    if (reg_PC >= 0xC000) {
-        Bank03::execute();
-    } 
-    // 2. $8000-$BFFF is switchable based on the Mapper state
-    else if (reg_PC >= 0x8000) {
-        // We use the mapper's prg_bank register to route the execution
-        // Note: We use % 4 to ensure we don't go out of bounds
-        uint8_t current_bank = mapper.prg_bank % 4;
+namespace Dispatcher {
+    void execute() {
+        // --- NES Memory Map Dispatching ---
 
-        switch (current_bank) {
-            case 0: Bank00::execute(); break;
-            case 1: Bank01::execute(); break;
-            case 2: Bank02::execute(); break;
-            case 3: Bank03::execute(); break; // Some modes allow Bank 3 here too
-            default:
-                Bank00::execute(); // Fallback safety
-                break;
+        // 1. $C000-$FFFF: Fixed PRG Bank (Always Bank 03 in Dragon Warrior)
+        if (reg_PC >= 0xC000) {
+            Bank03::execute();
+        } 
+        
+        // 2. $8000-$BFFF: Swappable PRG Bank Slot
+        else if (reg_PC >= 0x8000) {
+            // Get the current bank index from the mapper.
+            // MMC1 has different modes, but Dragon Warrior typically switches 16KB slots.
+            uint8_t current_bank = mapper.prg_bank % 4;
+
+            switch (current_bank) {
+                case 0: Bank00::execute(); break;
+                case 1: Bank01::execute(); break;
+                case 2: Bank02::execute(); break;
+                case 3: Bank03::execute(); break; 
+                default: Bank00::execute(); break;
+            }
+        } 
+        
+        // 3. $0000-$7FFF: RAM, Registers, and Save RAM
+        else {
+            // Recompiled code only exists for ROM. If the game jumps to RAM ($0000-$07FF)
+            // or Save RAM ($6000-$7FFF) to execute code, we must increment PC 
+            // manually or implement an interpreter fallback to avoid infinite loops.
+            LOG_CPU("Attempted execution at RAM address: 0x%04X", reg_PC);
+            reg_PC++; 
         }
-    } 
-    // 3. Handle RAM ($0000-$1FFF) or Save RAM ($6000-$7FFF)
-    else {
-        // If the CPU tries to execute code from RAM, we don't have recompiled
-        // functions for it. We log it and skip to prevent a crash.
-        // (Dragon Warrior rarely executes from RAM)
-        reg_PC++; 
     }
 }
