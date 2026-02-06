@@ -9,12 +9,14 @@
 #include <mutex>
 #include <cstring>
 #include "MapperMMC1.h"
+#include "recompiled/cpu_shared.h" // Ensure this includes your updated header
 
 #define LOG_TAG "DWA_NATIVE"
 
-// --- Forward Declarations ---
-// This prevents the "undeclared identifier" error in engine_loop
-void draw_frame(); 
+// --- Recompiled Bank Dispatcher ---
+namespace Dispatcher {
+    void execute(); // Defined in Dispatcher.cpp
+}
 
 // --- Global Hardware State ---
 uint8_t cpu_ram[0x0800] = {0};
@@ -28,7 +30,6 @@ uint8_t ppu_data_buffer = 0;
 std::mutex buffer_mutex;
 MapperMMC1 mapper;
 
-// Basic NES Palette (standard colors)
 uint32_t nes_palette[64] = {
     0xFF666666, 0xFF002A88, 0xFF1412A7, 0xFF3B00A4, 0xFF5C007E, 0xFF6E0040, 0xFF6C0600, 0xFF561D00,
     0xFF333500, 0xFF0B4800, 0xFF005200, 0xFF004F08, 0xFF00404D, 0xFF000000, 0xFF000000, 0xFF000000,
@@ -38,48 +39,89 @@ uint32_t nes_palette[64] = {
     0xFFBCBE00, 0xFF88D100, 0xFF5CE430, 0xFF45E082, 0xFF48CDDE, 0xFF4F4F4F, 0xFF000000, 0xFF000000
 };
 
-// --- Shared 6502 CPU State ---
+// --- Shared 6502 CPU Implementation ---
 extern "C" {
     uint16_t reg_PC = 0;
     uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
-    void execute_instruction(); 
-    uint8_t bus_read(uint16_t addr);
-    void bus_write(uint16_t addr, uint8_t val);
-    void push_stack(uint8_t val) { cpu_ram[0x0100 | reg_S] = val; reg_S--; }
-    uint8_t pop_stack() { reg_S++; return cpu_ram[0x0100 | reg_S]; }
+
+    void execute_instruction() {
+        Dispatcher::execute(); 
+    }
+
     void update_nz(uint8_t val) { 
-        reg_P &= ~0x82; 
-        if (val == 0) reg_P |= 0x02;
-        if (val & 0x80) reg_P |= 0x80;
+        reg_P &= ~(FLAG_N | FLAG_Z); 
+        if (val == 0) reg_P |= FLAG_Z;
+        if (val & 0x80) reg_P |= FLAG_N;
     }
+
     void update_flags_cmp(uint8_t reg, uint8_t val) {
-        reg_P &= ~0x83; 
-        if (reg >= val) reg_P |= 0x01; 
-        if (reg == val) reg_P |= 0x02; 
-        if ((uint8_t)(reg - val) & 0x80) reg_P |= 0x80; 
+        reg_P &= ~(FLAG_N | FLAG_Z | FLAG_C); 
+        if (reg >= val) reg_P |= FLAG_C; 
+        if (reg == val) reg_P |= FLAG_Z; 
+        if ((uint8_t)(reg - val) & 0x80) reg_P |= FLAG_N; 
     }
+
+    // --- Math/Bit Helpers ---
     void cpu_adc(uint8_t val) {
-        uint16_t carry = (reg_P & 0x01);
+        uint16_t carry = (reg_P & FLAG_C);
         uint16_t sum = reg_A + val + carry;
-        if (~(reg_A ^ val) & (reg_A ^ sum) & 0x80) reg_P |= 0x40; else reg_P &= ~0x40;
-        if (sum > 0xFF) reg_P |= 0x01; else reg_P &= ~0x01;
+        if (~(reg_A ^ val) & (reg_A ^ sum) & 0x80) reg_P |= FLAG_V; else reg_P &= ~FLAG_V;
+        if (sum > 0xFF) reg_P |= FLAG_C; else reg_P &= ~FLAG_C;
         reg_A = (uint8_t)sum;
         update_nz(reg_A);
     }
+
     void cpu_sbc(uint8_t val) { cpu_adc(~val); }
+
     void cpu_bit(uint8_t val) {
-        reg_P &= ~0xC2; 
-        if ((val & reg_A) == 0) reg_P |= 0x02;
-        reg_P |= (val & 0xC0); 
+        reg_P &= ~(FLAG_Z | FLAG_V | FLAG_N);
+        if ((val & reg_A) == 0) reg_P |= FLAG_Z;
+        reg_P |= (val & 0xC0); // Copy bits 7 and 6 to N and V
     }
-    uint16_t read_pointer(uint16_t addr) {
-        uint8_t lo = bus_read(addr);
-        uint8_t hi = bus_read((addr & 0xFF00) | ((addr + 1) & 0x00FF));
-        return (hi << 8) | lo;
+
+    // --- Shift/Rotate Helpers (Resolves Linker Errors) ---
+    uint8_t cpu_asl(uint8_t val) {
+        reg_P = (reg_P & ~FLAG_C) | ((val >> 7) & FLAG_C);
+        uint8_t res = val << 1;
+        update_nz(res);
+        return res;
     }
+
+    uint8_t cpu_lsr(uint8_t val) {
+        reg_P = (reg_P & ~FLAG_C) | (val & FLAG_C);
+        uint8_t res = val >> 1;
+        update_nz(res);
+        return res;
+    }
+
+    uint8_t cpu_rol(uint8_t val) {
+        uint8_t old_c = (reg_P & FLAG_C);
+        reg_P = (reg_P & ~FLAG_C) | ((val >> 7) & FLAG_C);
+        uint8_t res = (val << 1) | old_c;
+        update_nz(res);
+        return res;
+    }
+
+    uint8_t cpu_ror(uint8_t val) {
+        uint8_t old_c = (reg_P & FLAG_C);
+        reg_P = (reg_P & ~FLAG_C) | (val & FLAG_C);
+        uint8_t res = (val >> 1) | (old_c << 7);
+        update_nz(res);
+        return res;
+    }
+
+    // --- Addressing Helpers ---
+    uint16_t read_pointer_indexed_y(uint16_t zp_addr) {
+        uint16_t lo = bus_read(zp_addr);
+        uint16_t hi = bus_read((zp_addr + 1) & 0xFF);
+        return (lo | (hi << 8)) + reg_Y;
+    }
+
+    void push_stack(uint8_t val) { cpu_ram[0x0100 | reg_S] = val; reg_S--; }
+    uint8_t pop_stack() { reg_S++; return cpu_ram[0x0100 | reg_S]; }
 }
 
-// --- PPU & Mirroring ---
+// --- PPU & Bus Logic ---
 uint8_t ppu_status = 0, ppu_ctrl = 0, ppu_mask = 0, ppu_addr_latch = 0, oam_addr = 0;
 uint16_t ppu_addr_reg = 0;
 bool is_running = false;
@@ -156,7 +198,7 @@ extern "C" void bus_write(uint16_t addr, uint8_t val) {
     else if (addr >= 0x6000) mapper.write(addr, val);
 }
 
-// --- Implementation of Rendering ---
+// --- Frame Rendering ---
 void draw_frame() {
     std::lock_guard<std::mutex> lock(buffer_mutex);
     uint16_t nt_base = (ppu_ctrl & 0x03) * 1024;
@@ -170,40 +212,46 @@ void draw_frame() {
                 uint8_t p2 = mapper.read_chr(bg_pat_base + tile * 16 + y + 8);
                 for (int x = 0; x < 8; x++) {
                     uint8_t pix = ((p1 >> (7 - x)) & 0x01) | (((p2 >> (7 - x)) & 0x01) << 1);
-                    uint8_t pal_entry = read_palette(pix);
-                    screen_buffer[(ty * 8 + y) * 256 + (tx * 8 + x)] = nes_palette[pal_entry & 0x3F];
+                    uint8_t palette_val = read_palette(0x3F00 + pix);
+                    screen_buffer[(ty * 8 + y) * 256 + (tx * 8 + x)] = nes_palette[palette_val & 0x3F];
                 }
             }
         }
     }
 }
 
-void power_on_reset() {
+// --- Entry Points ---
+extern "C" void power_on_reset() {
     reg_PC = (bus_read(0xFFFD) << 8) | bus_read(0xFFFC);
-    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Reset! PC set to: %04X", reg_PC);
+    LOG_CPU("Reset! PC set to: %04X", reg_PC);
 }
 
-void nmi_handler() {
+extern "C" void nmi_handler() {
     push_stack(reg_PC >> 8);
     push_stack(reg_PC & 0xFF);
     push_stack(reg_P);
     reg_PC = (bus_read(0xFFFB) << 8) | bus_read(0xFFFA);
+    ppu_status |= 0x80;
 }
 
 void engine_loop() {
     power_on_reset();
+    is_running = true;
     while (is_running) {
         if (is_paused) {
             std::this_thread::sleep_for(std::chrono::milliseconds(16));
             continue;
         }
-        auto start_time = std::chrono::steady_clock::now();
-        for (int i = 0; i < 15000; i++) { execute_instruction(); }
-        ppu_status |= 0x80; 
-        if (ppu_ctrl & 0x80) nmi_handler();
+        auto start = std::chrono::steady_clock::now();
+        
+        // Execute approx. cycles for 1 frame
+        for (int i = 0; i < 29780; i += 3) { 
+            execute_instruction(); 
+        }
+
+        nmi_handler();
         draw_frame();
-        std::this_thread::sleep_until(start_time + std::chrono::microseconds(16666));
+        
+        std::this_thread::sleep_until(start + std::chrono::microseconds(16666));
     }
 }
-
-// ... Rest of your JNI methods (nativeInitEngine, nativeUpdateSurface, etc.)
