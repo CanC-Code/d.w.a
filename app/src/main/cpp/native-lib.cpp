@@ -16,15 +16,15 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// Dragon Warrior specific RAM addresses
+// Dragon Warrior specific RAM addresses for synchronization
 #define DW_RAM_VBLANK_FLAG   0x002D
 #define DW_RAM_FRAME_COUNTER 0x003C
 
 // --- Dispatcher Declaration ---
-// We only declare these here. They are defined in Dispatcher.cpp.
+// These symbols are defined in your recompiled Dispatcher.cpp
 namespace Dispatcher { 
     void execute(); 
-    void request_interrupt_nmi(); 
+    void request_nmi(); // Corrected name to match recompiled symbol
 }
 
 // --- Hardware State ---
@@ -161,6 +161,8 @@ extern "C" {
     uint8_t pop_stack() { return cpu_ram[0x0100 | (++reg_S)]; }
 }
 
+
+
 void trigger_nmi() {
     push_stack(reg_PC >> 8);
     push_stack(reg_PC & 0xFF);
@@ -171,7 +173,7 @@ void trigger_nmi() {
     cpu_ram[DW_RAM_FRAME_COUNTER]++;
 
     // Call the NMI request in the recompiled Dispatcher
-    Dispatcher::request_interrupt_nmi(); 
+    Dispatcher::request_nmi(); 
 }
 
 // --- Main Engine Loop ---
