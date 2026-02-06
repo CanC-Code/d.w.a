@@ -4,6 +4,9 @@ import re
 ASM_DIR = "source_files"
 OUT_DIR = "app/src/main/cpp/recompiled"
 
+# Track if we have already exported the global symbols to avoid duplicates
+exported_globals = {"power_on_reset": False, "nmi_handler": False}
+
 def parse_address(operand):
     operand = operand.strip()
     if not operand: return "0"
@@ -47,6 +50,7 @@ def translate_line(line):
     return f"// {opcode} {operand}"
 
 def convert_file(filename):
+    global exported_globals
     bank_name = os.path.splitext(filename)[0].replace("-", "_")
     os.makedirs(OUT_DIR, exist_ok=True)
     with open(os.path.join(ASM_DIR, filename), 'r', encoding='utf-8', errors='ignore') as f:
@@ -90,21 +94,29 @@ def convert_file(filename):
         if in_func: out.write("    }\n")
         out.write('}\n\n')
 
-        # GLOBAL BRIDGES with inline to prevent duplicate symbol errors
+        # GLOBAL BRIDGES - Only one bank gets to define the global C symbol
         out.write('extern "C" {\n')
-        reset_labels = ['power_on_reset', 'RESET', 'START', 'Reset']
-        nmi_labels = ['nmi_handler', 'NMI', 'VBlank', 'VBLANK']
+        reset_labels = ['RESET', 'START', 'Reset', 'power_on_reset']
+        nmi_labels = ['VBlank', 'VBLANK', 'NMI', 'nmi_handler']
         
-        for r in reset_labels:
-            if r in found_labels:
-                out.write(f'    inline void power_on_reset() {{ {bank_name}::{r}(); }}\n')
-                break
+        # We prioritize the "Fixed Bank" (usually Bank03 or higher)
+        # by processing files in order, but checking if we already exported.
+        if not exported_globals["power_on_reset"]:
+            for r in reset_labels:
+                if r in found_labels:
+                    out.write(f'    void power_on_reset() {{ {bank_name}::{r}(); }}\n')
+                    exported_globals["power_on_reset"] = True
+                    break
         
-        for n in nmi_labels:
-            if n in found_labels:
-                out.write(f'    inline void nmi_handler() {{ {bank_name}::{n}(); }}\n')
-                break
+        if not exported_globals["nmi_handler"]:
+            for n in nmi_labels:
+                if n in found_labels:
+                    out.write(f'    void nmi_handler() {{ {bank_name}::{n}(); }}\n')
+                    exported_globals["nmi_handler"] = True
+                    break
         out.write('}\n')
 
-for f in os.listdir(ASM_DIR):
+# Sort files so Bank03 (usually fixed bank) is checked early or Bank00
+files = sorted(os.listdir(ASM_DIR), reverse=True)
+for f in files:
     if f.endswith('.asm'): convert_file(f)
