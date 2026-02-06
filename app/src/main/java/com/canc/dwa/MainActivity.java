@@ -18,7 +18,6 @@ import android.view.MotionEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
-import android.widget.FrameLayout;
 import android.widget.Toast;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AlertDialog;
@@ -33,7 +32,8 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     private static final int PICK_ROM_REQUEST = 1;
     private static final String PREFS_NAME = "ControllerPrefs";
-    
+    private static final float SNAP_GRID_SIZE = 20f; // Pixels for alignment snapping
+
     private View gameContainer, setupContainer, menuOverlay;
     private SurfaceView gameSurface;
     private Bitmap screenBitmap;
@@ -50,9 +50,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         setupContainer = findViewById(R.id.setup_layout);
         gameContainer = findViewById(R.id.game_layout);
         gameSurface = findViewById(R.id.game_surface);
-        
-        // New UI Elements for the Menu
-        menuOverlay = findViewById(R.id.menu_overlay); // Ensure this exists in your XML
+        menuOverlay = findViewById(R.id.menu_overlay);
 
         screenBitmap = Bitmap.createBitmap(256, 240, Bitmap.Config.ARGB_8888);
         gameSurface.getHolder().addCallback(this);
@@ -70,7 +68,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     public void onBackPressed() {
         if (isEditMode) {
             exitEditMode();
-        } else if (gameContainer.getVisibility() == View.VISIBLE) {
+        } else if (gameContainer != null && gameContainer.getVisibility() == View.VISIBLE) {
             showSettingsMenu();
         } else {
             super.onBackPressed();
@@ -79,10 +77,11 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     private void showSettingsMenu() {
         nativePauseEngine();
-        
-        String[] options = {"Toggle Orientation", "Move Buttons", "Reset Layout", "Resume"};
+        if (menuOverlay != null) menuOverlay.setVisibility(View.VISIBLE);
+
+        String[] options = {"Toggle Orientation", "Move & Align Buttons", "Reset Layout", "Resume"};
         new AlertDialog.Builder(this)
-                .setTitle("Game Menu")
+                .setTitle("Emulator Settings")
                 .setItems(options, (dialog, which) -> {
                     switch (which) {
                         case 0: toggleOrientation(); break;
@@ -106,6 +105,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     }
 
     private void resumeGame() {
+        if (menuOverlay != null) menuOverlay.setVisibility(View.GONE);
         nativeResumeEngine();
     }
 
@@ -113,14 +113,15 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     private void enterEditMode() {
         isEditMode = true;
-        Toast.makeText(this, "Drag buttons to move. Press BACK to save.", Toast.LENGTH_LONG).show();
-        setupTouchControls(); // Re-bind with Edit Mode logic
+        if (menuOverlay != null) menuOverlay.setVisibility(View.GONE);
+        Toast.makeText(this, "Drag buttons to move. Back to save.", Toast.LENGTH_LONG).show();
+        setupTouchControls(); 
     }
 
     private void exitEditMode() {
         isEditMode = false;
         Toast.makeText(this, "Layout Saved", Toast.LENGTH_SHORT).show();
-        setupTouchControls(); // Re-bind with Input Mode logic
+        setupTouchControls(); 
         resumeGame();
     }
 
@@ -143,7 +144,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     private void resetPositions() {
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().clear().apply();
-        recreate(); // Simple way to snap back to XML defaults
+        recreate(); 
     }
 
     // --- Engine & Surface Core ---
@@ -158,12 +159,12 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         Canvas canvas = holder.lockCanvas();
         if (canvas != null) {
             try {
-                // Rendering code remains the same...
                 float scale = Math.min((float)gameSurface.getWidth() / 256, (float)gameSurface.getHeight() / 240);
                 int w = (int)(256 * scale);
                 int h = (int)(240 * scale);
                 int left = (gameSurface.getWidth() - w) / 2;
                 int top = (gameSurface.getHeight() - h) / 2;
+
                 destRect.set(left, top, left + w, top + h);
                 canvas.drawColor(0xFF000000); 
                 canvas.drawBitmap(screenBitmap, null, destRect, null);
@@ -195,15 +196,19 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
         v.setOnTouchListener((v1, event) -> {
             if (isEditMode) {
-                // DRAG LOGIC
                 if (event.getAction() == MotionEvent.ACTION_MOVE) {
-                    v1.setX(event.getRawX() - (v1.getWidth() / 2f));
-                    v1.setY(event.getRawY() - (v1.getHeight() / 2f));
+                    // Raw movement
+                    float newX = event.getRawX() - (v1.getWidth() / 2f);
+                    float newY = event.getRawY() - (v1.getHeight() / 2f);
+                    
+                    // Snap to grid for alignment
+                    v1.setX(Math.round(newX / SNAP_GRID_SIZE) * SNAP_GRID_SIZE);
+                    v1.setY(Math.round(newY / SNAP_GRID_SIZE) * SNAP_GRID_SIZE);
+                    
                     savePosition(prefKey, v1.getX(), v1.getY());
                 }
                 return true;
             } else {
-                // INPUT LOGIC
                 int action = event.getAction();
                 if (action == MotionEvent.ACTION_DOWN) {
                     injectInput(bitmask, true);
@@ -216,8 +221,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             }
         });
     }
-
-    // --- Lifecycle and ROM extraction helpers ---
 
     private void showGameLayout() {
         if (setupContainer != null) setupContainer.setVisibility(View.GONE);
