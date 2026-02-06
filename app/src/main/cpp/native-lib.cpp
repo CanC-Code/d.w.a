@@ -77,7 +77,7 @@ extern "C" {
 uint8_t ppu_status = 0, ppu_ctrl = 0, ppu_mask = 0, ppu_addr_latch = 0, oam_addr = 0;
 uint16_t ppu_addr_reg = 0;
 bool is_running = false;
-bool is_paused = false; // PAUSE FLAG
+bool is_paused = false;
 
 uint32_t nes_palette[64] = {
     0xFF666666, 0xFF002A88, 0xFF1412A7, 0xFF3B00A4, 0xFF5C007E, 0xFF6E0040, 0xFF6C0600, 0xFF561D00,
@@ -88,6 +88,12 @@ uint32_t nes_palette[64] = {
     0xFFBCBE00, 0xFF88D100, 0xFF5CE430, 0xFF45E082, 0xFF48CDDE, 0xFF4F4F4F, 0xFF000000, 0xFF000000
 };
 
+// Internal helper for Palette Mirroring
+uint8_t read_palette(uint16_t addr) {
+    if (addr >= 0x10 && (addr % 4 == 0)) addr -= 0x10; // Mirror sprite transparent to BG
+    return palette_ram[addr & 0x1F];
+}
+
 extern "C" uint8_t bus_read(uint16_t addr) {
     if (addr < 0x2000) return cpu_ram[addr % 0x0800];
     if (addr >= 0x2000 && addr <= 0x3FFF) {
@@ -97,9 +103,9 @@ extern "C" uint8_t bus_read(uint16_t addr) {
             uint8_t data = ppu_data_buffer;
             uint16_t p_addr = ppu_addr_reg & 0x3FFF;
             if (p_addr < 0x3F00) ppu_data_buffer = (p_addr >= 0x2000) ? ppu_vram[p_addr % 2048] : mapper.read_chr(p_addr);
-            else { data = palette_ram[p_addr & 0x1F]; ppu_data_buffer = ppu_vram[p_addr % 2048]; }
+            else { data = read_palette(p_addr & 0x1F); ppu_data_buffer = ppu_vram[p_addr % 2048]; }
             ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
-            ppu_addr_reg &= 0x3FFF; // Mask to 14-bit
+            ppu_addr_reg &= 0x3FFF;
             return data;
         }
     }
@@ -117,18 +123,17 @@ extern "C" void bus_write(uint16_t addr, uint8_t val) {
         else if (reg == 3) oam_addr = val;
         else if (reg == 4) oam_ram[oam_addr++] = val;
         else if (reg == 6) {
-            if (ppu_addr_latch == 0) { 
-                ppu_addr_reg = (ppu_addr_reg & 0x00FF) | ((val & 0x3F) << 8); 
-                ppu_addr_latch = 1; 
-            } else { 
-                ppu_addr_reg = (ppu_addr_reg & 0xFF00) | val; 
-                ppu_addr_latch = 0; 
-            }
+            if (ppu_addr_latch == 0) { ppu_addr_reg = (ppu_addr_reg & 0x00FF) | ((val & 0x3F) << 8); ppu_addr_latch = 1; }
+            else { ppu_addr_reg = (ppu_addr_reg & 0xFF00) | val; ppu_addr_latch = 0; }
         }
         else if (reg == 7) {
             uint16_t p_addr = ppu_addr_reg & 0x3FFF;
             if (p_addr >= 0x2000 && p_addr < 0x3F00) ppu_vram[p_addr % 2048] = val;
-            else if (p_addr >= 0x3F00) palette_ram[p_addr & 0x1F] = val;
+            else if (p_addr >= 0x3F00) {
+                uint8_t p_idx = p_addr & 0x1F;
+                if (p_idx >= 0x10 && (p_idx % 4 == 0)) p_idx -= 0x10;
+                palette_ram[p_idx] = val;
+            }
             ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
             ppu_addr_reg &= 0x3FFF;
         }
@@ -156,7 +161,8 @@ void draw_frame() {
                 uint8_t p2 = mapper.read_chr(bg_pat_base + tile * 16 + y + 8);
                 for (int x = 0; x < 8; x++) {
                     uint8_t pix = ((p1 >> (7 - x)) & 0x01) | (((p2 >> (7 - x)) & 0x01) << 1);
-                    screen_buffer[(ty * 8 + y) * 256 + (tx * 8 + x)] = (pix != 0) ? nes_palette[palette_ram[pix] & 0x3F] : nes_palette[palette_ram[0] & 0x3F];
+                    uint32_t color = (pix != 0) ? nes_palette[read_palette(pix) & 0x3F] : nes_palette[read_palette(0) & 0x3F];
+                    screen_buffer[(ty * 8 + y) * 256 + (tx * 8 + x)] = color;
                 }
             }
         }
@@ -170,7 +176,7 @@ void draw_frame() {
             for (int sx = 0; sx < 8; sx++) {
                 uint8_t pix = ((p1 >> (7 - sx)) & 0x01) | (((p2 >> (7 - sx)) & 0x01) << 1);
                 if (pix != 0 && (x + sx) < 256 && (y + sy) < 240) {
-                    screen_buffer[(y + sy) * 256 + (x + sx)] = nes_palette[palette_ram[0x10 + pix] & 0x3F];
+                    screen_buffer[(y + sy) * 256 + (x + sx)] = nes_palette[read_palette(0x10 + pix) & 0x3F];
                 }
             }
         }
@@ -180,34 +186,35 @@ void draw_frame() {
 void engine_loop() {
     power_on_reset();
     while (is_running) {
-        if (is_paused) { // PAUSE LOGIC
+        if (is_paused) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
         }
 
         auto start = std::chrono::steady_clock::now();
-        ppu_status &= ~0xC0; // Clear VBlank and Sprite 0
         
+        // PPU Sync: Frame starts, clear VBlank
+        ppu_status &= ~0x80; 
+
+        // Dragon Warrior expects the VBlank flag to cycle.
+        // We simulate the 'visible' portion of the frame (approx 14ms)
         std::this_thread::sleep_for(std::chrono::microseconds(14500));
-        
-        ppu_status |= 0x40; // Simulate Sprite 0 Hit
-        ppu_status |= 0x80; // VBlank Set
-        
+
+        // Enter VBlank
+        ppu_status |= 0x80; 
         if (ppu_ctrl & 0x80) nmi_handler();
+
         draw_frame();
+
+        // 60FPS Lock
         std::this_thread::sleep_until(start + std::chrono::milliseconds(16));
     }
 }
 
 // --- JNI Bridge ---
 
-extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativePauseEngine(JNIEnv* env, jobject thiz) {
-    is_paused = true;
-}
-
-extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeResumeEngine(JNIEnv* env, jobject thiz) {
-    is_paused = false;
-}
+extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativePauseEngine(JNIEnv* env, jobject thiz) { is_paused = true; }
+extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeResumeEngine(JNIEnv* env, jobject thiz) { is_paused = false; }
 
 extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv* env, jobject thiz, jstring filesDir) {
     if (is_running) return;
@@ -219,15 +226,13 @@ extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeInitEngin
     }
     std::ifstream c_in(pathStr + "/chr_rom.bin", std::ios::binary); 
     if (c_in) c_in.read((char*)mapper.chr_rom, 16384);
-    
-    is_running = true; 
-    is_paused = false;
+    is_running = true; is_paused = false;
     std::thread(engine_loop).detach();
     env->ReleaseStringUTFChars(filesDir, cPath);
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv* env, jobject thiz, jobject bitmap) {
-    if (is_paused) return; // Don't update surface if paused
+    if (is_paused) return;
     void* pixels; if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
     { std::lock_guard<std::mutex> lock(buffer_mutex); memcpy(pixels, screen_buffer, 256 * 240 * 4); }
     AndroidBitmap_unlockPixels(env, bitmap);
