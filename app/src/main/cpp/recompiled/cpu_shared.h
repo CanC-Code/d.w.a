@@ -7,6 +7,16 @@
 // Log helper for debugging recompiled execution
 #define LOG_CPU(...) __android_log_print(ANDROID_LOG_DEBUG, "DWA_RECOMPILED", __VA_ARGS__)
 
+// --- 6502 Status Flag Bitmask ---
+#define FLAG_C 0x01 // Carry
+#define FLAG_Z 0x02 // Zero
+#define FLAG_I 0x04 // Interrupt Disable
+#define FLAG_D 0x08 // Decimal Mode
+#define FLAG_B 0x10 // Break
+#define FLAG_U 0x20 // Unused/Always 1
+#define FLAG_V 0x40 // Overflow
+#define FLAG_N 0x80 // Negative
+
 // --- NES Hardware Constants & Memory Map ---
 #define SpriteRAM          0x0200
 #define PPU_CTRL           0x2000
@@ -32,17 +42,7 @@
 #define DIR_DOWN           0x02
 #define DIR_LEFT           0x03
 
-#define MCTL_SQ1_SW        0x00
-#define MCTL_SQ1_HW        0x01
-#define MCTL_SQ2_SW        0x02
-#define MCTL_SQ2_HW        0x03
-#define MCTL_TRI_SW        0x04
-#define MCTL_TRI_HW        0x05
-#define MCTL_NOIS_SW       0x06
-#define MCTL_DMC_HW        0x07
-
 // --- Map Data Pointers (Required for Bank 00) ---
-// Extracted from MapDatTbl in Bank 00
 #define DLCstlGFDat        0x80B0
 #define HauksnessDat       0x8178
 #define TantGFDat          0x8240
@@ -72,18 +72,7 @@
 #define ErdCaveB1Dat       0x92B0
 #define ErdCaveB2Dat       0x92E2
 
-// --- Text Block Aliases ---
-#define TextBlock1         0x8000
-#define TB1E0              0x8000
-#define TB1E1              0x8039
-#define TB1E2              0x804A
-#define TextBlock8         0x8000
-#define TB8E0              0x8000
-#define TB14E2             0xAA6C
-#define TB14E3             0xAA8F
-
 // --- Global Function Entry Points ---
-#define BankPointers       0x8000
 #define ModAttribBits      0xC006
 #define GetNPCSpriteIndex  0xC0F4
 #define WordMultiply       0xC1C9
@@ -102,6 +91,7 @@
 #define ChangeMaps         0xD9E2
 #define WaitForNMI         0xFF74
 
+// Use extern "C" for linkage consistency between C++ files and the linker
 extern "C" {
     // --- CPU Registers ---
     extern uint16_t reg_PC;
@@ -123,19 +113,19 @@ extern "C" {
     extern void cpu_adc(uint8_t val);
     extern void cpu_sbc(uint8_t val);
     extern void cpu_bit(uint8_t val);
-    
+
+    // --- Shift/Rotate Helpers (Crucial for Linker) ---
     extern uint8_t cpu_asl(uint8_t val);
     extern uint8_t cpu_lsr(uint8_t val);
     extern uint8_t cpu_rol(uint8_t val);
     extern uint8_t cpu_ror(uint8_t val);
 
-    // --- Addressing Helpers ---
+    // --- Addressing Helpers (Crucial for Linker) ---
     extern uint16_t read_pointer(uint16_t addr);
     extern uint16_t read_pointer_x(uint16_t addr);
     extern uint16_t read_pointer_indexed_y(uint16_t zp_addr);
 
     // --- Execution Control ---
-    void execute_instruction();
     void power_on_reset();
     void nmi_handler();
 }
