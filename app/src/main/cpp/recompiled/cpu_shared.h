@@ -21,31 +21,31 @@
 #define JOYPAD1            0x4016
 #define JOYPAD2            0x4017
 
-// --- Dragon Warrior Specific Aliases & Tables ---
-[span_5](start_span)[span_6](start_span)// Memory Aliases from Dragon_Warrior_Defines.asm[span_5](end_span)[span_6](end_span)
+// --- Dragon Warrior Specific Aliases & RAM ---
 #define MapWidth           0x0013 
 #define MapHeight          0x0014
 #define CoverDatPtr        0x0017
-[span_7](start_span)#define PlayerFlags        0x00CF //[span_7](end_span)
+#define PlayerFlags        0x00CF 
 
-[span_8](start_span)// Pointers from BankPointers Table[span_8](end_span)
-#define LoadStartPals      0xAA7E 
-#define LoadEndBossGFX     0xBABD
-#define DoSprites          0xB6DA
-#define RemoveWindow       0xA7A2
-#define DoPalFadeIn        0xAA3D
-#define DoPalFadeOut       0xAA43
+// --- Function Entry Points (Targets for JSR/JMP) ---
+[span_2](start_span)// These addresses are verified from the BankPointers table and Forward Declarations[span_2](end_span)
+[span_3](start_span)#define LoadStartPals      0xAA7E //[span_3](end_span)
+[span_4](start_span)#define LoadEndBossGFX     0xBABD //[span_4](end_span)
+[span_5](start_span)#define DoSprites          0xB6DA //[span_5](end_span)
+[span_6](start_span)#define RemoveWindow       0xA7A2 //[span_6](end_span)
+[span_7](start_span)#define DoPalFadeIn        0xAA3D //[span_7](end_span)
+[span_8](start_span)#define DoPalFadeOut       0xAA43 //[span_8](end_span)
 
-// --- Function Entry Points (JSR/JMP Targets) ---
-[span_9](start_span)[span_10](start_span)[span_11](start_span)// Addresses verified from assembly labels[span_9](end_span)[span_10](end_span)[span_11](end_span)
+[span_9](start_span)// Verified Aliases[span_9](end_span)
 #define ModAttribBits      0xC006
 #define GetNPCSpriteIndex  0xC0F4
 #define UpdateRandNum      0xC55B
 #define CalcPPUBufAddr     0xC596
 #define ClearSpriteRAM     0xC6BB
-#define DoWindow           0xC6F0
-[span_12](start_span)#define GoldToBCD          0xA8BA //[span_12](end_span)
-[span_13](start_span)#define GetJoypadStatus    0xC608 //[span_13](end_span)
+
+// Additional Common Routines
+#define GoldToBCD          0xA8BA 
+#define GetJoypadStatus    0xC608 
 
 extern "C" {
     // --- CPU Registers ---
