@@ -14,13 +14,11 @@
 #define LOG_TAG "DWA_NATIVE"
 
 // --- Recompiled Bank Dispatcher ---
-// This is the bridge to your recompiled C files
 namespace Dispatcher {
     void execute();
 }
 
 // --- Global Hardware State ---
-// These are likely marked 'extern' in your recompiled C files
 uint8_t cpu_ram[0x0800] = {0};
 uint8_t ppu_vram[2048] = {0};
 uint8_t palette_ram[32] = {0};
@@ -39,6 +37,7 @@ uint16_t ppu_addr_reg = 0;
 bool is_running = false;
 bool is_paused = false;
 
+// NES Color Palette (2C02)
 uint32_t nes_palette[64] = {
     0xFF666666, 0xFF002A88, 0xFF1412A7, 0xFF3B00A4, 0xFF5C007E, 0xFF6E0040, 0xFF6C0600, 0xFF561D00,
     0xFF333500, 0xFF0B4800, 0xFF005200, 0xFF004F08, 0xFF00404D, 0xFF000000, 0xFF000000, 0xFF000000,
@@ -53,12 +52,10 @@ extern "C" {
     uint16_t reg_PC = 0;
     uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
 
-    // The game logic calls this to step the recompiled instructions
     void execute_instruction() {
         Dispatcher::execute();
     }
 
-    // Standard 6502 Support Functions required by recompiled code
     void update_nz(uint8_t val) {
         reg_P &= ~(FLAG_N | FLAG_Z);
         if (val == 0) reg_P |= FLAG_Z;
@@ -123,6 +120,13 @@ extern "C" {
         return bus_read(addr) | (bus_read(addr + 1) << 8);
     }
 
+    // (Indirect, X)
+    uint16_t read_pointer_indexed_x(uint16_t addr) {
+        uint8_t zp = (addr + reg_X) & 0xFF;
+        return bus_read(zp) | (bus_read((zp + 1) & 0xFF) << 8);
+    }
+
+    // (Indirect), Y
     uint16_t read_pointer_indexed_y(uint16_t zp_addr) {
         uint16_t lo = bus_read(zp_addr);
         uint16_t hi = bus_read((zp_addr + 1) & 0xFF);
@@ -135,8 +139,9 @@ extern "C" {
 
 // --- Bus Logic ---
 uint16_t ntable_mirror(uint16_t addr) {
-    addr = (addr - 0x2000) % 0x1000;
-    return addr % 0x0800; // Vertical Mirroring
+    addr = (addr - 0x2000) & 0x0FFF;
+    if (addr >= 0x0800) addr -= 0x0800; // Vertical Mirroring for DW1
+    return addr;
 }
 
 uint8_t read_palette(uint16_t addr) {
@@ -150,7 +155,7 @@ extern "C" uint8_t bus_read(uint16_t addr) {
     if (addr >= 0x2000 && addr <= 0x3FFF) {
         uint16_t reg = addr % 8;
         if (reg == 2) { // PPUSTATUS
-            uint8_t s = ppu_status | 0x80; // Always provide VBlank for native boot
+            uint8_t s = ppu_status;
             ppu_status &= ~0x80; 
             ppu_addr_latch = 0;
             return s;
@@ -209,21 +214,21 @@ extern "C" void bus_write(uint16_t addr, uint8_t val) {
 }
 
 // --- Native Rendering Bridge ---
+
 void draw_frame() {
     std::lock_guard<std::mutex> lock(buffer_mutex);
-    uint16_t nt_base = (ppu_ctrl & 0x03) * 1024;
     uint16_t bg_pat_base = (ppu_ctrl & 0x10) ? 0x1000 : 0x0000;
 
     for (int ty = 0; ty < 30; ty++) {
         for (int tx = 0; tx < 32; tx++) {
-            uint8_t tile = ppu_vram[ntable_mirror(0x2000 + nt_base + ty * 32 + tx)];
+            uint8_t tile = ppu_vram[ntable_mirror(0x2000 + ty * 32 + tx)];
             for (int y = 0; y < 8; y++) {
                 uint8_t p1 = mapper.read_chr(bg_pat_base + tile * 16 + y);
                 uint8_t p2 = mapper.read_chr(bg_pat_base + tile * 16 + y + 8);
                 for (int x = 0; x < 8; x++) {
                     uint8_t pix = ((p1 >> (7 - x)) & 0x01) | (((p2 >> (7 - x)) & 0x01) << 1);
-                    uint8_t palette_val = read_palette(0x3F00 + pix);
-                    screen_buffer[(ty * 8 + y) * 256 + (tx * 8 + x)] = nes_palette[palette_val & 0x3F];
+                    uint32_t color = nes_palette[read_palette(0x3F00 + pix) & 0x3F];
+                    screen_buffer[(ty * 8 + y) * 256 + (tx * 8 + x)] = color;
                 }
             }
         }
@@ -236,7 +241,6 @@ extern "C" void power_on_reset() {
     mapper.control = 0x1C; 
     mapper.prg_bank = 0;
 
-    // Read the reset vector from Bank 3
     uint8_t lo = mapper.read_prg(0xFFFC);
     uint8_t hi = mapper.read_prg(0xFFFD);
     reg_PC = (hi << 8) | lo;
@@ -250,6 +254,9 @@ extern "C" void power_on_reset() {
 
 extern "C" void nmi_handler() {
     ppu_status |= 0x80; 
+    // Synchronize the DW1 internal VBlank RAM flag
+    cpu_ram[VBlankFlag] = 1; 
+
     push_stack(reg_PC >> 8);
     push_stack(reg_PC & 0xFF);
     push_stack(reg_P);
@@ -268,19 +275,16 @@ void engine_loop() {
         }
         auto start = std::chrono::steady_clock::now();
 
-        // RUN RECOMPILED LOGIC: 
-        // We execute a block of cycles per frame
+        // RUN RECOMPILED LOGIC
         for (int i = 0; i < 29780; i++) {
             execute_instruction();
             if (!is_running) break;
         }
 
-        // Trigger the recompiled NMI handler (the game's main drawing routine)
-        if (ppu_ctrl & 0x80) {
-            nmi_handler();
-        }
-
+        // Trigger VBlank
+        nmi_handler();
         draw_frame();
+        
         std::this_thread::sleep_until(start + std::chrono::microseconds(16666));
     }
 }
@@ -296,7 +300,6 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstri
         return env->NewStringUTF("Error: Could not open file");
     }
 
-    // Skip 16-byte iNES header and load into mapper memory
     file.seekg(16, std::ios::beg); 
     for (int i = 0; i < 4; i++) file.read((char*)mapper.prg_rom[i], 16384);
     for (int i = 0; i < 2; i++) file.read((char*)mapper.chr_rom[i], 4096);
@@ -326,7 +329,6 @@ Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv *env, jobject thiz, jo
     AndroidBitmap_unlockPixels(env, bitmap);
 }
 
-// Standard lifecycle hooks
 extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_injectInput(JNIEnv *env, jobject thiz, jint bit, jboolean p) {
     if (p) controller_state |= (uint8_t)bit; else controller_state &= ~((uint8_t)bit);
 }
