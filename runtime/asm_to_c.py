@@ -4,11 +4,9 @@ import re
 ASM_DIR = "source_files"
 OUT_DIR = "app/src/main/cpp/recompiled"
 
-# Global dictionary to store all .alias and label definitions
 global_symbols = {}
 
 def pre_parse_symbols():
-    """Scan all files first to build a global symbol table."""
     if not os.path.exists(ASM_DIR):
         print(f"Directory {ASM_DIR} not found.")
         return
@@ -16,7 +14,7 @@ def pre_parse_symbols():
     for filename in os.listdir(ASM_DIR):
         if not (filename.endswith('.asm') or filename.endswith('.txt')):
             continue
-        
+
         current_pc = 0x8000 
         try:
             with open(os.path.join(ASM_DIR, filename), 'r') as f:
@@ -24,61 +22,50 @@ def pre_parse_symbols():
                     clean = line.split(';')[0].strip()
                     if not clean: continue
 
-                    # Handle .org
                     org_match = re.match(r'^\.org\s+\$([0-9A-Fa-f]+)', clean)
                     if org_match:
                         current_pc = int(org_match.group(1), 16)
                         continue
 
-                    # 1. Match .alias (Force Uppercase Hex)
                     alias_match = re.match(r'^\.alias\s+(\w+)\s+\$?([0-9A-Fa-f]+)', clean)
                     if alias_match:
                         name, val = alias_match.groups()
                         global_symbols[name] = f"0x{val.upper()}"
                         continue
 
-                    # 2. Match Labels
                     label_match = re.match(r'^(\w+):', clean)
                     if label_match:
                         name = label_match.group(1)
-                        # Standard LXXXX labels
                         if re.match(r'^L[0-9A-Fa-f]{4}$', name):
                             global_symbols[name] = f"0x{name[1:].upper()}"
                         else:
-                            # Named labels get the current tracked PC
                             global_symbols[name] = hex(current_pc).upper().replace('X', 'x')
 
-                    # PC Tracking (Approximate size to keep labels unique)
                     ins_match = re.match(r'^\s*(\w{3})\s*(.*)$', clean)
                     if ins_match:
                         opcode, op = ins_match.groups()
                         current_pc += get_ins_size(opcode, op)
-                        
         except Exception as e:
             print(f"Error parsing {filename}: {e}")
 
 def resolve_symbol(symbol):
-    """Ensures a symbol is returned as an uppercase hex string."""
     if not symbol: return "0x0"
-    
-    # Clean symbol
     clean_sym = symbol.strip('#$() ,XY')
-    
     if clean_sym in global_symbols:
         return global_symbols[clean_sym]
-    
-    # Handle raw hex $C5E0
     if all(c in "0123456789ABCDEFabcdef" for c in clean_sym) and len(clean_sym) >= 2:
         return f"0x{clean_sym.upper()}"
-    
-    # Return 0 with a comment to avoid breaking the build, but flag it
     return f"0x0 /* UNRESOLVED: {clean_sym} */"
 
 def get_ins_size(opcode, op):
     if not op or op.strip() == "": return 1
     if op.startswith('#'): return 2
     if '(' in op: return 2
-    if re.search(r'\$[0-9A-Fa-f]{3,4}', op): return 3
+    # If the operand is a 4-digit hex or a known label > 0xFF, it's 3 bytes
+    res = resolve_symbol(op)
+    if "0x" in res and not "UNRESOLVED" in res:
+        val = int(res.split(' ')[0], 16)
+        if val > 0xFF: return 3
     return 2
 
 def parse_addr(opcode, op):
@@ -125,6 +112,8 @@ def translate_line(line):
         'CPX': f"update_flags_cmp(reg_X, {val});",
         'CPY': f"update_flags_cmp(reg_Y, {val});",
         'BIT': f"cpu_bit({val});",
+        'INC': f"{{ uint8_t tmp = bus_read({val}) + 1; bus_write({val}, tmp); update_nz(tmp); }}",
+        'DEC': f"{{ uint8_t tmp = bus_read({val}) - 1; bus_write({val}, tmp); update_nz(tmp); }}",
         'ASL': f"reg_A = cpu_asl(reg_A);" if not op else f"bus_write({val}, cpu_asl(bus_read({val})));",
         'LSR': f"reg_A = cpu_lsr(reg_A);" if not op else f"bus_write({val}, cpu_lsr(bus_read({val})));",
         'ROL': f"reg_A = cpu_rol(reg_A);" if not op else f"bus_write({val}, cpu_rol(bus_read({val})));",
@@ -133,6 +122,8 @@ def translate_line(line):
         'BEQ': f"if (reg_P & 0x02) {{ reg_PC = {target_hex}; return; }}",
         'BCC': f"if (!(reg_P & 0x01)) {{ reg_PC = {target_hex}; return; }}",
         'BCS': f"if (reg_P & 0x01) {{ reg_PC = {target_hex}; return; }}",
+        'BMI': f"if (reg_P & 0x80) {{ reg_PC = {target_hex}; return; }}",
+        'BPL': f"if (!(reg_P & 0x80)) {{ reg_PC = {target_hex}; return; }}",
         'JSR': f"{{ uint16_t ret = reg_PC + 2; push_stack(ret >> 8); push_stack(ret & 0xFF); reg_PC = {target_hex}; return; }}",
         'JMP': f"reg_PC = {target_hex}; return;",
         'RTS': "reg_PC = (pop_stack() | (pop_stack() << 8)) + 1; return;",
@@ -150,11 +141,10 @@ def translate_line(line):
         'PLP': "reg_P = pop_stack();",
         'CLC': "reg_P &= ~0x01;",
         'SEC': "reg_P |= 0x01;",
-        'CLI': "reg_P &= ~0x04;",
-        'SEI': "reg_P |= 0x04;",
-        'CLV': "reg_P &= ~0x40;",
         'CLD': "reg_P &= ~0x08;",
         'SED': "reg_P |= 0x08;",
+        'TXS': "reg_S = reg_X;",
+        'TSX': "reg_X = reg_S; update_nz(reg_X);",
     }
 
     code = mapping.get(opcode, f"/* {opcode} {op} */")
@@ -165,32 +155,32 @@ def convert_file(filename):
     with open(os.path.join(ASM_DIR, filename), 'r') as f:
         lines = f.readlines()
 
-    # Track addresses used in this file to prevent duplicate cases
     used_addresses = set()
 
     with open(os.path.join(OUT_DIR, f"{bank_name}.cpp"), 'w') as out:
-        out.write('#include "cpu_shared.h"\n\nnamespace ' + bank_name + ' {\n')
-        out.write('    void execute() {\n        switch(reg_PC) {\n')
+        out.write('#include "cpu_shared.h"\n\n')
+        # Use extern "C" to match the linkage of your core helper functions
+        out.write('extern "C" {\n')
+        out.write('    namespace ' + bank_name + ' {\n')
+        out.write('        void execute() {\n            switch(reg_PC) {\n')
 
         for line in lines:
             label_match = re.search(r'^\s*(\w+):', line)
             if label_match:
                 label_name = label_match.group(1)
                 addr = resolve_symbol(label_name)
-                
-                # Check for duplicates or collisions at 0x0
+
                 if addr not in used_addresses and "UNRESOLVED" not in addr:
-                    out.write(f'            case {addr}:\n')
+                    out.write(f'                case {addr}:\n')
                     used_addresses.add(addr)
-                
+
                 code, size = translate_line(line)
                 if code:
-                    # If the addr was a duplicate, we still output the code, just not the case label
-                    prefix = "                " if addr in used_addresses else f"                /* Combined with above: {label_name} */ "
+                    prefix = "                    " if addr in used_addresses else f"                    /* Alias: {label_name} */ "
                     suffix = "" if "return" in code else f" reg_PC += {size}; return;"
                     out.write(f'{prefix}{code}{suffix}\n')
 
-        out.write('            default: reg_PC++; return;\n        }\n    }\n}\n')
+        out.write('                default: reg_PC++; return;\n            }\n        }\n    }\n}\n')
 
 if __name__ == "__main__":
     os.makedirs(OUT_DIR, exist_ok=True)
