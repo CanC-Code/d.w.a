@@ -16,14 +16,14 @@
 
 // --- Recompiled Bank Dispatcher ---
 namespace Dispatcher {
-    void execute(); 
+    void execute();
 }
 
 // --- Global Hardware State ---
 uint8_t cpu_ram[0x0800] = {0};
-uint8_t ppu_vram[2048] = {0}; 
+uint8_t ppu_vram[2048] = {0};
 uint8_t palette_ram[32] = {0};
-uint8_t oam_ram[256] = {0}; 
+uint8_t oam_ram[256] = {0};
 uint32_t screen_buffer[256 * 240] = {0};
 uint8_t controller_state = 0;
 uint8_t controller_shift = 0;
@@ -46,20 +46,20 @@ extern "C" {
     uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
 
     void execute_instruction() {
-        Dispatcher::execute(); 
+        Dispatcher::execute();
     }
 
-    void update_nz(uint8_t val) { 
-        reg_P &= ~(FLAG_N | FLAG_Z); 
+    void update_nz(uint8_t val) {
+        reg_P &= ~(FLAG_N | FLAG_Z);
         if (val == 0) reg_P |= FLAG_Z;
         if (val & 0x80) reg_P |= FLAG_N;
     }
 
     void update_flags_cmp(uint8_t reg, uint8_t val) {
-        reg_P &= ~(FLAG_N | FLAG_Z | FLAG_C); 
-        if (reg >= val) reg_P |= FLAG_C; 
-        if (reg == val) reg_P |= FLAG_Z; 
-        if ((uint8_t)(reg - val) & 0x80) reg_P |= FLAG_N; 
+        reg_P &= ~(FLAG_N | FLAG_Z | FLAG_C);
+        if (reg >= val) reg_P |= FLAG_C;
+        if (reg == val) reg_P |= FLAG_Z;
+        if ((uint8_t)(reg - val) & 0x80) reg_P |= FLAG_N;
     }
 
     void cpu_adc(uint8_t val) {
@@ -76,7 +76,7 @@ extern "C" {
     void cpu_bit(uint8_t val) {
         reg_P &= ~(FLAG_Z | FLAG_V | FLAG_N);
         if ((val & reg_A) == 0) reg_P |= FLAG_Z;
-        reg_P |= (val & 0xC0); 
+        reg_P |= (val & 0xC0);
     }
 
     uint8_t cpu_asl(uint8_t val) {
@@ -119,8 +119,8 @@ extern "C" {
         return (lo | (hi << 8)) + reg_Y;
     }
 
-    void push_stack(uint8_t val) { cpu_ram[0x0100 | reg_S] = val; reg_S--; }
-    uint8_t pop_stack() { reg_S++; return cpu_ram[0x0100 | reg_S]; }
+    void push_stack(uint8_t val) { cpu_ram[0x0100 | (reg_S & 0xFF)] = val; reg_S--; }
+    uint8_t pop_stack() { reg_S++; return cpu_ram[0x0100 | (reg_S & 0xFF)]; }
 }
 
 // --- PPU & Bus Logic ---
@@ -131,12 +131,12 @@ bool is_paused = false;
 
 uint16_t ntable_mirror(uint16_t addr) {
     addr = (addr - 0x2000) % 0x1000;
-    return addr % 0x0800; 
+    return addr % 0x0800;
 }
 
 uint8_t read_palette(uint16_t addr) {
     uint8_t p_idx = addr & 0x1F;
-    if (p_idx >= 0x10 && (p_idx % 4 == 0)) p_idx -= 0x10; 
+    if (p_idx >= 0x10 && (p_idx % 4 == 0)) p_idx -= 0x10;
     return palette_ram[p_idx];
 }
 
@@ -144,11 +144,11 @@ extern "C" uint8_t bus_read(uint16_t addr) {
     if (addr < 0x2000) return cpu_ram[addr % 0x0800];
     if (addr >= 0x2000 && addr <= 0x3FFF) {
         uint16_t reg = addr % 8;
-        if (reg == 2) { 
-            uint8_t s = ppu_status; 
-            ppu_status &= ~0x80; 
-            ppu_addr_latch = 0; 
-            return s; 
+        if (reg == 2) {
+            uint8_t s = ppu_status;
+            ppu_status &= ~0x80;
+            ppu_addr_latch = 0;
+            return s;
         }
         if (reg == 7) {
             uint8_t data = ppu_data_buffer;
@@ -161,10 +161,10 @@ extern "C" uint8_t bus_read(uint16_t addr) {
         }
     }
     if (addr >= 0x6000) return mapper.read_prg(addr);
-    if (addr == 0x4016) { 
-        uint8_t ret = (controller_shift & 0x80) >> 7; 
-        controller_shift <<= 1; 
-        return ret; 
+    if (addr == 0x4016) {
+        uint8_t ret = (controller_shift & 0x80) >> 7;
+        controller_shift <<= 1;
+        return ret;
     }
     return 0;
 }
@@ -192,7 +192,7 @@ extern "C" void bus_write(uint16_t addr, uint8_t val) {
             ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
         }
     }
-    else if (addr == 0x4014) { 
+    else if (addr == 0x4014) {
         uint16_t base = val << 8;
         for (int i = 0; i < 256; i++) oam_ram[i] = bus_read(base + i);
     }
@@ -224,9 +224,16 @@ void draw_frame() {
 
 // --- CPU Entry ---
 extern "C" void power_on_reset() {
-    // Initial bank setup to ensure fixed bank at $C000 is visible
-    mapper.reset(); 
-    reg_PC = (bus_read(0xFFFD) << 8) | bus_read(0xFFFC);
+    mapper.reset();
+    uint8_t lo = bus_read(0xFFFC);
+    uint8_t hi = bus_read(0xFFFD);
+    reg_PC = (hi << 8) | lo;
+    
+    // Failsafe if ROM isn't loaded correctly yet
+    if (reg_PC == 0) reg_PC = 0xCF25; 
+    
+    reg_S = 0xFD;
+    reg_P = 0x24;
     LOG_CPU("Reset! PC set to: %04X", reg_PC);
 }
 
@@ -247,10 +254,10 @@ void engine_loop() {
             continue;
         }
         auto start = std::chrono::steady_clock::now();
-        // Execute approx 29780 cycles per frame
-        for (int i = 0; i < 10000; i++) { 
-            execute_instruction(); 
-            if (reg_PC == 0) break; // Safety break
+        // Execute a fixed number of instructions per frame
+        for (int i = 0; i < 20000; i++) {
+            execute_instruction();
+            if (!is_running) break;
         }
         nmi_handler();
         draw_frame();
@@ -259,21 +266,20 @@ void engine_loop() {
 }
 
 // --- JNI Lifecycle ---
+// Package changed to com_canc_dwa to match your actual structure
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_example_dwa_NativeLib_loadROM(JNIEnv *env, jobject thiz, jbyteArray rom_data) {
+Java_com_canc_dwa_MainActivity_loadROM(JNIEnv *env, jobject thiz, jbyteArray rom_data) {
     jbyte* bytes = env->GetByteArrayElements(rom_data, nullptr);
     jsize len = env->GetArrayLength(rom_data);
 
-    // iNES Header (16 bytes) + PRG (64KB)
     if (len >= (16 + 65536)) {
         for (int i = 0; i < 4; i++) {
             memcpy(mapper.prg_rom[i], &bytes[16 + (i * 16384)], 16384);
         }
-        LOG_CPU("ROM Loaded successfully: 64KB PRG mapped.");
+        LOG_CPU("ROM Loaded successfully.");
     }
 
-    // Load CHR (8KB) if present
     if (len >= (16 + 65536 + 8192)) {
         for (int i = 0; i < 2; i++) {
             memcpy(mapper.chr_rom[i], &bytes[16 + 65536 + (i * 4096)], 4096);
@@ -281,18 +287,17 @@ Java_com_example_dwa_NativeLib_loadROM(JNIEnv *env, jobject thiz, jbyteArray rom
     }
 
     env->ReleaseByteArrayElements(rom_data, bytes, JNI_ABORT);
-    // PC is set during startEngine -> power_on_reset
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_example_dwa_NativeLib_startEngine(JNIEnv *env, jobject thiz) {
+Java_com_canc_dwa_MainActivity_startEngine(JNIEnv *env, jobject thiz) {
     if (!is_running) {
         std::thread(engine_loop).detach();
     }
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_example_dwa_NativeLib_updateSurface(JNIEnv *env, jobject thiz, jobject bitmap) {
+Java_com_canc_dwa_MainActivity_updateSurface(JNIEnv *env, jobject thiz, jobject bitmap) {
     AndroidBitmapInfo info;
     void* pixels;
     if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) return;
