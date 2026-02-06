@@ -4,65 +4,95 @@ import re
 ASM_DIR = "source_files"
 OUT_DIR = "app/src/main/cpp/recompiled"
 
-# Global dictionary to store .alias definitions
-aliases = {}
+# Global dictionary to store all .alias and label definitions across all files
+global_symbols = {}
+
+def pre_parse_symbols():
+    """Scan all files first to build a global symbol table."""
+    for filename in os.listdir(ASM_DIR):
+        if not (filename.endswith('.asm') or filename.endswith('.txt')):
+            continue
+        with open(os.path.join(ASM_DIR, filename), 'r') as f:
+            for line in f:
+                clean = line.split(';')[0].strip()
+                # Match .alias Name Value
+                alias_match = re.match(r'^\.alias\s+(\w+)\s+\$?([0-9A-F]+)', clean)
+                if alias_match:
+                    name, val = alias_match.groups()
+                    global_symbols[name] = f"0x{val}"
+                
+                # Match LXXXX: labels
+                label_match = re.match(r'^(L[0-9A-F]{4}):', clean)
+                if label_match:
+                    name = label_match.group(1)
+                    global_symbols[name] = name.replace('L', '0x')
 
 def get_ins_size(opcode, op):
     if not op or op.strip() == "": return 1
     if op.startswith('#'): return 2
     if '(' in op: return 2 
-    # Check if operand is a known 8-bit alias
-    if op in aliases and int(aliases[op], 16) <= 0xFF: return 2
-    if len(op) > 4 or (op in aliases and int(aliases[op], 16) > 0xFF): return 3 
+    val = op.strip().replace('$', '')
+    # If it's a known symbol, check its resolved value
+    if op in global_symbols:
+        val = global_symbols[op].replace('0x', '')
+    
+    try:
+        if len(val) > 2 and int(val, 16) > 0xFF: return 3
+    except ValueError:
+        pass
     return 2 
 
 def parse_addr(opcode, op):
     op = op.strip()
     if not op: return "0"
     
-    # Resolve aliases first
-    for alias, val in aliases.items():
-        # Match whole word only to avoid partial replacement
-        op = re.sub(r'\b' + re.escape(alias) + r'\b', val, op)
-
-    is_write = opcode in ['STA', 'STX', 'STY', 'INC', 'DEC', 'ASL', 'LSR', 'ROL', 'ROR']
-    if op.startswith('#$'): return f"0x{op[2:]}"
-    if op.startswith('#'): return op[1:] # Decimal or literal
+    # Handle Binary Literals (e.g., %00000101)
+    if op.startswith('#%'):
+        return str(int(op[2:], 2))
     
+    # Resolve symbols/aliases
+    if op.startswith('#'):
+        core_op = op[1:].replace('$', '')
+        if core_op in global_symbols:
+            return global_symbols[core_op]
+        return f"0x{core_op}" if '$' in op else core_op
+
     # Handle Indirect Indexed (ptr),Y
     if op.startswith('(') and '),Y' in op.upper():
-        hex_addr = op.replace('(', '').replace('),Y', '').replace('$', '0x').strip()
-        return f"bus_read(read_pointer({hex_addr}) + reg_Y)"
+        ptr = op.replace('(', '').replace('),Y', '').replace('$', '').strip()
+        ptr_val = global_symbols.get(ptr, f"0x{ptr}")
+        return f"bus_read(read_pointer({ptr_val}) + reg_Y)"
     
-    # Handle Absolute/ZeroPage
-    hex_addr = op.replace('$', '0x').split(',')[0].strip('()')
+    # Resolve absolute labels/aliases
+    clean_op = op.replace('$', '').split(',')[0].strip('()')
+    resolved_val = global_symbols.get(clean_op, f"0x{clean_op}")
     
-    if ',X' in op.upper(): addr_calc = f"({hex_addr} + reg_X)"
-    elif ',Y' in op.upper(): addr_calc = f"({hex_addr} + reg_Y)"
-    else: addr_calc = hex_addr
+    is_write = opcode in ['STA', 'STX', 'STY', 'INC', 'DEC', 'ASL', 'LSR', 'ROL', 'ROR']
+    
+    if ',X' in op.upper(): addr_calc = f"({resolved_val} + reg_X)"
+    elif ',Y' in op.upper(): addr_calc = f"({resolved_val} + reg_Y)"
+    else: addr_calc = resolved_val
 
     return addr_calc if is_write else f"bus_read({addr_calc})"
 
 def translate_line(line):
-    # Strip comments and handle .alias
     clean = line.split(';')[0].strip()
-    
-    alias_match = re.match(r'^\.alias\s+(\w+)\s+\$?([0-9A-F]+)', clean)
-    if alias_match:
-        name, val = alias_match.groups()
-        aliases[name] = f"0x{val}"
-        return f"// Alias: {name} = {val}", 0
-
     match = re.match(r'^(?:\w+:)?\s*(\w{3})\s*(.*)$', clean)
     if not match: return None, 0
     
     opcode, op = match.groups()
     opcode = opcode.upper()
+    
+    # Simple fix for local branches (+/-) to prevent C++ syntax errors
+    if op == "+" or op == "-":
+        return f"// TODO: Resolve local branch {opcode} {op}", 0
+
     val = parse_addr(opcode, op)
     size = get_ins_size(opcode, op)
-
-    # Convert branch labels like + or - to hex if they match case patterns
-    clean_op = op.replace('$', '0x')
+    
+    # Resolve jump/branch targets to hex
+    target = op.replace('$', '').strip()
+    target_hex = global_symbols.get(target, f"0x{target}")
 
     mapping = {
         'LDA': f"reg_A = {val}; update_nz(reg_A);",
@@ -80,27 +110,21 @@ def translate_line(line):
         'CMP': f"update_flags_cmp(reg_A, {val});",
         'CPX': f"update_flags_cmp(reg_X, {val});",
         'CPY': f"update_flags_cmp(reg_Y, {val});",
-        'INC': f"bus_write({val}, (bus_read({val}) + 1)); // Simplified INC",
-        'DEC': f"bus_write({val}, (bus_read({val}) - 1)); // Simplified DEC",
-        'ASL': f"reg_A = cpu_asl(reg_A);" if op == "" else f"bus_write({val}, cpu_asl(bus_read({val})));",
-        'LSR': f"reg_A = cpu_lsr(reg_A);" if op == "" else f"bus_write({val}, cpu_lsr(bus_read({val})));",
+        'INC': f"{{ uint16_t a = {val}; bus_write(a, bus_read(a) + 1); }}",
+        'DEC': f"{{ uint16_t a = {val}; bus_write(a, bus_read(a) - 1); }}",
         'TAX': "reg_X = reg_A; update_nz(reg_X);",
         'TAY': "reg_Y = reg_A; update_nz(reg_Y);",
         'TXA': "reg_A = reg_X; update_nz(reg_A);",
         'TYA': "reg_A = reg_Y; update_nz(reg_A);",
         'PHA': "push_stack(reg_A);",
         'PLA': "reg_A = pop_stack(); update_nz(reg_A);",
-        'PHP': "push_stack(reg_P);",
-        'PLP': "reg_P = pop_stack();",
         'RTS': "reg_PC = (pop_stack() | (pop_stack() << 8)) + 1; return;",
-        'JSR': f"{{ uint16_t ret = reg_PC + 2; push_stack(ret >> 8); push_stack(ret & 0xFF); reg_PC = {clean_op}; return; }}",
-        'JMP': f"reg_PC = {clean_op}; return;",
-        'BNE': f"if (!(reg_P & 0x02)) {{ reg_PC = {clean_op}; return; }}",
-        'BEQ': f"if (reg_P & 0x02) {{ reg_PC = {clean_op}; return; }}",
-        'BCC': f"if (!(reg_P & 0x01)) {{ reg_PC = {clean_op}; return; }}",
-        'BCS': f"if (reg_P & 0x01) {{ reg_PC = {clean_op}; return; }}",
-        'BVC': f"if (!(reg_P & 0x40)) {{ reg_PC = {clean_op}; return; }}",
-        'BVS': f"if (reg_P & 0x40) {{ reg_PC = {clean_op}; return; }}",
+        'JSR': f"{{ uint16_t ret = reg_PC + 2; push_stack(ret >> 8); push_stack(ret & 0xFF); reg_PC = {target_hex}; return; }}",
+        'JMP': f"reg_PC = {target_hex}; return;",
+        'BNE': f"if (!(reg_P & 0x02)) {{ reg_PC = {target_hex}; return; }}",
+        'BEQ': f"if (reg_P & 0x02) {{ reg_PC = {target_hex}; return; }}",
+        'BCC': f"if (!(reg_P & 0x01)) {{ reg_PC = {target_hex}; return; }}",
+        'BCS': f"if (reg_P & 0x01) {{ reg_PC = {target_hex}; return; }}",
         'SEC': "reg_P |= 0x01;",
         'CLC': "reg_P &= ~0x01;",
     }
@@ -118,25 +142,20 @@ def convert_file(filename):
         out.write('    void execute() {\n        switch(reg_PC) {\n')
 
         for line in lines:
-            # Handle standard labels LXXXX
             label_match = re.search(r'^\s*(L[0-9A-F]{4}):', line)
             if label_match:
                 addr = label_match.group(1).replace('L', '0x')
                 out.write(f'            case {addr}:\n')
-                
                 code, size = translate_line(line)
                 if code:
-                    suffix = "" if ("return" in code or "// Alias" in code) else f" reg_PC += {size}; return;"
+                    suffix = "" if "return" in code else f" reg_PC += {size}; return;"
                     out.write(f'                {code}{suffix}\n')
-            
-            # Briefly log data bytes for manual implementation/reference
-            elif ".byte" in line or ".word" in line:
-                out.write(f'                // Data: {line.strip()}\n')
 
         out.write('            default: reg_PC++; return;\n        }\n    }\n}\n')
 
-# Process
+# Execution
 os.makedirs(OUT_DIR, exist_ok=True)
+pre_parse_symbols() # Ensure all cross-file aliases are loaded
 for f in os.listdir(ASM_DIR):
-    if f.endswith('.asm') or f.endswith('.txt'): # Added .txt support for your upload
+    if f.endswith('.asm') or f.endswith('.txt'):
         convert_file(f)
