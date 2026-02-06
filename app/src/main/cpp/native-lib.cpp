@@ -88,28 +88,41 @@ uint32_t nes_palette[64] = {
     0xFFBCBE00, 0xFF88D100, 0xFF5CE430, 0xFF45E082, 0xFF48CDDE, 0xFF4F4F4F, 0xFF000000, 0xFF000000
 };
 
-// Internal helper for Palette Mirroring
 uint8_t read_palette(uint16_t addr) {
-    if (addr >= 0x10 && (addr % 4 == 0)) addr -= 0x10; // Mirror sprite transparent to BG
-    return palette_ram[addr & 0x1F];
+    uint8_t p_idx = addr & 0x1F;
+    if (p_idx >= 0x10 && (p_idx % 4 == 0)) p_idx -= 0x10; 
+    return palette_ram[p_idx];
 }
 
 extern "C" uint8_t bus_read(uint16_t addr) {
     if (addr < 0x2000) return cpu_ram[addr % 0x0800];
     if (addr >= 0x2000 && addr <= 0x3FFF) {
         uint16_t reg = addr % 8;
-        if (reg == 2) { uint8_t s = ppu_status; ppu_status &= ~0x80; ppu_addr_latch = 0; return s; }
+        if (reg == 2) { 
+            uint8_t s = ppu_status; 
+            ppu_status &= ~0x80; // Clear VBlank flag on read
+            ppu_addr_latch = 0; 
+            return s; 
+        }
         if (reg == 7) {
             uint8_t data = ppu_data_buffer;
             uint16_t p_addr = ppu_addr_reg & 0x3FFF;
             if (p_addr < 0x3F00) ppu_data_buffer = (p_addr >= 0x2000) ? ppu_vram[p_addr % 2048] : mapper.read_chr(p_addr);
-            else { data = read_palette(p_addr & 0x1F); ppu_data_buffer = ppu_vram[p_addr % 2048]; }
+            else { 
+                data = read_palette(p_addr); 
+                ppu_data_buffer = ppu_vram[p_addr % 2048]; 
+            }
             ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
             ppu_addr_reg &= 0x3FFF;
             return data;
         }
     }
-    if (addr >= 0x6000) return mapper.read_prg(addr); 
+    if (addr >= 0x6000) {
+        if (addr >= 0xFFFC && addr <= 0xFFFD) {
+            __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, "CPU fetching Reset Vector at %04X", addr);
+        }
+        return mapper.read_prg(addr);
+    }
     if (addr == 0x4016) { uint8_t ret = (controller_shift & 0x80) >> 7; controller_shift <<= 1; return ret; }
     return 0;
 }
@@ -167,6 +180,7 @@ void draw_frame() {
             }
         }
     }
+    // Simple Sprite Rendering
     for (int i = 63; i >= 0; i--) {
         uint8_t y = oam_ram[i * 4] + 1; uint8_t tile = oam_ram[i * 4 + 1]; uint8_t x = oam_ram[i * 4 + 3];
         if (y >= 240 || y == 0) continue;
@@ -193,25 +207,23 @@ void engine_loop() {
 
         auto start = std::chrono::steady_clock::now();
         
-        // PPU Sync: Frame starts, clear VBlank
+        // PPU Clear VBlank at start of frame
         ppu_status &= ~0x80; 
 
-        // Dragon Warrior expects the VBlank flag to cycle.
-        // We simulate the 'visible' portion of the frame (approx 14ms)
+        // Simulate frame time (CPU work)
         std::this_thread::sleep_for(std::chrono::microseconds(14500));
 
-        // Enter VBlank
+        // Trigger VBlank
         ppu_status |= 0x80; 
-        if (ppu_ctrl & 0x80) nmi_handler();
+        if (ppu_ctrl & 0x80) {
+            nmi_handler();
+        }
 
         draw_frame();
 
-        // 60FPS Lock
         std::this_thread::sleep_until(start + std::chrono::milliseconds(16));
     }
 }
-
-// --- JNI Bridge ---
 
 extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativePauseEngine(JNIEnv* env, jobject thiz) { is_paused = true; }
 extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeResumeEngine(JNIEnv* env, jobject thiz) { is_paused = false; }
