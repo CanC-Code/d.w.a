@@ -18,13 +18,14 @@
             android:text="DRAGON WARRIOR NATIVE"
             android:textColor="#FFFFFF"
             android:textSize="24sp"
-            android:layout_marginBottom="20dp" />
+            android:layout_marginBottom="20dp"
+            android:textStyle="bold" />
 
         <Button
             android:id="@+id/btn_select_rom"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Select ROM" />
+            android:text="Select ROM (.nes)" />
     </LinearLayout>
 
     <FrameLayout
@@ -41,41 +42,51 @@
         <ImageButton android:id="@+id/btn_up" android:layout_width="60dp" android:layout_height="60dp" 
             android:layout_gravity="bottom|start" android:layout_marginBottom="120dp" android:layout_marginStart="80dp"
             android:background="@android:color/transparent" android:src="@drawable/dpad_up" android:scaleType="fitCenter" />
-        
+
         <ImageButton android:id="@+id/btn_down" android:layout_width="60dp" android:layout_height="60dp" 
             android:layout_gravity="bottom|start" android:layout_marginBottom="20dp" android:layout_marginStart="80dp"
             android:background="@android:color/transparent" android:src="@drawable/dpad_down" android:scaleType="fitCenter" />
-        
+
         <ImageButton android:id="@+id/btn_left" android:layout_width="60dp" android:layout_height="60dp" 
             android:layout_gravity="bottom|start" android:layout_marginBottom="70dp" android:layout_marginStart="30dp"
             android:background="@android:color/transparent" android:src="@drawable/dpad_left" android:scaleType="fitCenter" />
-        
+
         <ImageButton android:id="@+id/btn_right" android:layout_width="60dp" android:layout_height="60dp" 
             android:layout_gravity="bottom|start" android:layout_marginBottom="70dp" android:layout_marginStart="130dp"
             android:background="@android:color/transparent" android:src="@drawable/dpad_right" android:scaleType="fitCenter" />
 
-        <ImageButton android:id="@+id/btn_b" android:layout_width="70dp" android:layout_height="70dp" 
-            android:layout_gravity="bottom|end" android:layout_marginBottom="40dp" android:layout_marginEnd="100dp"
+        <ImageButton android:id="@+id/btn_b" android:layout_width="75dp" android:layout_height="75dp" 
+            android:layout_gravity="bottom|end" android:layout_marginBottom="40dp" android:layout_marginEnd="105dp"
             android:background="@android:color/transparent" android:src="@drawable/button_b" android:scaleType="fitCenter" />
-        
-        <ImageButton android:id="@+id/btn_a" android:layout_width="80dp" android:layout_height="80dp" 
+
+        <ImageButton android:id="@+id/btn_a" android:layout_width="85dp" android:layout_height="85dp" 
             android:layout_gravity="bottom|end" android:layout_marginBottom="35dp" android:layout_marginEnd="20dp"
             android:background="@android:color/transparent" android:src="@drawable/button_a" android:scaleType="fitCenter" />
 
         <ImageButton android:id="@+id/btn_select" android:layout_width="80dp" android:layout_height="40dp" 
-            android:layout_gravity="bottom|center_horizontal" android:layout_marginBottom="20dp" android:layout_marginStart="-45dp"
+            android:layout_gravity="bottom|center_horizontal" android:layout_marginBottom="20dp" android:layout_marginStart="-50dp"
             android:background="@android:color/transparent" android:src="@drawable/button_select" android:scaleType="fitCenter" />
-        
+
         <ImageButton android:id="@+id/btn_start" android:layout_width="80dp" android:layout_height="40dp" 
-            android:layout_gravity="bottom|center_horizontal" android:layout_marginBottom="20dp" android:layout_marginStart="45dp"
+            android:layout_gravity="bottom|center_horizontal" android:layout_marginBottom="20dp" android:layout_marginStart="50dp"
             android:background="@android:color/transparent" android:src="@drawable/button_start" android:scaleType="fitCenter" />
 
-        <View
+        <FrameLayout
             android:id="@+id/menu_overlay"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:background="#80000000"
-            android:visibility="gone" />
+            android:background="#B3000000"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="center"
+                android:text="PAUSED"
+                android:textColor="#FFFFFF"
+                android:textSize="32sp"
+                android:textStyle="bold" />
+        </FrameLayout>
 
     </FrameLayout>
 </FrameLayout>
