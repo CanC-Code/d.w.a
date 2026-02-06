@@ -20,11 +20,13 @@ void MapperMMC1::reset() {
 }
 
 void MapperMMC1::write(uint16_t addr, uint8_t val) {
+    // If bit 7 is set, reset the shift register
     if (val & 0x80) {
         shift_register = 0x10;
         write_count = 0;
         control |= 0x0C; 
     } else {
+        // Shift bit into register
         shift_register = ((val & 0x01) << 4) | (shift_register >> 1);
         write_count++;
 
@@ -33,16 +35,12 @@ void MapperMMC1::write(uint16_t addr, uint8_t val) {
 
             if (addr >= 0x8000 && addr <= 0x9FFF) {
                 control = data;
-                // Bits 0-1 of 'control' specify mirroring:
-                // 0: One-screen, lower bank; 1: One-screen, upper bank; 
-                // 2: Vertical; 3: Horizontal
             } else if (addr >= 0xA000 && addr <= 0xBFFF) {
                 chr_bank_0 = data;
             } else if (addr >= 0xC000 && addr <= 0xDFFF) {
                 chr_bank_1 = data;
             } else if (addr >= 0xE000) {
                 prg_bank = data & 0x0F;
-                // Bit 4 of the PRG register often acts as a RAM chip enable
                 ram_enabled = !(data & 0x10); 
             }
 
@@ -54,9 +52,6 @@ void MapperMMC1::write(uint16_t addr, uint8_t val) {
 
 uint8_t MapperMMC1::read_prg(uint16_t addr) {
     if (addr >= 0x6000 && addr <= 0x7FFF) {
-        // Dragon Warrior is sensitive to PRG-RAM. 
-        // We ensure it returns a valid value even if "disabled" 
-        // to prevent boot-up logic hangs.
         return prg_ram[addr - 0x6000];
     }
 
@@ -84,12 +79,28 @@ uint8_t MapperMMC1::read_prg(uint16_t addr) {
 uint8_t MapperMMC1::read_chr(uint16_t addr) {
     uint16_t offset = addr & 0x0FFF;
 
+    if (control & 0x10) { // 4KB banks mode
+        if (addr < 0x1000) return chr_rom[chr_bank_0 % 4][offset];
+        return chr_rom[chr_bank_1 % 4][offset];
+    } else { // 8KB bank mode
+        uint8_t bank = (chr_bank_0 & 0x0E);
+        if (addr >= 0x1000) bank++;
+        return chr_rom[bank % 4][offset];
+    }
+}
+
+// IMPLEMENTATION TO FIX PPU.CPP ERROR
+void MapperMMC1::write_chr(uint16_t addr, uint8_t val) {
+    uint16_t offset = addr & 0x0FFF;
+    
+    // While Dragon Warrior is CHR-ROM, this allows the PPU 
+    // bus logic to function without crashing if a write is attempted.
     if (control & 0x10) { // 4KB banks
-        if (addr < 0x1000) return chr_rom[chr_bank_0 % 2][offset];
-        return chr_rom[chr_bank_1 % 2][offset];
+        if (addr < 0x1000) chr_rom[chr_bank_0 % 4][offset] = val;
+        else chr_rom[chr_bank_1 % 4][offset] = val;
     } else { // 8KB bank
         uint8_t bank = (chr_bank_0 & 0x0E);
         if (addr >= 0x1000) bank++;
-        return chr_rom[bank % 2][offset];
+        chr_rom[bank % 4][offset] = val;
     }
 }
