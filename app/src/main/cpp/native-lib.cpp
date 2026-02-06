@@ -16,17 +16,15 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// Dragon Warrior specific RAM addresses for synchronization
+// Dragon Warrior specific RAM addresses
 #define DW_RAM_VBLANK_FLAG   0x002D
 #define DW_RAM_FRAME_COUNTER 0x003C
 
-// --- Dispatcher Implementation ---
+// --- Dispatcher Declaration ---
+// We only declare these here. They are defined in Dispatcher.cpp.
 namespace Dispatcher { 
-    bool nmi_requested = false;
     void execute(); 
-    void request_interrupt_nmi() { nmi_requested = true; }
-    // Backward compatibility for calls using the old name
-    void request_nmi() { nmi_requested = true; } 
+    void request_interrupt_nmi(); 
 }
 
 // --- Hardware State ---
@@ -168,10 +166,11 @@ void trigger_nmi() {
     push_stack(reg_PC & 0xFF);
     push_stack(reg_P);
 
-    // Update synchronization flags in RAM
+    // Update Dragon Warrior synchronization flags in RAM
     cpu_ram[DW_RAM_VBLANK_FLAG] = 1;
     cpu_ram[DW_RAM_FRAME_COUNTER]++;
 
+    // Call the NMI request in the recompiled Dispatcher
     Dispatcher::request_interrupt_nmi(); 
 }
 
@@ -216,12 +215,8 @@ void engine_loop() {
 extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_nativeTriggerNMI(JNIEnv *env, jobject thiz) {
     if (!rom_loaded || is_paused) return;
-    
-    // Explicitly pulse the PPU status for the recompiled assembly
     ppu.status |= 0x80;
-    if (ppu.ctrl & 0x80) {
-        trigger_nmi();
-    }
+    if (ppu.ctrl & 0x80) trigger_nmi();
 }
 
 extern "C" JNIEXPORT jstring JNICALL
