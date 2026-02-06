@@ -8,17 +8,18 @@
 #define LOG_CPU(...) __android_log_print(ANDROID_LOG_DEBUG, "DWA_RECOMPILED", __VA_ARGS__)
 
 // --- 6502 Status Flag Bitmask ---
-#define FLAG_C 0x01 // Carry
-#define FLAG_Z 0x02 // Zero
-#define FLAG_I 0x04 // Interrupt Disable
-#define FLAG_D 0x08 // Decimal Mode
-#define FLAG_B 0x10 // Break
-#define FLAG_U 0x20 // Unused/Always 1
-#define FLAG_V 0x40 // Overflow
-#define FLAG_N 0x80 // Negative
+// These must match the bit positions in the hardware P register
+#define FLAG_C 0x01 // Carry: Set if last operation caused an overflow/underflow
+#define FLAG_Z 0x02 // Zero: Set if result of last operation was 0
+#define FLAG_I 0x04 // Interrupt Disable: If set, NMIs/IRQs are ignored
+#define FLAG_D 0x08 // Decimal Mode: (Unused in NES, but retained for logic)
+#define FLAG_B 0x10 // Break: Set when BRK is executed
+#define FLAG_U 0x20 // Unused/Always 1: Hardware always reports this bit as high
+#define FLAG_V 0x40 // Overflow: Set if signed overflow occurred
+#define FLAG_N 0x80 // Negative: Set if bit 7 of result is 1
 
 // --- NES Hardware Constants ---
-#define SpriteRAM          0x0200
+#define RAM_STACK_BASE     0x0100
 #define PPU_CTRL           0x2000
 #define PPU_MASK           0x2001
 #define PPU_STATUS         0x2002
@@ -27,19 +28,21 @@
 #define PPU_SCROLL         0x2005
 #define PPU_ADDR           0x2006
 #define PPU_DATA           0x2007
-#define SND_CHN            0x4015
+#define APU_STATUS         0x4015
 #define JOYPAD1            0x4016
 #define JOYPAD2            0x4017
 
 // --- Dragon Warrior Internal RAM Aliases ---
-#define MapWidth           0x0013 
-#define MapHeight          0x0014
-#define VBlankFlag         0x002D // CRITICAL: Game loops on this ($2D) until NMI sets it to 1
-#define FrameCounter       0x0012 
-#define ScrollX            0x00FC 
-#define ScrollY            0x00FD
+// These allow recompiled code to use names instead of raw hex
+#define DW_VBLANK_FLAG     0x002D // The "engine heartbeat" address
+#define DW_FRAME_CNT       0x0012 
+#define DW_SCROLL_X        0x00FC 
+#define DW_MAP_ID          0x0045
 
-// Use extern "C" for linkage consistency between C++ and recompiled bank files
+
+
+// Wrap in extern "C" to prevent C++ name mangling, allowing the 
+// recompiled .c or .o files to link to your native-lib.cpp functions.
 extern "C" {
     // --- CPU Registers (Shared Global State) ---
     extern uint16_t reg_PC;
@@ -57,7 +60,8 @@ extern "C" {
     void update_nz(uint8_t val);
     void update_flags_cmp(uint8_t reg, uint8_t val);
 
-    // --- Native 6502 Instruction Helpers (CRITICAL: Fixes Linker Errors) ---
+    // --- Native 6502 Instruction Helpers ---
+    // These are implemented in native-lib.cpp and called by recompiled instructions
     void cpu_adc(uint8_t val);
     void cpu_sbc(uint8_t val);
     void cpu_bit(uint8_t val);
@@ -66,12 +70,13 @@ extern "C" {
     uint8_t cpu_rol(uint8_t val);
     uint8_t cpu_ror(uint8_t val);
 
-    // --- Native Addressing Mode Helpers ---
+    // --- Addressing Mode Pointer Helpers ---
+    // Little-endian address fetching
     uint16_t read_pointer(uint16_t addr);
     uint16_t read_pointer_indexed_x(uint16_t addr);
     uint16_t read_pointer_indexed_y(uint16_t zp_addr);
 
-    // --- Execution Hooks ---
+    // --- Main Dispatch Hook ---
     void execute_instruction();
 }
 
