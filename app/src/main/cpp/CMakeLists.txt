@@ -5,31 +5,25 @@ project("dwa")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 1. Explicit Source List
-# Added MapperMMC1.cpp to handle the hardware logic
-set(DWA_SOURCES
-    native-lib.cpp
-    MapperMMC1.cpp
-    recompiled/Dispatcher.cpp
-    recompiled/Bank00.cpp
-    recompiled/Bank01.cpp
-    recompiled/Bank02.cpp
-    recompiled/Bank03.cpp
+# 1. Automatic Source Discovery
+# This finds all .cpp files in the root and the recompiled folder automatically
+file(GLOB_RECURSE DWA_SOURCES 
+    "*.cpp" 
+    "recompiled/*.cpp"
 )
 
 # 2. Define the main native library
 add_library(dwa SHARED ${DWA_SOURCES})
 
 # 3. Include Directories
-# Added the parent directory so recompiled files can find MapperMMC1.h and cpu_shared.h
 target_include_directories(dwa PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/recompiled
 )
 
-# 4. Compiler Flags
-# -O3 and -flto are excellent choices for an emulator.
-# Added -fomit-frame-pointer to squeeze out more performance on ARM.
+# 4. Performance & Compatibility Flags
+# Added -Wno-switch to ignore warnings from the massive switch-cases in Bank files
+# Added -fno-plt for faster calls between shared logic
 target_compile_options(dwa PRIVATE 
     -O3 
     -fexceptions 
@@ -37,17 +31,22 @@ target_compile_options(dwa PRIVATE
     -ffast-math
     -flto
     -fomit-frame-pointer
+    -fno-plt
+    -Wno-switch
 )
 
-# 5. Linker Flags
-target_link_options(dwa PRIVATE -flto)
+# 5. Linker Flags (Critical for LTO)
+# Ensure the linker uses LTO to inline functions across Bank03 and Dispatcher
+target_link_options(dwa PRIVATE 
+    -flto
+    -Wl,--gc-sections
+)
 
-# 6. Locate NDK libraries
+# 6. System Libraries
 find_library(log-lib log)
 find_library(graphics-lib jnigraphics)
 
-# 7. Link all required libraries
-# 'atomic' is required for some C++17 features on older Android NDKs
+# 7. Final Linkage
 target_link_libraries(dwa 
     ${log-lib} 
     ${graphics-lib}
