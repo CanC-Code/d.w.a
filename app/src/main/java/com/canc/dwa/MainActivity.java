@@ -1,301 +1,258 @@
-package com.canc.dwa;
+#include <jni.h>
+#include <string>
+#include <vector>
+#include <fstream>
+#include <android/log.h>
+#include <android/bitmap.h>
+#include <thread>
+#include <chrono>
+#include <mutex>
+#include <cstring>
+#include "MapperMMC1.h"
 
-import android.annotation.SuppressLint;
-import android.app.Activity;
-import android.content.Context;
-import android.content.Intent;
-import android.content.SharedPreferences;
-import android.content.pm.ActivityInfo;
-import android.content.res.Configuration;
-import android.graphics.Bitmap;
-import android.graphics.Canvas;
-import android.graphics.Rect;
-import android.net.Uri;
-import android.os.Bundle;
-import android.util.Log;
-import android.view.Choreographer;
-import android.view.MotionEvent;
-import android.view.SurfaceHolder;
-import android.view.SurfaceView;
-import android.view.View;
-import android.widget.Toast;
-import androidx.annotation.NonNull;
-import androidx.appcompat.app.AlertDialog;
-import androidx.appcompat.app.AppCompatActivity;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.InputStream;
+#define LOG_TAG "DWA_NATIVE"
 
-public class MainActivity extends AppCompatActivity implements SurfaceHolder.Callback, Choreographer.FrameCallback {
+// --- Global Hardware State ---
+uint8_t cpu_ram[0x0800] = {0};
+uint8_t ppu_vram[2048] = {0};
+uint8_t palette_ram[32] = {0};
+uint8_t oam_ram[256] = {0}; 
+uint32_t screen_buffer[256 * 240] = {0};
+uint8_t controller_state = 0;
+uint8_t controller_shift = 0;
+uint8_t ppu_data_buffer = 0;
+std::mutex buffer_mutex;
+MapperMMC1 mapper;
 
-    static { System.loadLibrary("dwa"); }
+// --- Shared 6502 CPU State ---
+extern "C" {
+    uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
+    uint8_t bus_read(uint16_t addr);
+    void bus_write(uint16_t addr, uint8_t val);
 
-    private static final int PICK_ROM_REQUEST = 1;
-    private static final String PREFS_NAME = "ControllerPrefs";
-    private static final float SNAP_GRID_SIZE = 20f; // Pixels for alignment snapping
+    void push_stack(uint8_t val) { cpu_ram[0x0100 | reg_S] = val; reg_S--; }
+    uint8_t pop_stack() { reg_S++; return cpu_ram[0x0100 | reg_S]; }
 
-    private View gameContainer, setupContainer, menuOverlay;
-    private SurfaceView gameSurface;
-    private Bitmap screenBitmap;
-    private boolean isEngineRunning = false;
-    private boolean isSurfaceReady = false; 
-    private boolean isEditMode = false;
-    private final Rect destRect = new Rect();
+    void update_nz(uint8_t val) { 
+        reg_P &= ~0x82; 
+        if (val == 0) reg_P |= 0x02;
+        if (val & 0x80) reg_P |= 0x80;
+    }
 
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-        setContentView(R.layout.activity_main);
+    void update_flags_cmp(uint8_t reg, uint8_t val) {
+        reg_P &= ~0x83; 
+        if (reg >= val) reg_P |= 0x01; 
+        if (reg == val) reg_P |= 0x02; 
+        if ((uint8_t)(reg - val) & 0x80) reg_P |= 0x80; 
+    }
 
-        setupContainer = findViewById(R.id.setup_layout);
-        gameContainer = findViewById(R.id.game_layout);
-        gameSurface = findViewById(R.id.game_surface);
-        menuOverlay = findViewById(R.id.menu_overlay);
+    void cpu_adc(uint8_t val) {
+        uint16_t carry = (reg_P & 0x01);
+        uint16_t sum = reg_A + val + carry;
+        if (~(reg_A ^ val) & (reg_A ^ sum) & 0x80) reg_P |= 0x40; else reg_P &= ~0x40;
+        if (sum > 0xFF) reg_P |= 0x01; else reg_P &= ~0x01;
+        reg_A = (uint8_t)sum;
+        update_nz(reg_A);
+    }
 
-        screenBitmap = Bitmap.createBitmap(256, 240, Bitmap.Config.ARGB_8888);
-        gameSurface.getHolder().addCallback(this);
+    void cpu_sbc(uint8_t val) { cpu_adc(~val); }
+    void cpu_bit(uint8_t val) {
+        reg_P &= ~0xC2; 
+        if ((val & reg_A) == 0) reg_P |= 0x02;
+        reg_P |= (val & 0xC0); 
+    }
 
-        findViewById(R.id.btn_select_rom).setOnClickListener(v -> openFilePicker());
+    uint16_t read_pointer(uint16_t addr) {
+        uint8_t lo = bus_read(addr);
+        uint8_t hi = bus_read((addr & 0xFF00) | ((addr + 1) & 0x00FF));
+        return (hi << 8) | lo;
+    }
+    uint16_t read_pointer_x(uint16_t addr) { return read_pointer((addr + reg_X) & 0xFF); }
 
-        if (isRomExtracted()) {
-            showGameLayout();
+    void power_on_reset();
+    void nmi_handler();
+}
+
+// --- PPU Hardware ---
+uint8_t ppu_status = 0, ppu_ctrl = 0, ppu_mask = 0, ppu_addr_latch = 0, oam_addr = 0;
+uint16_t ppu_addr_reg = 0;
+bool is_running = false;
+bool is_paused = false;
+
+uint32_t nes_palette[64] = {
+    0xFF666666, 0xFF002A88, 0xFF1412A7, 0xFF3B00A4, 0xFF5C007E, 0xFF6E0040, 0xFF6C0600, 0xFF561D00,
+    0xFF333500, 0xFF0B4800, 0xFF005200, 0xFF004F08, 0xFF00404D, 0xFF000000, 0xFF000000, 0xFF000000,
+    0xFFADADAD, 0xFF155FD9, 0xFF4240FF, 0xFF7527FE, 0xFFA01ACC, 0xFFB71E7B, 0xFFB53120, 0xFF994E00,
+    0xFF6B6D00, 0xFF388700, 0xFF0C9300, 0xFF008F32, 0xFF007C8D, 0xFF000000, 0xFF000000, 0xFF000000,
+    0xFFEFB0FF, 0xFF64B0FF, 0xFF9290FF, 0xFFC676FF, 0xFFF36AFF, 0xFFFE6ECC, 0xFFFE8170, 0xFFEA9E22,
+    0xFFBCBE00, 0xFF88D100, 0xFF5CE430, 0xFF45E082, 0xFF48CDDE, 0xFF4F4F4F, 0xFF000000, 0xFF000000
+};
+
+// Internal helper for Palette Mirroring
+uint8_t read_palette(uint16_t addr) {
+    if (addr >= 0x10 && (addr % 4 == 0)) addr -= 0x10; // Mirror sprite transparent to BG
+    return palette_ram[addr & 0x1F];
+}
+
+extern "C" uint8_t bus_read(uint16_t addr) {
+    if (addr < 0x2000) return cpu_ram[addr % 0x0800];
+    if (addr >= 0x2000 && addr <= 0x3FFF) {
+        uint16_t reg = addr % 8;
+        if (reg == 2) { uint8_t s = ppu_status; ppu_status &= ~0x80; ppu_addr_latch = 0; return s; }
+        if (reg == 7) {
+            uint8_t data = ppu_data_buffer;
+            uint16_t p_addr = ppu_addr_reg & 0x3FFF;
+            if (p_addr < 0x3F00) ppu_data_buffer = (p_addr >= 0x2000) ? ppu_vram[p_addr % 2048] : mapper.read_chr(p_addr);
+            else { data = read_palette(p_addr & 0x1F); ppu_data_buffer = ppu_vram[p_addr % 2048]; }
+            ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
+            ppu_addr_reg &= 0x3FFF;
+            return data;
         }
     }
+    if (addr >= 0x6000) return mapper.read_prg(addr); 
+    if (addr == 0x4016) { uint8_t ret = (controller_shift & 0x80) >> 7; controller_shift <<= 1; return ret; }
+    return 0;
+}
 
-    // --- Menu and Orientation Logic ---
-
-    @Override
-    public void onBackPressed() {
-        if (isEditMode) {
-            exitEditMode();
-        } else if (gameContainer != null && gameContainer.getVisibility() == View.VISIBLE) {
-            showSettingsMenu();
-        } else {
-            super.onBackPressed();
+extern "C" void bus_write(uint16_t addr, uint8_t val) {
+    if (addr < 0x2000) cpu_ram[addr % 0x0800] = val;
+    else if (addr >= 0x2000 && addr <= 0x3FFF) {
+        uint16_t reg = addr % 8;
+        if (reg == 0) ppu_ctrl = val;
+        else if (reg == 1) ppu_mask = val;
+        else if (reg == 3) oam_addr = val;
+        else if (reg == 4) oam_ram[oam_addr++] = val;
+        else if (reg == 6) {
+            if (ppu_addr_latch == 0) { ppu_addr_reg = (ppu_addr_reg & 0x00FF) | ((val & 0x3F) << 8); ppu_addr_latch = 1; }
+            else { ppu_addr_reg = (ppu_addr_reg & 0xFF00) | val; ppu_addr_latch = 0; }
+        }
+        else if (reg == 7) {
+            uint16_t p_addr = ppu_addr_reg & 0x3FFF;
+            if (p_addr >= 0x2000 && p_addr < 0x3F00) ppu_vram[p_addr % 2048] = val;
+            else if (p_addr >= 0x3F00) {
+                uint8_t p_idx = p_addr & 0x1F;
+                if (p_idx >= 0x10 && (p_idx % 4 == 0)) p_idx -= 0x10;
+                palette_ram[p_idx] = val;
+            }
+            ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
+            ppu_addr_reg &= 0x3FFF;
         }
     }
-
-    private void showSettingsMenu() {
-        nativePauseEngine();
-        if (menuOverlay != null) menuOverlay.setVisibility(View.VISIBLE);
-
-        String[] options = {"Toggle Orientation", "Move & Align Buttons", "Reset Layout", "Resume"};
-        new AlertDialog.Builder(this)
-                .setTitle("Emulator Settings")
-                .setItems(options, (dialog, which) -> {
-                    switch (which) {
-                        case 0: toggleOrientation(); break;
-                        case 1: enterEditMode(); break;
-                        case 2: resetPositions(); break;
-                        case 3: resumeGame(); break;
-                    }
-                })
-                .setOnCancelListener(dialog -> resumeGame())
-                .show();
+    else if (addr == 0x4014) { 
+        uint16_t base = val << 8;
+        for (int i = 0; i < 256; i++) oam_ram[i] = bus_read(base + i);
     }
+    else if (addr == 0x4016) { if ((val & 0x01) == 0) controller_shift = controller_state; }
+    else if (addr >= 0x6000 && addr <= 0x7FFF) mapper.write_prg_ram(addr, val);
+    else if (addr >= 0x8000) mapper.write(addr, val);
+}
 
-    private void toggleOrientation() {
-        int current = getResources().getConfiguration().orientation;
-        if (current == Configuration.ORIENTATION_LANDSCAPE) {
-            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
-        } else {
-            setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
-        }
-        resumeGame();
-    }
+void draw_frame() {
+    std::lock_guard<std::mutex> lock(buffer_mutex);
+    uint16_t nt_base = (ppu_ctrl & 0x03) * 1024;
+    uint16_t bg_pat_base = (ppu_ctrl & 0x10) ? 0x1000 : 0x0000;
+    uint16_t spr_pat_base = (ppu_ctrl & 0x08) ? 0x1000 : 0x0000;
 
-    private void resumeGame() {
-        if (menuOverlay != null) menuOverlay.setVisibility(View.GONE);
-        nativeResumeEngine();
-    }
-
-    // --- Draggable Button Logic ---
-
-    private void enterEditMode() {
-        isEditMode = true;
-        if (menuOverlay != null) menuOverlay.setVisibility(View.GONE);
-        Toast.makeText(this, "Drag buttons to move. Back to save.", Toast.LENGTH_LONG).show();
-        setupTouchControls(); 
-    }
-
-    private void exitEditMode() {
-        isEditMode = false;
-        Toast.makeText(this, "Layout Saved", Toast.LENGTH_SHORT).show();
-        setupTouchControls(); 
-        resumeGame();
-    }
-
-    private void savePosition(String key, float x, float y) {
-        SharedPreferences.Editor editor = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit();
-        editor.putFloat(key + "_x", x);
-        editor.putFloat(key + "_y", y);
-        editor.apply();
-    }
-
-    private void loadPosition(View v, String key) {
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-        float x = prefs.getFloat(key + "_x", -1);
-        float y = prefs.getFloat(key + "_y", -1);
-        if (x != -1 && y != -1) {
-            v.setX(x);
-            v.setY(y);
-        }
-    }
-
-    private void resetPositions() {
-        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().clear().apply();
-        recreate(); 
-    }
-
-    // --- Engine & Surface Core ---
-
-    @Override
-    public void doFrame(long frameTimeNanos) {
-        if (!isEngineRunning || !isSurfaceReady) return;
-
-        nativeUpdateSurface(screenBitmap);
-
-        SurfaceHolder holder = gameSurface.getHolder();
-        Canvas canvas = holder.lockCanvas();
-        if (canvas != null) {
-            try {
-                float scale = Math.min((float)gameSurface.getWidth() / 256, (float)gameSurface.getHeight() / 240);
-                int w = (int)(256 * scale);
-                int h = (int)(240 * scale);
-                int left = (gameSurface.getWidth() - w) / 2;
-                int top = (gameSurface.getHeight() - h) / 2;
-
-                destRect.set(left, top, left + w, top + h);
-                canvas.drawColor(0xFF000000); 
-                canvas.drawBitmap(screenBitmap, null, destRect, null);
-            } finally {
-                holder.unlockCanvasAndPost(canvas);
+    for (int ty = 0; ty < 30; ty++) {
+        for (int tx = 0; tx < 32; tx++) {
+            uint8_t tile = ppu_vram[(nt_base + ty * 32 + tx) % 2048];
+            for (int y = 0; y < 8; y++) {
+                uint8_t p1 = mapper.read_chr(bg_pat_base + tile * 16 + y);
+                uint8_t p2 = mapper.read_chr(bg_pat_base + tile * 16 + y + 8);
+                for (int x = 0; x < 8; x++) {
+                    uint8_t pix = ((p1 >> (7 - x)) & 0x01) | (((p2 >> (7 - x)) & 0x01) << 1);
+                    uint32_t color = (pix != 0) ? nes_palette[read_palette(pix) & 0x3F] : nes_palette[read_palette(0) & 0x3F];
+                    screen_buffer[(ty * 8 + y) * 256 + (tx * 8 + x)] = color;
+                }
             }
         }
-        Choreographer.getInstance().postFrameCallback(this);
     }
-
-    @SuppressLint("ClickableViewAccessibility")
-    private void setupTouchControls() {
-        bindButton(R.id.btn_up,    0x08, "up"); 
-        bindButton(R.id.btn_down,  0x04, "down");
-        bindButton(R.id.btn_left,  0x02, "left"); 
-        bindButton(R.id.btn_right, 0x01, "right");
-        bindButton(R.id.btn_a,     0x80, "a"); 
-        bindButton(R.id.btn_b,     0x40, "b");
-        bindButton(R.id.btn_start, 0x10, "start"); 
-        bindButton(R.id.btn_select,0x20, "select");
-    }
-
-    @SuppressLint("ClickableViewAccessibility")
-    private void bindButton(int resId, int bitmask, String prefKey) {
-        View v = findViewById(resId);
-        if (v == null) return;
-
-        loadPosition(v, prefKey);
-
-        v.setOnTouchListener((v1, event) -> {
-            if (isEditMode) {
-                if (event.getAction() == MotionEvent.ACTION_MOVE) {
-                    // Raw movement
-                    float newX = event.getRawX() - (v1.getWidth() / 2f);
-                    float newY = event.getRawY() - (v1.getHeight() / 2f);
-                    
-                    // Snap to grid for alignment
-                    v1.setX(Math.round(newX / SNAP_GRID_SIZE) * SNAP_GRID_SIZE);
-                    v1.setY(Math.round(newY / SNAP_GRID_SIZE) * SNAP_GRID_SIZE);
-                    
-                    savePosition(prefKey, v1.getX(), v1.getY());
+    for (int i = 63; i >= 0; i--) {
+        uint8_t y = oam_ram[i * 4] + 1; uint8_t tile = oam_ram[i * 4 + 1]; uint8_t x = oam_ram[i * 4 + 3];
+        if (y >= 240 || y == 0) continue;
+        for (int sy = 0; sy < 8; sy++) {
+            uint8_t p1 = mapper.read_chr(spr_pat_base + tile * 16 + sy);
+            uint8_t p2 = mapper.read_chr(spr_pat_base + tile * 16 + sy + 8);
+            for (int sx = 0; sx < 8; sx++) {
+                uint8_t pix = ((p1 >> (7 - sx)) & 0x01) | (((p2 >> (7 - sx)) & 0x01) << 1);
+                if (pix != 0 && (x + sx) < 256 && (y + sy) < 240) {
+                    screen_buffer[(y + sy) * 256 + (x + sx)] = nes_palette[read_palette(0x10 + pix) & 0x3F];
                 }
-                return true;
-            } else {
-                int action = event.getAction();
-                if (action == MotionEvent.ACTION_DOWN) {
-                    injectInput(bitmask, true);
-                    v1.setPressed(true);
-                } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
-                    injectInput(bitmask, false);
-                    v1.setPressed(false);
-                }
-                return true;
             }
-        });
-    }
-
-    private void showGameLayout() {
-        if (setupContainer != null) setupContainer.setVisibility(View.GONE);
-        if (gameContainer != null) gameContainer.setVisibility(View.VISIBLE);
-        setupTouchControls();
-    }
-
-    private void startNativeEngine() {
-        if (isEngineRunning) return; 
-        showGameLayout();
-        String filesPath = getFilesDir().getAbsolutePath();
-        nativeInitEngine(filesPath);
-        isEngineRunning = true;
-        if (isSurfaceReady) Choreographer.getInstance().postFrameCallback(this);
-    }
-
-    private boolean isRomExtracted() {
-        File chrFile = new File(getFilesDir(), "chr_rom.bin");
-        File prgFile = new File(getFilesDir(), "prg_bank_0.bin");
-        return chrFile.exists() && prgFile.exists() && chrFile.length() > 0;
-    }
-
-    private void openFilePicker() {
-        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("*/*"); 
-        startActivityForResult(intent, PICK_ROM_REQUEST);
-    }
-
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == PICK_ROM_REQUEST && resultCode == Activity.RESULT_OK && data != null) {
-            Uri uri = data.getData();
-            if (uri != null) copyAndExtract(uri);
         }
     }
+}
 
-    private void copyAndExtract(Uri uri) {
-        try {
-            InputStream is = getContentResolver().openInputStream(uri);
-            if (is == null) return;
-            File internalRom = new File(getFilesDir(), "base.nes");
-            FileOutputStream os = new FileOutputStream(internalRom);
-            byte[] buffer = new byte[16384];
-            int length;
-            while ((length = is.read(buffer)) > 0) os.write(buffer, 0, length);
-            os.close(); is.close();
-            String outPath = getFilesDir().getAbsolutePath();
-            String result = nativeExtractRom(internalRom.getAbsolutePath(), outPath);
-            if ("Success".equals(result)) startNativeEngine();
-            else Toast.makeText(this, "Extraction failed: " + result, Toast.LENGTH_LONG).show();
-        } catch (Exception e) {
-            Log.e("DWA", "File error", e);
+void engine_loop() {
+    power_on_reset();
+    while (is_running) {
+        if (is_paused) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
         }
+
+        auto start = std::chrono::steady_clock::now();
+        
+        // PPU Sync: Frame starts, clear VBlank
+        ppu_status &= ~0x80; 
+
+        // Dragon Warrior expects the VBlank flag to cycle.
+        // We simulate the 'visible' portion of the frame (approx 14ms)
+        std::this_thread::sleep_for(std::chrono::microseconds(14500));
+
+        // Enter VBlank
+        ppu_status |= 0x80; 
+        if (ppu_ctrl & 0x80) nmi_handler();
+
+        draw_frame();
+
+        // 60FPS Lock
+        std::this_thread::sleep_until(start + std::chrono::milliseconds(16));
     }
+}
 
-    @Override 
-    public void surfaceCreated(@NonNull SurfaceHolder h) {
-        isSurfaceReady = true;
-        if (isRomExtracted()) {
-            startNativeEngine();
-            Choreographer.getInstance().removeFrameCallback(this);
-            Choreographer.getInstance().postFrameCallback(this);
-        }
+// --- JNI Bridge ---
+
+extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativePauseEngine(JNIEnv* env, jobject thiz) { is_paused = true; }
+extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeResumeEngine(JNIEnv* env, jobject thiz) { is_paused = false; }
+
+extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv* env, jobject thiz, jstring filesDir) {
+    if (is_running) return;
+    const char* cPath = env->GetStringUTFChars(filesDir, 0); std::string pathStr(cPath);
+    mapper.reset();
+    for(int i = 0; i < 4; i++) {
+        std::ifstream in(pathStr + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
+        if (in) in.read((char*)mapper.prg_rom[i], 16384);
     }
+    std::ifstream c_in(pathStr + "/chr_rom.bin", std::ios::binary); 
+    if (c_in) c_in.read((char*)mapper.chr_rom, 16384);
+    is_running = true; is_paused = false;
+    std::thread(engine_loop).detach();
+    env->ReleaseStringUTFChars(filesDir, cPath);
+}
 
-    @Override public void surfaceChanged(@NonNull SurfaceHolder h, int f, int w, int h1) {}
-    @Override public void surfaceDestroyed(@NonNull SurfaceHolder h) { isSurfaceReady = false; }
+extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv* env, jobject thiz, jobject bitmap) {
+    if (is_paused) return;
+    void* pixels; if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
+    { std::lock_guard<std::mutex> lock(buffer_mutex); memcpy(pixels, screen_buffer, 256 * 240 * 4); }
+    AndroidBitmap_unlockPixels(env, bitmap);
+}
 
-    // --- Native Methods ---
-    public native String nativeExtractRom(String romPath, String outDir);
-    public native void nativeInitEngine(String filesDir);
-    public native void nativeUpdateSurface(Bitmap bitmap);
-    public native void injectInput(int buttonBit, boolean isPressed);
-    public native void nativePauseEngine();
-    public native void nativeResumeEngine();
+extern "C" JNIEXPORT jstring JNICALL Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstring romPath, jstring outDir) {
+    const char* cPath = env->GetStringUTFChars(romPath, 0); const char* cOut = env->GetStringUTFChars(outDir, 0);
+    std::ifstream nes(cPath, std::ios::binary); if (!nes) return env->NewStringUTF("File Error");
+    nes.seekg(16);
+    for (int i = 0; i < 4; i++) {
+        std::vector<char> buf(16384); nes.read(buf.data(), 16384);
+        std::ofstream out(std::string(cOut) + "/prg_bank_" + std::to_string(i) + ".bin", std::ios::binary);
+        out.write(buf.data(), 16384);
+    }
+    std::vector<char> chr(16384); nes.read(chr.data(), 16384);
+    std::ofstream c_out(std::string(cOut) + "/chr_rom.bin", std::ios::binary); c_out.write(chr.data(), 16384);
+    env->ReleaseStringUTFChars(romPath, cPath); env->ReleaseStringUTFChars(outDir, cOut);
+    return env->NewStringUTF("Success");
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_injectInput(JNIEnv* env, jobject thiz, jint bit, jboolean pressed) {
+    if (pressed) controller_state |= bit; else controller_state &= ~bit;
 }
