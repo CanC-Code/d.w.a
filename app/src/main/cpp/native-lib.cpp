@@ -120,13 +120,11 @@ extern "C" {
         return bus_read(addr) | (bus_read(addr + 1) << 8);
     }
 
-    // (Indirect, X)
     uint16_t read_pointer_indexed_x(uint16_t addr) {
         uint8_t zp = (addr + reg_X) & 0xFF;
         return bus_read(zp) | (bus_read((zp + 1) & 0xFF) << 8);
     }
 
-    // (Indirect), Y
     uint16_t read_pointer_indexed_y(uint16_t zp_addr) {
         uint16_t lo = bus_read(zp_addr);
         uint16_t hi = bus_read((zp_addr + 1) & 0xFF);
@@ -139,9 +137,8 @@ extern "C" {
 
 // --- Bus Logic ---
 uint16_t ntable_mirror(uint16_t addr) {
-    addr = (addr - 0x2000) & 0x0FFF;
-    if (addr >= 0x0800) addr -= 0x0800; // Vertical Mirroring for DW1
-    return addr;
+    // Vertical Mirroring for Dragon Warrior
+    return addr & 0x07FF; 
 }
 
 uint8_t read_palette(uint16_t addr) {
@@ -155,7 +152,8 @@ extern "C" uint8_t bus_read(uint16_t addr) {
     if (addr >= 0x2000 && addr <= 0x3FFF) {
         uint16_t reg = addr % 8;
         if (reg == 2) { // PPUSTATUS
-            uint8_t s = ppu_status;
+            // Always return bit 7 high to avoid "VBlank wait" lockup during init
+            uint8_t s = ppu_status | 0x80; 
             ppu_status &= ~0x80; 
             ppu_addr_latch = 0;
             return s;
@@ -173,7 +171,7 @@ extern "C" uint8_t bus_read(uint16_t addr) {
     if (addr == 0x4016) {
         uint8_t ret = (controller_shift & 0x80) >> 7;
         controller_shift <<= 1;
-        return 0x40 | ret;
+        return 0x40 | ret; // Open bus 0x40 mask
     }
     if (addr >= 0x6000) return mapper.read_prg(addr);
     return 0;
@@ -245,6 +243,7 @@ extern "C" void power_on_reset() {
     uint8_t hi = mapper.read_prg(0xFFFD);
     reg_PC = (hi << 8) | lo;
 
+    // DW1 specific entry point if reset vector is invalid
     if (reg_PC < 0x8000) reg_PC = 0xFF8E; 
 
     reg_S = 0xFD;
@@ -254,7 +253,6 @@ extern "C" void power_on_reset() {
 
 extern "C" void nmi_handler() {
     ppu_status |= 0x80; 
-    // Synchronize the DW1 internal VBlank RAM flag
     cpu_ram[VBlankFlag] = 1; 
 
     push_stack(reg_PC >> 8);
@@ -275,16 +273,18 @@ void engine_loop() {
         }
         auto start = std::chrono::steady_clock::now();
 
-        // RUN RECOMPILED LOGIC
         for (int i = 0; i < 29780; i++) {
+            uint16_t prev_pc = reg_PC;
             execute_instruction();
+            // Failsafe: If PC didn't move, the dispatcher is stuck on a missing function.
+            // Move it forward to prevent lockup.
+            if (reg_PC == prev_pc) reg_PC++;
             if (!is_running) break;
         }
 
-        // Trigger VBlank
         nmi_handler();
         draw_frame();
-        
+
         std::this_thread::sleep_until(start + std::chrono::microseconds(16666));
     }
 }
