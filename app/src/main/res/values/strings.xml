@@ -1,3 +1,16 @@
 <resources>
     <string name="app_name">Dragon Warrior Native</string>
+    
+    <string name="setup_title">DRAGON WARRIOR NATIVE</string>
+    <string name="btn_select_rom">Select ROM</string>
+    <string name="status_extracting">Extracting PRG/CHR Banks...</string>
+    
+    <string name="desc_up">D-Pad Up</string>
+    <string name="desc_down">D-Pad Down</string>
+    <string name="desc_left">D-Pad Left</string>
+    <string name="desc_right">D-Pad Right</string>
+    <string name="desc_a">A Button</string>
+    <string name="desc_b">B Button</string>
+    <string name="desc_start">Start</string>
+    <string name="desc_select">Select</string>
 </resources>
