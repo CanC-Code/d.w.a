@@ -229,8 +229,8 @@ extern "C" void power_on_reset() {
     uint8_t hi = bus_read(0xFFFD);
     reg_PC = (hi << 8) | lo;
     
-    // Failsafe if ROM isn't loaded correctly yet
-    if (reg_PC == 0) reg_PC = 0xCF25; 
+    // Failsafe for Dragon Warrior 1 start address if vector is missing
+    if (reg_PC == 0) reg_PC = 0xFF8E; 
     
     reg_S = 0xFD;
     reg_P = 0x24;
@@ -254,7 +254,7 @@ void engine_loop() {
             continue;
         }
         auto start = std::chrono::steady_clock::now();
-        // Execute a fixed number of instructions per frame
+        // approx 29780 cycles per frame
         for (int i = 0; i < 20000; i++) {
             execute_instruction();
             if (!is_running) break;
@@ -266,45 +266,73 @@ void engine_loop() {
 }
 
 // --- JNI Lifecycle ---
-// Package changed to com_canc_dwa to match your actual structure
 
-extern "C" JNIEXPORT void JNICALL
-Java_com_canc_dwa_MainActivity_loadROM(JNIEnv *env, jobject thiz, jbyteArray rom_data) {
-    jbyte* bytes = env->GetByteArrayElements(rom_data, nullptr);
-    jsize len = env->GetArrayLength(rom_data);
 
-    if (len >= (16 + 65536)) {
-        for (int i = 0; i < 4; i++) {
-            memcpy(mapper.prg_rom[i], &bytes[16 + (i * 16384)], 16384);
-        }
-        LOG_CPU("ROM Loaded successfully.");
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstring romPath, jstring outDir) {
+    const char *path = env->GetStringUTFChars(romPath, nullptr);
+    
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        env->ReleaseStringUTFChars(romPath, path);
+        return env->NewStringUTF("Error: Could not open file");
     }
 
-    if (len >= (16 + 65536 + 8192)) {
-        for (int i = 0; i < 2; i++) {
-            memcpy(mapper.chr_rom[i], &bytes[16 + 65536 + (i * 4096)], 4096);
-        }
+    // Skip 16-byte iNES Header
+    file.seekg(16, std::ios::beg);
+
+    // Read 64KB PRG-ROM (4 banks of 16KB)
+    for (int i = 0; i < 4; i++) {
+        file.read((char*)mapper.prg_rom[i], 16384);
     }
 
-    env->ReleaseByteArrayElements(rom_data, bytes, JNI_ABORT);
+    // Read 8KB CHR-ROM (2 banks of 4KB)
+    for (int i = 0; i < 2; i++) {
+        file.read((char*)mapper.chr_rom[i], 4096);
+    }
+
+    file.close();
+    env->ReleaseStringUTFChars(romPath, path);
+    
+    LOG_CPU("ROM Extracted and Mapped.");
+    return env->NewStringUTF("Success");
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_canc_dwa_MainActivity_startEngine(JNIEnv *env, jobject thiz) {
+Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv *env, jobject thiz, jstring filesDir) {
     if (!is_running) {
         std::thread(engine_loop).detach();
     }
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_canc_dwa_MainActivity_updateSurface(JNIEnv *env, jobject thiz, jobject bitmap) {
+Java_com_canc_dwa_MainActivity_injectInput(JNIEnv *env, jobject thiz, jint buttonBit, jboolean isPressed) {
+    if (isPressed) controller_state |= (uint8_t)buttonBit;
+    else controller_state &= ~((uint8_t)buttonBit);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_nativePauseEngine(JNIEnv *env, jobject thiz) {
+    is_paused = true;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_nativeResumeEngine(JNIEnv *env, jobject thiz) {
+    is_paused = false;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv *env, jobject thiz, jobject bitmap) {
     AndroidBitmapInfo info;
     void* pixels;
     if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) return;
     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
 
-    std::lock_guard<std::mutex> lock(buffer_mutex);
-    memcpy(pixels, screen_buffer, 256 * 240 * 4);
+    {
+        std::lock_guard<std::mutex> lock(buffer_mutex);
+        memcpy(pixels, screen_buffer, 256 * 240 * 4);
+    }
 
     AndroidBitmap_unlockPixels(env, bitmap);
 }
