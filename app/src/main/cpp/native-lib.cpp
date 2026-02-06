@@ -14,7 +14,14 @@
 
 #define LOG_TAG "DWA_NATIVE"
 
-namespace Dispatcher { void execute(); }
+// Constants for shared RAM locations in Dragon Warrior
+#define VBlankFlag   0x002D
+#define FrameCounter 0x003C
+
+namespace Dispatcher { 
+    void execute(); 
+    void request_nmi(); 
+}
 
 // --- Hardware State ---
 uint8_t cpu_ram[0x0800] = {0};
@@ -37,6 +44,7 @@ uint32_t nes_palette[64] = {
     0xFFBCBE00, 0xFF88D100, 0xFF5CE430, 0xFF45E082, 0xFF48CDDE, 0xFF4F4F4F, 0xFF000000, 0xFF000000
 };
 
+// --- CPU Global State ---
 extern "C" {
     uint16_t reg_PC = 0;
     uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
@@ -144,63 +152,79 @@ extern "C" {
     uint8_t pop_stack() { reg_S++; return cpu_ram[0x0100 | (reg_S & 0xFF)]; }
 }
 
+// --- Interrupt Handling ---
 void nmi_handler() {
+    // 1. Update Game Engine RAM variables to signal VBlank has occurred
     cpu_ram[VBlankFlag] = 1; 
     cpu_ram[FrameCounter]++;
-    push_stack(reg_PC >> 8); 
-    push_stack(reg_PC & 0xFF); 
-    push_stack(reg_P);
-    uint16_t vector = bus_read(0xFFFA) | (bus_read(0xFFFB) << 8);
-    reg_PC = vector;
+
+    // 2. Request the Dispatcher to jump to the NMI vector on the next cycle
+    Dispatcher::request_nmi();
 }
 
+// --- Main Engine Loop ---
 void engine_loop() {
     memset(cpu_ram, 0, sizeof(cpu_ram));
     mapper.reset();
     ppu.reset();
 
-    // Start at the Hardware Reset Label we found in Bank03.asm
+    // Reset CPU State
+    reg_A = 0; reg_X = 0; reg_Y = 0;
+    reg_S = 0xFD; reg_P = 0x24;
+    
+    // Jump to Hardware Reset Vector found in Bank03.asm
     reg_PC = 0xFFD8; 
 
     is_running = true;
     while (is_running) {
         if (is_paused) { std::this_thread::sleep_for(std::chrono::milliseconds(16)); continue; }
+        
         auto frame_start = std::chrono::steady_clock::now();
 
-        // INTERLEAVED EXECUTION: Split the frame to allow PPU Status updates
+        // EXECUTION: 29780 cycles per frame
+        // Interleaved to allow PPU Status bit to be seen by boot-up loops
         for (int step = 0; step < 2; step++) {
             for (int i = 0; i < 14890; i++) {
                 uint16_t prev_pc = reg_PC;
                 execute_instruction();
+                // Failsafe: If no case matches, move forward to prevent deadlock
                 if (reg_PC == prev_pc) reg_PC++; 
             }
-            // Toggle VBlank bit halfway through so the boot loop can "see" it
-            if (step == 0) ppu.status |= 0x80; 
+            if (step == 0) ppu.status |= 0x80; // Set VBlank bit mid-frame
         }
 
+        // Trigger NMI if PPU Control register has bit 7 set
         if (ppu.ctrl & 0x80) nmi_handler();
-        ppu.status &= ~0x80; // Clear for next frame
+        
+        // Final frame status clearing
+        ppu.status &= ~0x80;
 
+        // Render to Screen Buffer
         {
             std::lock_guard<std::mutex> lock(buffer_mutex);
             ppu.render_frame(mapper, nes_palette);
         }
+
+        // Sync to ~60FPS
         std::this_thread::sleep_until(frame_start + std::chrono::microseconds(16666));
     }
 }
 
-// JNI Methods
+// --- JNI Interface ---
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstring romPath, jstring outDir) {
     const char *path = env->GetStringUTFChars(romPath, nullptr);
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {
         env->ReleaseStringUTFChars(romPath, path);
-        return env->NewStringUTF("Error: Open failed");
+        return env->NewStringUTF("Error: Could not open ROM");
     }
-    file.seekg(16, std::ios::beg);
+
+    file.seekg(16, std::ios::beg); // Skip Header
     for (int i = 0; i < 4; i++) file.read((char*)mapper.prg_rom[i], 16384);
     for (int i = 0; i < 2; i++) file.read((char*)mapper.chr_rom[i], 4096);
+
     file.close();
     env->ReleaseStringUTFChars(romPath, path);
     return env->NewStringUTF("Success");
@@ -208,7 +232,9 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstri
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv *env, jobject thiz, jstring filesDir) {
-    if (!is_running) std::thread(engine_loop).detach();
+    if (!is_running) {
+        std::thread(engine_loop).detach();
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -222,9 +248,13 @@ Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv *env, jobject thiz, jo
     AndroidBitmap_unlockPixels(env, bitmap);
 }
 
-extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_injectInput(JNIEnv *env, jobject thiz, jint bit, jboolean p) {
+extern "C" JNIEXPORT void JNICALL 
+Java_com_canc_dwa_MainActivity_injectInput(JNIEnv *env, jobject thiz, jint bit, jboolean p) {
     if (p) controller_state |= (uint8_t)bit; else controller_state &= ~((uint8_t)bit);
 }
 
-extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativePauseEngine(JNIEnv *env, jobject thiz) { is_paused = true; }
-extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeResumeEngine(JNIEnv *env, jobject thiz) { is_paused = false; }
+extern "C" JNIEXPORT void JNICALL 
+Java_com_canc_dwa_MainActivity_nativePauseEngine(JNIEnv *env, jobject thiz) { is_paused = true; }
+
+extern "C" JNIEXPORT void JNICALL 
+Java_com_canc_dwa_MainActivity_nativeResumeEngine(JNIEnv *env, jobject thiz) { is_paused = false; }
