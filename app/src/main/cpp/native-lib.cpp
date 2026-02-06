@@ -69,6 +69,7 @@ extern "C" {
     void cpu_adc(uint8_t val) {
         uint16_t carry = (reg_P & FLAG_C) ? 1 : 0;
         uint16_t sum = reg_A + val + carry;
+        // Overflow flag logic
         if (~(reg_A ^ val) & (reg_A ^ sum) & 0x80) reg_P |= FLAG_V; else reg_P &= ~FLAG_V;
         if (sum > 0xFF) reg_P |= FLAG_C; else reg_P &= ~FLAG_C;
         reg_A = (uint8_t)sum;
@@ -80,23 +81,22 @@ extern "C" {
     void cpu_bit(uint8_t val) {
         reg_P &= ~(FLAG_Z | FLAG_V | FLAG_N);
         if ((val & reg_A) == 0) reg_P |= FLAG_Z;
-        reg_P |= (val & 0xC0);
+        reg_P |= (val & 0xC0); // Bits 6 and 7 of memory are transferred to V and N
     }
 
+    // --- Shift Operations ---
     uint8_t cpu_asl(uint8_t val) {
         reg_P = (reg_P & ~FLAG_C) | ((val >> 7) & 0x01);
         uint8_t res = val << 1;
         update_nz(res);
         return res;
     }
-
     uint8_t cpu_lsr(uint8_t val) {
         reg_P = (reg_P & ~FLAG_C) | (val & 0x01);
         uint8_t res = val >> 1;
         update_nz(res);
         return res;
     }
-
     uint8_t cpu_rol(uint8_t val) {
         uint8_t old_c = (reg_P & FLAG_C) ? 1 : 0;
         reg_P = (reg_P & ~FLAG_C) | ((val >> 7) & 0x01);
@@ -104,7 +104,6 @@ extern "C" {
         update_nz(res);
         return res;
     }
-
     uint8_t cpu_ror(uint8_t val) {
         uint8_t old_c = (reg_P & FLAG_C) ? 1 : 0;
         reg_P = (reg_P & ~FLAG_C) | (val & 0x01);
@@ -113,6 +112,7 @@ extern "C" {
         return res;
     }
 
+    // --- Bus Access ---
     uint8_t bus_read(uint16_t addr) {
         if (addr < 0x2000) return cpu_ram[addr % 0x0800];
         if (addr >= 0x2000 && addr <= 0x3FFF) return ppu.cpu_read(addr, mapper);
@@ -121,6 +121,7 @@ extern "C" {
             controller_shift <<= 1;
             return 0x40 | r;
         }
+        // PRG-ROM Access via Mapper
         if (addr >= 0x6000) return mapper.read_prg(addr);
         return 0;
     }
@@ -128,7 +129,7 @@ extern "C" {
     void bus_write(uint16_t addr, uint8_t val) {
         if (addr < 0x2000) cpu_ram[addr % 0x0800] = val;
         else if (addr >= 0x2000 && addr <= 0x3FFF) ppu.cpu_write(addr, val, mapper);
-        else if (addr == 0x4014) { 
+        else if (addr == 0x4014) { // OAM DMA
             uint16_t b = val << 8;
             for(int i=0; i<256; i++) ppu.oam_ram[i] = bus_read(b + i);
         }
@@ -139,15 +140,18 @@ extern "C" {
         else if (addr >= 0x6000) mapper.write(addr, val);
     }
 
+    // --- Pointers & Stack ---
     uint16_t read_pointer(uint16_t addr) { return bus_read(addr) | (bus_read(addr + 1) << 8); }
+    
+    // Support for Zero-Page Wrap-around
     uint16_t read_pointer_indexed_x(uint16_t addr) {
-        uint8_t zp = (addr + reg_X) & 0xFF;
-        return bus_read(zp) | (bus_read((zp + 1) & 0xFF) << 8);
+        uint8_t zp = (uint8_t)(addr + reg_X);
+        return bus_read(zp) | (bus_read((uint8_t)(zp + 1)) << 8);
     }
     uint16_t read_pointer_indexed_y(uint16_t zp_addr) {
-        uint16_t lo = bus_read(zp_addr);
-        uint16_t hi = bus_read((zp_addr + 1) & 0xFF);
-        return (lo | (hi << 8)) + reg_Y;
+        uint16_t lo = bus_read((uint8_t)zp_addr);
+        uint16_t hi = bus_read((uint8_t)(zp_addr + 1));
+        return (uint16_t)((lo | (hi << 8)) + reg_Y);
     }
 
     void push_stack(uint8_t val) { cpu_ram[0x0100 | (reg_S & 0xFF)] = val; reg_S--; }
@@ -156,6 +160,7 @@ extern "C" {
 
 // --- Interrupt Handling ---
 void nmi_handler() {
+    // Dragon Warrior logic depends on these RAM flags to exit "WaitVblank" loops
     cpu_ram[DW_RAM_VBLANK_FLAG] = 1; 
     cpu_ram[DW_RAM_FRAME_COUNTER]++;
     Dispatcher::request_nmi();
@@ -171,8 +176,8 @@ void engine_loop() {
     // Reset CPU registers
     reg_A = 0; reg_X = 0; reg_Y = 0;
     reg_S = 0xFD; reg_P = 0x24;
-    
-    // FETCH ACTUAL RESET VECTOR
+
+    // Fetch Reset Vector from ROM
     uint8_t lo = bus_read(0xFFFC);
     uint8_t hi = bus_read(0xFFFD);
     reg_PC = (hi << 8) | lo;
@@ -183,27 +188,31 @@ void engine_loop() {
 
     while (is_running) {
         if (is_paused) { std::this_thread::sleep_for(std::chrono::milliseconds(16)); continue; }
-        
+
         auto frame_start = std::chrono::steady_clock::now();
 
-        // 29780 cycles per frame divided into slices for PPU status syncing
+        // 29780 cycles per frame divided into slices for better PPU/CPU sync
         for (int slice = 0; slice < 10; slice++) {
             for (int i = 0; i < 2978; i++) {
                 uint16_t prev_pc = reg_PC;
                 execute_instruction();
+                // Prevent hardware trap: if instruction didn't move PC, force it
                 if (reg_PC == prev_pc) reg_PC++; 
                 total_cycles++;
             }
-            // Trigger VBlank midway to satisfy initial boot-up wait loops
+            
+            // Periodically check if we should trigger VBlank mid-frame to satisfy boot checks
             if (slice == 5) ppu.status |= 0x80; 
-
-            // Periodic Heartbeat Logging (every ~100k instructions)
-            if (total_cycles % 101252 == 0) {
+            
+            if (total_cycles % 150000 == 0) {
                 LOGI("Heartbeat - PC: 0x%04X, A: %02X, SP: %02X, Flags: %02X", reg_PC, reg_A, reg_S, reg_P);
             }
         }
 
+        // Check for NMI request from PPU
         if (ppu.ctrl & 0x80) nmi_handler();
+        
+        // Finalize frame and clear VBlank for the next one
         ppu.status &= ~0x80;
 
         {
@@ -228,12 +237,14 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstri
         return env->NewStringUTF("Error: Could not open ROM");
     }
 
-    file.seekg(16, std::ios::beg); // Skip Header
+    // iNES Header skip
+    file.seekg(16, std::ios::beg);
+    // Load PRG/CHR Banks
     for (int i = 0; i < 4; i++) file.read((char*)mapper.prg_rom[i], 16384);
     for (int i = 0; i < 2; i++) file.read((char*)mapper.chr_rom[i], 4096);
 
     file.close();
-    LOGI("ROM Loaded: 64KB PRG, 8KB CHR mapped to MapperMMC1");
+    LOGI("ROM Loaded into MapperMMC1. Reset Vector is 0x%02X%02X", mapper.read_prg(0xFFFD), mapper.read_prg(0xFFFC));
     env->ReleaseStringUTFChars(romPath, path);
     return env->NewStringUTF("Success");
 }
