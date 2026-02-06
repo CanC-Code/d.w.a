@@ -48,6 +48,7 @@ uint32_t nes_palette[64] = {
 };
 
 // --- CPU Global State ---
+// All functions called by recompiled banks MUST be in this extern "C" block
 extern "C" {
     uint16_t reg_PC = 0;
     uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
@@ -84,8 +85,40 @@ extern "C" {
         reg_P |= (val & 0xC0);
     }
 
+    // Shift Operations - Fixed for Linker Visibility
+    uint8_t cpu_asl(uint8_t val) {
+        reg_P = (reg_P & ~0x01) | ((val >> 7) & 0x01);
+        uint8_t res = val << 1;
+        update_nz(res);
+        return res;
+    }
+
+    uint8_t cpu_lsr(uint8_t val) {
+        reg_P = (reg_P & ~0x01) | (val & 0x01);
+        uint8_t res = val >> 1;
+        update_nz(res);
+        return res;
+    }
+
+    uint8_t cpu_rol(uint8_t val) {
+        uint8_t old_c = (reg_P & 0x01);
+        reg_P = (reg_P & ~0x01) | ((val >> 7) & 0x01);
+        uint8_t res = (val << 1) | old_c;
+        update_nz(res);
+        return res;
+    }
+
+    uint8_t cpu_ror(uint8_t val) {
+        uint8_t old_c = (reg_P & 0x01);
+        reg_P = (reg_P & ~0x01) | (val & 0x01);
+        uint8_t res = (val >> 1) | (old_c << 7);
+        update_nz(res);
+        return res;
+    }
+
     // Bus Access
     uint8_t bus_read(uint16_t addr) {
+        if (addr < 0x0800) return cpu_ram[addr];
         if (addr < 0x2000) return cpu_ram[addr % 0x0800];
         if (addr < 0x4000) return ppu.cpu_read(addr, mapper);
         if (addr == 0x4016) {
@@ -127,12 +160,10 @@ extern "C" {
 
 // --- Interrupt Logic ---
 void trigger_nmi() {
-    // 6502 NMI: Push PC_high, PC_low, Status; Jump to Vector
     push_stack(reg_PC >> 8);
     push_stack(reg_PC & 0xFF);
     push_stack(reg_P);
     
-    // Dragon Warrior NMI logic
     cpu_ram[DW_RAM_VBLANK_FLAG] = 1;
     cpu_ram[DW_RAM_FRAME_COUNTER]++;
     
@@ -145,7 +176,6 @@ void engine_loop() {
     mapper.reset();
     ppu.reset();
 
-    // Booting the CPU
     reg_PC = read_pointer(0xFFFC);
     LOGI("CPU Booting at: 0x%04X", reg_PC);
 
@@ -155,15 +185,15 @@ void engine_loop() {
 
         auto frame_start = std::chrono::steady_clock::now();
 
-        // 1. CPU Execution Slice (Standard NES frame cycles)
+        // 1. CPU Execution Slice
         for (int i = 0; i < 29780; i++) {
             uint16_t last_pc = reg_PC;
             execute_instruction();
-            if (reg_PC == last_pc) reg_PC++; // Safeguard against infinite traps
+            if (reg_PC == last_pc) reg_PC++; 
         }
 
         // 2. VBlank Handshake
-        ppu.status |= 0x80; // Set VBlank flag in $2002
+        ppu.status |= 0x80; 
         if (ppu.ctrl & 0x80) trigger_nmi();
 
         // 3. Render and Swap
@@ -175,7 +205,6 @@ void engine_loop() {
         // 4. End of VBlank
         ppu.status &= ~0x80;
 
-        // Throttle to 60 FPS
         std::this_thread::sleep_until(frame_start + std::chrono::microseconds(16666));
     }
 }
@@ -188,7 +217,7 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstri
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) return env->NewStringUTF("Error: Could not open ROM");
 
-    file.seekg(16, std::ios::beg); // Skip iNES
+    file.seekg(16, std::ios::beg);
     for (int i = 0; i < 4; i++) file.read((char*)mapper.prg_rom[i], 16384);
     for (int i = 0; i < 2; i++) file.read((char*)mapper.chr_rom[i], 4096);
     file.close();
