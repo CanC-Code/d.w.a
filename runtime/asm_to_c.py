@@ -4,7 +4,7 @@ import re
 ASM_DIR = "source_files"
 OUT_DIR = "app/src/main/cpp/recompiled"
 
-# Global dictionary to store all .alias and label definitions across all files
+# Global dictionary to store all .alias and label definitions
 global_symbols = {}
 
 def pre_parse_symbols():
@@ -15,64 +15,64 @@ def pre_parse_symbols():
         try:
             with open(os.path.join(ASM_DIR, filename), 'r') as f:
                 for line in f:
+                    # Strip comments
                     clean = line.split(';')[0].strip()
-                    # Match .alias Name Value
-                    alias_match = re.match(r'^\.alias\s+(\w+)\s+\$?([0-9A-F]+)', clean)
+                    if not clean: continue
+
+                    # 1. Match .alias Name Value
+                    alias_match = re.match(r'^\.alias\s+(\w+)\s+\$?([0-9A-Fa-f]+)', clean)
                     if alias_match:
                         name, val = alias_match.groups()
                         global_symbols[name] = f"0x{val}"
 
-                    # Match LXXXX: labels
-                    label_match = re.match(r'^(L[0-9A-F]{4}):', clean)
+                    # 2. Match LXXXX: labels (Standard NES style)
+                    label_match = re.match(r'^(L[0-9A-Fa-f]{4}):', clean)
                     if label_match:
                         name = label_match.group(1)
-                        global_symbols[name] = name.replace('L', '0x')
+                        global_symbols[name] = f"0x{name[1:]}"
+
+                    # 3. Match named labels
+                    named_label = re.match(r'^(\w+):', clean)
+                    if named_label:
+                        name = named_label.group(1)
+                        # If it's not an L-address, we keep the name for the C++ linker/header
+                        if name not in global_symbols:
+                            global_symbols[name] = name
         except Exception as e:
             print(f"Error parsing {filename}: {e}")
 
 def get_ins_size(opcode, op):
+    """Determines instruction size (1, 2, or 3 bytes)."""
     if not op or op.strip() == "": return 1
-    if op.startswith('#'): return 2
-    if '(' in op: return 2 
+    if op.startswith('#'): return 2 # Immediate
+    if '(' in op: return 2          # Indirect (usually Zero Page in NES)
+
+    # If it contains a 3-4 digit hex, it's absolute (3 bytes)
+    if re.search(r'\$[0-9A-Fa-f]{3,4}', op): return 3
     
-    # Extract numeric part to judge size
-    val_match = re.search(r'\$?([0-9A-Fa-f]{3,4})', op)
-    if val_match: return 3
-    
-    # Check if symbol is known to be 16-bit
+    # Check resolved symbol value
     clean_op = op.strip().replace('$', '').split(',')[0].strip('()')
     if clean_op in global_symbols:
-        val = global_symbols[clean_op].replace('0x', '')
-        if len(val) > 2: return 3
-        
-    return 2 
+        val = str(global_symbols[clean_op])
+        if '0x' in val and len(val) > 4: return 3 # e.g., 0xC006
+
+    return 2 # Default to Zero Page/Relative
 
 def parse_addr(opcode, op):
+    """Converts ASM operand to C++ bus access."""
     op = op.strip()
     if not op: return "0"
 
-    # 1. Handle Binary Literals
-    if '% ' in op or op.startswith('%') or op.startswith('#%'):
-        bin_val = op.replace('#', '').replace('%', '').strip()
-        return str(int(bin_val, 2))
+    # Handle Immediate
+    if op.startswith('#'):
+        val = op.replace('#', '').replace('$', '0x').replace('%', '0b')
+        return val
 
-    # 2. Extract Core Symbol/Value
-    # core_match pulls the alphanumeric part or hex part
-    core_match = re.search(r'[\$]?([0-9A-Fa-f\w]+)', op)
-    if not core_match: return "0"
-    core = core_match.group(1)
-    
-    # 3. Resolve Symbol
-    if core in global_symbols:
-        resolved = global_symbols[core]
-    elif '$' in op:
-        # It's a raw hex literal from ASM, convert to C++ hex
-        resolved = f"0x{core}"
-    else:
-        # It's a label not yet found; keep as name for Defines.h to handle
-        resolved = core
+    # Resolve core symbol
+    core = re.search(r'[a-zA-Z0-9_]+', op.replace('$', '')).group(0)
+    resolved = global_symbols.get(core, f"0x{core}" if core.isalnum() else core)
 
-    # 4. Handle Addressing Modes
+    # Addressing Mode Translation
     if '(' in op and '),Y' in op.upper():
         return f"bus_read(read_pointer({resolved}) + reg_Y)"
     
@@ -84,9 +84,9 @@ def parse_addr(opcode, op):
 
     return addr_calc if is_write else f"bus_read({addr_calc})"
 
-def translate_line(line):
+def translate_line(line, line_idx, all_lines):
+    """Translates a single line of ASM to C++ code."""
     clean = line.split(';')[0].strip()
-    # Match opcode and operand
     match = re.match(r'^(?:\w+:)?\s*(\w{3})\s*(.*)$', clean)
     if not match: return None, 0
 
@@ -94,25 +94,32 @@ def translate_line(line):
     opcode = opcode.upper()
     op = op.strip()
 
-    # 5. Fix relative branch syntax errors (+ / -)
-    if op in ["+", "++", "+++", "-", "--", "---"]:
-        return f"// TODO: Resolve relative branch {opcode} {op}", 0
+    # 1. Resolve relative branch (+ / -)
+    target_hex = "0"
+    if op in ["+", "++", "-", "--"]:
+        direction = 1 if "+" in op else -1
+        count = len(op)
+        found = 0
+        search_idx = line_idx
+        while 0 <= search_idx < len(all_lines):
+            search_idx += direction
+            if search_idx < 0 or search_idx >= len(all_lines): break
+            if f":*" in all_lines[search_idx] or (direction == 1 and op in all_lines[search_idx]):
+                found += 1
+                if found == count:
+                    # Look for a label on this line
+                    lbl = re.search(r'(L[0-9A-F]{4}):', all_lines[search_idx])
+                    target_hex = f"0x{lbl.group(1)[1:]}" if lbl else "/* Relative Error */"
+                    break
+    else:
+        # Standard symbol resolution for JMP/Branch
+        target_match = re.search(r'[a-zA-Z0-9_]+', op.replace('$', ''))
+        if target_match:
+            core = target_match.group(0)
+            target_hex = global_symbols.get(core, core)
 
     val = parse_addr(opcode, op)
     size = get_ins_size(opcode, op)
-
-    # 6. Resolve jump/branch targets (similar logic to parse_addr but no bus_read)
-    target_match = re.search(r'[\$]?([0-9A-Fa-f\w]+)', op)
-    if target_match:
-        target_core = target_match.group(1)
-        if target_core in global_symbols:
-            target_hex = global_symbols[target_core]
-        elif '$' in op:
-            target_hex = f"0x{target_core}"
-        else:
-            target_hex = target_core
-    else:
-        target_hex = "0"
 
     mapping = {
         'LDA': f"reg_A = {val}; update_nz(reg_A);",
@@ -139,6 +146,7 @@ def translate_line(line):
         'PHA': "push_stack(reg_A);",
         'PLA': "reg_A = pop_stack(); update_nz(reg_A);",
         'RTS': "reg_PC = (pop_stack() | (pop_stack() << 8)) + 1; return;",
+        'RTI': "reg_P = pop_stack(); reg_PC = (pop_stack() | (pop_stack() << 8)); return;",
         'JSR': f"{{ uint16_t ret = reg_PC + 2; push_stack(ret >> 8); push_stack(ret & 0xFF); reg_PC = {target_hex}; return; }}",
         'JMP': f"reg_PC = {target_hex}; return;",
         'BNE': f"if (!(reg_P & 0x02)) {{ reg_PC = {target_hex}; return; }}",
@@ -147,9 +155,11 @@ def translate_line(line):
         'BCS': f"if (reg_P & 0x01) {{ reg_PC = {target_hex}; return; }}",
         'SEC': "reg_P |= 0x01;",
         'CLC': "reg_P &= ~0x01;",
+        'SEI': "reg_P |= 0x04;",
+        'CLI': "reg_P &= ~0x04;",
     }
 
-    code = mapping.get(opcode, f"// TODO: {opcode} {op}")
+    code = mapping.get(opcode, f"// UNHANDLED: {opcode} {op}")
     return code, size
 
 def convert_file(filename):
@@ -161,28 +171,25 @@ def convert_file(filename):
         out.write('#include "cpu_shared.h"\n\nnamespace ' + bank_name + ' {\n')
         out.write('    void execute() {\n        switch(reg_PC) {\n')
 
-        for line in lines:
-            # Check for label cases
+        for idx, line in enumerate(lines):
+            # Check for label or code lines
             label_match = re.search(r'^\s*(L[0-9A-F]{4}):', line)
             if label_match:
-                addr = label_match.group(1).replace('L', '0x')
+                addr = f"0x{label_match.group(1)[1:]}"
                 out.write(f'            case {addr}:\n')
-                code, size = translate_line(line)
+                
+                code, size = translate_line(line, idx, lines)
                 if code:
-                    # Don't increment PC if the instruction forces a return (JMP/JSR/RTS)
+                    # Logic: If it's a branch/jump, it has its own 'return'. 
+                    # Otherwise, increment PC and return to the main loop.
                     suffix = "" if "return" in code else f" reg_PC += {size}; return;"
                     out.write(f'                {code}{suffix}\n')
 
         out.write('            default: reg_PC++; return;\n        }\n    }\n}\n')
 
-# Main Process
 if __name__ == "__main__":
     os.makedirs(OUT_DIR, exist_ok=True)
-    print("Pre-parsing symbols...")
     pre_parse_symbols()
-    
-    print("Converting files...")
     for f in os.listdir(ASM_DIR):
         if f.endswith('.asm') or f.endswith('.txt'):
             convert_file(f)
-    print("Done.")
