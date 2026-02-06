@@ -12,7 +12,6 @@
 #include "recompiled/cpu_shared.h"
 
 #define LOG_TAG "DWA_NATIVE"
-#define LOG_CPU(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 // --- Recompiled Bank Dispatcher ---
 namespace Dispatcher {
@@ -27,6 +26,7 @@ uint8_t oam_ram[256] = {0};
 uint32_t screen_buffer[256 * 240] = {0};
 uint8_t controller_state = 0;
 uint8_t controller_shift = 0;
+uint8_t last_strobe = 0;
 uint8_t ppu_data_buffer = 0;
 std::mutex buffer_mutex;
 MapperMMC1 mapper;
@@ -63,7 +63,7 @@ extern "C" {
     }
 
     void cpu_adc(uint8_t val) {
-        uint16_t carry = (reg_P & FLAG_C);
+        uint16_t carry = (reg_P & FLAG_C) ? 1 : 0;
         uint16_t sum = reg_A + val + carry;
         if (~(reg_A ^ val) & (reg_A ^ sum) & 0x80) reg_P |= FLAG_V; else reg_P &= ~FLAG_V;
         if (sum > 0xFF) reg_P |= FLAG_C; else reg_P &= ~FLAG_C;
@@ -94,7 +94,7 @@ extern "C" {
     }
 
     uint8_t cpu_rol(uint8_t val) {
-        uint8_t old_c = (reg_P & FLAG_C);
+        uint8_t old_c = (reg_P & FLAG_C) ? 1 : 0;
         reg_P = (reg_P & ~FLAG_C) | ((val >> 7) & 0x01);
         uint8_t res = (val << 1) | old_c;
         update_nz(res);
@@ -102,7 +102,7 @@ extern "C" {
     }
 
     uint8_t cpu_ror(uint8_t val) {
-        uint8_t old_c = (reg_P & FLAG_C);
+        uint8_t old_c = (reg_P & FLAG_C) ? 1 : 0;
         reg_P = (reg_P & ~FLAG_C) | (val & 0x01);
         uint8_t res = (val >> 1) | (old_c << 7);
         update_nz(res);
@@ -131,6 +131,7 @@ bool is_paused = false;
 
 uint16_t ntable_mirror(uint16_t addr) {
     addr = (addr - 0x2000) % 0x1000;
+    // Simple vertical mirroring assumption
     return addr % 0x0800;
 }
 
@@ -146,7 +147,7 @@ extern "C" uint8_t bus_read(uint16_t addr) {
         uint16_t reg = addr % 8;
         if (reg == 2) {
             uint8_t s = ppu_status;
-            ppu_status &= ~0x80;
+            ppu_status &= ~0x80; // Clear VBlank on read
             ppu_addr_latch = 0;
             return s;
         }
@@ -160,12 +161,14 @@ extern "C" uint8_t bus_read(uint16_t addr) {
             return data;
         }
     }
-    if (addr >= 0x6000) return mapper.read_prg(addr);
-    if (addr == 0x4016) {
-        uint8_t ret = (controller_shift & 0x80) >> 7;
-        controller_shift <<= 1;
-        return ret;
+    if (addr >= 0x4016 && addr <= 0x4017) {
+        if (addr == 0x4016) {
+            uint8_t ret = (controller_shift & 0x80) >> 7;
+            controller_shift <<= 1;
+            return 0x40 | ret;
+        }
     }
+    if (addr >= 0x6000) return mapper.read_prg(addr);
     return 0;
 }
 
@@ -196,7 +199,12 @@ extern "C" void bus_write(uint16_t addr, uint8_t val) {
         uint16_t base = val << 8;
         for (int i = 0; i < 256; i++) oam_ram[i] = bus_read(base + i);
     }
-    else if (addr == 0x4016) { if ((val & 0x01) == 0) controller_shift = controller_state; }
+    else if (addr == 0x4016) {
+        if ((val & 0x01) == 0 && (last_strobe & 0x01) == 1) {
+            controller_shift = controller_state;
+        }
+        last_strobe = val;
+    }
     else if (addr >= 0x6000) mapper.write(addr, val);
 }
 
@@ -228,21 +236,22 @@ extern "C" void power_on_reset() {
     uint8_t lo = bus_read(0xFFFC);
     uint8_t hi = bus_read(0xFFFD);
     reg_PC = (hi << 8) | lo;
-    
-    // Failsafe for Dragon Warrior 1 start address if vector is missing
+
     if (reg_PC == 0) reg_PC = 0xFF8E; 
-    
     reg_S = 0xFD;
     reg_P = 0x24;
-    LOG_CPU("Reset! PC set to: %04X", reg_PC);
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Reset! PC: %04X", reg_PC);
 }
 
 extern "C" void nmi_handler() {
+    ppu_status |= 0x80; // Set VBlank bit
     push_stack(reg_PC >> 8);
     push_stack(reg_PC & 0xFF);
     push_stack(reg_P);
-    reg_PC = (bus_read(0xFFFB) << 8) | bus_read(0xFFFA);
-    ppu_status |= 0x80;
+    
+    uint8_t lo = mapper.read_prg(0xFFFA);
+    uint8_t hi = mapper.read_prg(0xFFFB);
+    reg_PC = (hi << 8) | lo;
 }
 
 void engine_loop() {
@@ -254,8 +263,8 @@ void engine_loop() {
             continue;
         }
         auto start = std::chrono::steady_clock::now();
-        // approx 29780 cycles per frame
-        for (int i = 0; i < 20000; i++) {
+        // Dragon Warrior 1 approx cycle count per frame
+        for (int i = 0; i < 29780; i++) {
             execute_instruction();
             if (!is_running) break;
         }
@@ -265,37 +274,24 @@ void engine_loop() {
     }
 }
 
-// --- JNI Lifecycle ---
-
-
+// --- JNI Implementation ---
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstring romPath, jstring outDir) {
     const char *path = env->GetStringUTFChars(romPath, nullptr);
-    
+
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {
         env->ReleaseStringUTFChars(romPath, path);
         return env->NewStringUTF("Error: Could not open file");
     }
 
-    // Skip 16-byte iNES Header
-    file.seekg(16, std::ios::beg);
-
-    // Read 64KB PRG-ROM (4 banks of 16KB)
-    for (int i = 0; i < 4; i++) {
-        file.read((char*)mapper.prg_rom[i], 16384);
-    }
-
-    // Read 8KB CHR-ROM (2 banks of 4KB)
-    for (int i = 0; i < 2; i++) {
-        file.read((char*)mapper.chr_rom[i], 4096);
-    }
+    file.seekg(16, std::ios::beg); // Skip iNES header
+    for (int i = 0; i < 4; i++) file.read((char*)mapper.prg_rom[i], 16384);
+    for (int i = 0; i < 2; i++) file.read((char*)mapper.chr_rom[i], 4096);
 
     file.close();
     env->ReleaseStringUTFChars(romPath, path);
-    
-    LOG_CPU("ROM Extracted and Mapped.");
     return env->NewStringUTF("Success");
 }
 
