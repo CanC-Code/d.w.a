@@ -13,42 +13,42 @@ def pre_parse_symbols():
         print(f"Directory {ASM_DIR} not found.")
         return
 
-    # Track current PC per file based on .org
     for filename in os.listdir(ASM_DIR):
         if not (filename.endswith('.asm') or filename.endswith('.txt')):
             continue
         
-        current_pc = 0x8000 # Default for NES PRG
+        current_pc = 0x8000 
         try:
             with open(os.path.join(ASM_DIR, filename), 'r') as f:
                 for line in f:
                     clean = line.split(';')[0].strip()
                     if not clean: continue
 
-                    # Handle .org to track address-less labels
+                    # Handle .org
                     org_match = re.match(r'^\.org\s+\$([0-9A-Fa-f]+)', clean)
                     if org_match:
                         current_pc = int(org_match.group(1), 16)
                         continue
 
-                    # 1. Match .alias
+                    # 1. Match .alias (Force Uppercase Hex)
                     alias_match = re.match(r'^\.alias\s+(\w+)\s+\$?([0-9A-Fa-f]+)', clean)
                     if alias_match:
                         name, val = alias_match.groups()
-                        global_symbols[name] = f"0x{val}"
+                        global_symbols[name] = f"0x{val.upper()}"
                         continue
 
-                    # 2. Match Labels (LXXXX: or Name:)
+                    # 2. Match Labels
                     label_match = re.match(r'^(\w+):', clean)
                     if label_match:
                         name = label_match.group(1)
-                        # If label is L8000 style, use the hex. Otherwise use current_pc
+                        # Standard LXXXX labels
                         if re.match(r'^L[0-9A-Fa-f]{4}$', name):
-                            global_symbols[name] = f"0x{name[1:]}"
+                            global_symbols[name] = f"0x{name[1:].upper()}"
                         else:
-                            global_symbols[name] = hex(current_pc)
+                            # Named labels get the current tracked PC
+                            global_symbols[name] = hex(current_pc).upper().replace('X', 'x')
 
-                    # Increment PC based on instruction size (approximation for label tracking)
+                    # PC Tracking (Approximate size to keep labels unique)
                     ins_match = re.match(r'^\s*(\w{3})\s*(.*)$', clean)
                     if ins_match:
                         opcode, op = ins_match.groups()
@@ -58,26 +58,23 @@ def pre_parse_symbols():
             print(f"Error parsing {filename}: {e}")
 
 def resolve_symbol(symbol):
-    """Ensures a symbol is returned as a hex string for the C++ compiler."""
-    if not symbol: return "0"
-    if symbol.startswith("0x") or symbol.isdigit():
-        return symbol
+    """Ensures a symbol is returned as an uppercase hex string."""
+    if not symbol: return "0x0"
     
-    # Clean symbol from addressing mode characters
+    # Clean symbol
     clean_sym = symbol.strip('#$() ,XY')
     
-    resolved = global_symbols.get(clean_sym)
-    if resolved:
-        return resolved
+    if clean_sym in global_symbols:
+        return global_symbols[clean_sym]
     
-    # Fallback for raw hex constants like $C5E0
+    # Handle raw hex $C5E0
     if all(c in "0123456789ABCDEFabcdef" for c in clean_sym) and len(clean_sym) >= 2:
-        return f"0x{clean_sym}"
+        return f"0x{clean_sym.upper()}"
     
-    return f"/* UNRESOLVED: {symbol} */ 0"
+    # Return 0 with a comment to avoid breaking the build, but flag it
+    return f"0x0 /* UNRESOLVED: {clean_sym} */"
 
 def get_ins_size(opcode, op):
-    """Determines instruction size."""
     if not op or op.strip() == "": return 1
     if op.startswith('#'): return 2
     if '(' in op: return 2
@@ -85,23 +82,16 @@ def get_ins_size(opcode, op):
     return 2
 
 def parse_addr(opcode, op):
-    """Converts ASM operand to C++ bus access."""
     op = op.strip()
     if not op: return "0"
+    if op.startswith('#'): return resolve_symbol(op)
 
-    # Handle Immediate
-    if op.startswith('#'):
-        return resolve_symbol(op)
-
-    # Addressing Mode Translation
     is_write = opcode in ['STA', 'STX', 'STY', 'INC', 'DEC', 'ASL', 'LSR', 'ROL', 'ROR']
     
     if '(' in op and '),Y' in op.upper():
-        resolved = resolve_symbol(op)
-        return f"read_pointer_indexed_y({resolved})" # Custom helper in C++
+        return f"read_pointer_indexed_y({resolve_symbol(op)})"
 
     resolved = resolve_symbol(op)
-    
     if ',X' in op.upper(): addr_calc = f"({resolved} + reg_X)"
     elif ',Y' in op.upper(): addr_calc = f"({resolved} + reg_Y)"
     else: addr_calc = resolved
@@ -115,8 +105,6 @@ def translate_line(line):
 
     opcode, op = match.groups()
     opcode = opcode.upper()
-    
-    # Branch targets must be hex
     target_hex = resolve_symbol(op)
     val = parse_addr(opcode, op)
     size = get_ins_size(opcode, op)
@@ -138,6 +126,9 @@ def translate_line(line):
         'CPY': f"update_flags_cmp(reg_Y, {val});",
         'BIT': f"cpu_bit({val});",
         'ASL': f"reg_A = cpu_asl(reg_A);" if not op else f"bus_write({val}, cpu_asl(bus_read({val})));",
+        'LSR': f"reg_A = cpu_lsr(reg_A);" if not op else f"bus_write({val}, cpu_lsr(bus_read({val})));",
+        'ROL': f"reg_A = cpu_rol(reg_A);" if not op else f"bus_write({val}, cpu_rol(bus_read({val})));",
+        'ROR': f"reg_A = cpu_ror(reg_A);" if not op else f"bus_write({val}, cpu_ror(bus_read({val})));",
         'BNE': f"if (!(reg_P & 0x02)) {{ reg_PC = {target_hex}; return; }}",
         'BEQ': f"if (reg_P & 0x02) {{ reg_PC = {target_hex}; return; }}",
         'BCC': f"if (!(reg_P & 0x01)) {{ reg_PC = {target_hex}; return; }}",
@@ -153,6 +144,17 @@ def translate_line(line):
         'TAY': "reg_Y = reg_A; update_nz(reg_Y);",
         'TXA': "reg_A = reg_X; update_nz(reg_A);",
         'TYA': "reg_A = reg_Y; update_nz(reg_A);",
+        'PHA': "push_stack(reg_A);",
+        'PLA': "reg_A = pop_stack(); update_nz(reg_A);",
+        'PHP': "push_stack(reg_P);",
+        'PLP': "reg_P = pop_stack();",
+        'CLC': "reg_P &= ~0x01;",
+        'SEC': "reg_P |= 0x01;",
+        'CLI': "reg_P &= ~0x04;",
+        'SEI': "reg_P |= 0x04;",
+        'CLV': "reg_P &= ~0x40;",
+        'CLD': "reg_P &= ~0x08;",
+        'SED': "reg_P |= 0x08;",
     }
 
     code = mapping.get(opcode, f"/* {opcode} {op} */")
@@ -163,6 +165,9 @@ def convert_file(filename):
     with open(os.path.join(ASM_DIR, filename), 'r') as f:
         lines = f.readlines()
 
+    # Track addresses used in this file to prevent duplicate cases
+    used_addresses = set()
+
     with open(os.path.join(OUT_DIR, f"{bank_name}.cpp"), 'w') as out:
         out.write('#include "cpu_shared.h"\n\nnamespace ' + bank_name + ' {\n')
         out.write('    void execute() {\n        switch(reg_PC) {\n')
@@ -172,12 +177,18 @@ def convert_file(filename):
             if label_match:
                 label_name = label_match.group(1)
                 addr = resolve_symbol(label_name)
-                out.write(f'            case {addr}:\n')
+                
+                # Check for duplicates or collisions at 0x0
+                if addr not in used_addresses and "UNRESOLVED" not in addr:
+                    out.write(f'            case {addr}:\n')
+                    used_addresses.add(addr)
                 
                 code, size = translate_line(line)
                 if code:
+                    # If the addr was a duplicate, we still output the code, just not the case label
+                    prefix = "                " if addr in used_addresses else f"                /* Combined with above: {label_name} */ "
                     suffix = "" if "return" in code else f" reg_PC += {size}; return;"
-                    out.write(f'                {code}{suffix}\n')
+                    out.write(f'{prefix}{code}{suffix}\n')
 
         out.write('            default: reg_PC++; return;\n        }\n    }\n}\n')
 
