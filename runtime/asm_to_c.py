@@ -9,16 +9,20 @@ global_symbols = {}
 
 def get_ins_size(opcode, op):
     opcode = opcode.lower()
+    # Implied/Accumulator instructions
     if opcode in ['clc', 'cld', 'cli', 'clv', 'dex', 'dey', 'inx', 'iny', 'nop', 
                   'pha', 'php', 'pla', 'plp', 'rti', 'rts', 'sec', 'sed', 'sei', 
-                  'tax', 'tay', 'tsx', 'txa', 'txs', 'tya', 'asl', 'lsr', 'rol', 'ror']:
-        if not op or op.strip().upper() == 'A': return 1
+                  'tax', 'tay', 'tsx', 'txa', 'txs', 'tya']:
+        return 1
+    # Shift/Rotate Accumulator
+    if opcode in ['asl', 'lsr', 'rol', 'ror'] and (not op or op.strip().upper() == 'A'):
+        return 1
     
     if not op or op.strip() == "": return 1
     
     # Addressing Mode Detection
     if op.startswith('#'): return 2
-    if '(' in op: return 2 # Indirect is almost always ZP in NES games
+    if '(' in op: return 2 # Zero Page Indirect (NES standard)
     
     if ',' in op:
         clean_op = re.sub(r'[#$(),\sXY%]', '', op)
@@ -73,13 +77,12 @@ def translate_line(opcode, op, current_pc):
         }
         if opcode in imm_map: return imm_map[opcode], size
 
-    # 2. INDIRECT ADDRESSING (Critical for Dragon Warrior)
+    # 2. INDIRECT ADDRESSING
     if '(' in op:
         addr = int(val_raw, 16) & 0xFF
-        if opcode == 'jmp': # Indirect JMP
+        if opcode == 'jmp':
             return f'reg_PC = read_pointer(0x{addr:04x}); return;', size
         
-        # Indirect Indexed: LDA ($addr),Y
         if '),Y' in op.upper():
             code_map = {
                 'lda': f'reg_A = bus_read(read_pointer_indexed_y({hex(addr)})); update_nz(reg_A);',
@@ -88,7 +91,6 @@ def translate_line(opcode, op, current_pc):
             }
             if opcode in code_map: return code_map[opcode], size
         
-        # Indexed Indirect: LDA ($addr,X)
         if ',X)' in op.upper():
             return f'reg_A = bus_read(read_pointer_indexed_x({hex(addr)})); update_nz(reg_A);', size
 
@@ -96,9 +98,12 @@ def translate_line(opcode, op, current_pc):
     addr_val = int(val_raw, 16) & 0xFFFF
     m_str = f"0x{addr_val:04x}"
     
+    # Check for Accumulator shift
+    is_acc = (not op or op.strip().upper() == 'A') and opcode in ['asl', 'lsr', 'rol', 'ror']
+
     if ',' in op:
         reg = 'reg_X' if ',X' in op.upper() else 'reg_Y'
-        final_addr = f"(uint16_t)({m_str} + {reg})" if addr_val > 0xFF else f"(uint8_t)({addr_val} + {reg})"
+        final_addr = f"(uint16_t)({m_str} + {reg})"
     else:
         final_addr = m_str
 
@@ -117,22 +122,24 @@ def translate_line(opcode, op, current_pc):
         'jsr': f'{{ uint16_t ret = (reg_PC + {size} - 1); push_stack(ret >> 8); push_stack(ret & 0xFF); reg_PC = {final_addr}; return; }}',
         'inc': f'{{ uint8_t v = bus_read({final_addr}) + 1; bus_write({final_addr}, v); update_nz(v); }}',
         'dec': f'{{ uint8_t v = bus_read({final_addr}) - 1; bus_write({final_addr}, v); update_nz(v); }}',
-        'asl': f'{{ if ("{op}" == "A") reg_A = cpu_asl(reg_A); else bus_write({final_addr}, cpu_asl(bus_read({final_addr}))); }}',
-        'lsr': f'{{ if ("{op}" == "A") reg_A = cpu_lsr(reg_A); else bus_write({final_addr}, cpu_lsr(bus_read({final_addr}))); }}',
-        'rol': f'{{ if ("{op}" == "A") reg_A = cpu_rol(reg_A); else bus_write({final_addr}, cpu_rol(bus_read({final_addr}))); }}',
-        'ror': f'{{ if ("{op}" == "A") reg_A = cpu_ror(reg_A); else bus_write({final_addr}, cpu_ror(bus_read({final_addr}))); }}',
+        'asl': f'reg_A = cpu_asl(reg_A);' if is_acc else f'{{ uint8_t v = cpu_asl(bus_read({final_addr})); bus_write({final_addr}, v); }}',
+        'lsr': f'reg_A = cpu_lsr(reg_A);' if is_acc else f'{{ uint8_t v = cpu_lsr(bus_read({final_addr})); bus_write({final_addr}, v); }}',
+        'rol': f'reg_A = cpu_rol(reg_A);' if is_acc else f'{{ uint8_t v = cpu_rol(bus_read({final_addr})); bus_write({final_addr}, v); }}',
+        'ror': f'reg_A = cpu_ror(reg_A);' if is_acc else f'{{ uint8_t v = cpu_ror(bus_read({final_addr})); bus_write({final_addr}, v); }}',
+        'ora': f'reg_A |= bus_read({final_addr}); update_nz(reg_A);',
+        'and': f'reg_A &= bus_read({final_addr}); update_nz(reg_A);',
+        'eor': f'reg_A ^= bus_read({final_addr}); update_nz(reg_A);',
     }
     
-    # Branching
     branch_map = {
         'beq': 'reg_P & FLAG_Z', 'bne': '!(reg_P & FLAG_Z)',
         'bcs': 'reg_P & FLAG_C', 'bcc': '!(reg_P & FLAG_C)',
         'bmi': 'reg_P & FLAG_N', 'bpl': '!(reg_P & FLAG_N)',
+        'bvs': 'reg_P & FLAG_V', 'bvc': '!(reg_P & FLAG_V)',
     }
     if opcode in branch_map:
         return f'if ({branch_map[opcode]}) {{ reg_PC = {m_str}; return; }}', size
 
-    # Single-byte / Stack
     standalone = {
         'rts': 'reg_PC = (pop_stack() | (pop_stack() << 8)) + 1; return;',
         'rti': 'reg_P = pop_stack(); reg_PC = (pop_stack() | (pop_stack() << 8)); return;',
@@ -143,6 +150,8 @@ def translate_line(opcode, op, current_pc):
         'php': 'push_stack(reg_P | 0x30);', 'plp': 'reg_P = (pop_stack() & 0xEF) | 0x20;',
         'clc': 'reg_P &= ~FLAG_C;', 'sec': 'reg_P |= FLAG_C;',
         'cli': 'reg_P &= ~FLAG_I;', 'sei': 'reg_P |= FLAG_I;',
+        'cld': 'reg_P &= ~FLAG_D;', 'sed': 'reg_P |= FLAG_D;',
+        'clv': 'reg_P &= ~FLAG_V;',
         'dex': 'reg_X--; update_nz(reg_X);', 'inx': 'reg_X++; update_nz(reg_X);',
         'dey': 'reg_Y--; update_nz(reg_Y);', 'iny': 'reg_Y++; update_nz(reg_Y);',
         'nop': '// NOP',
