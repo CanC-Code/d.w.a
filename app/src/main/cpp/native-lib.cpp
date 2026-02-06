@@ -9,13 +9,13 @@
 #include <mutex>
 #include <cstring>
 #include "MapperMMC1.h"
-#include "recompiled/cpu_shared.h" // Ensure this includes your updated header
+#include "recompiled/cpu_shared.h"
 
 #define LOG_TAG "DWA_NATIVE"
 
 // --- Recompiled Bank Dispatcher ---
 namespace Dispatcher {
-    void execute(); // Defined in Dispatcher.cpp
+    void execute(); 
 }
 
 // --- Global Hardware State ---
@@ -61,7 +61,6 @@ extern "C" {
         if ((uint8_t)(reg - val) & 0x80) reg_P |= FLAG_N; 
     }
 
-    // --- Math/Bit Helpers ---
     void cpu_adc(uint8_t val) {
         uint16_t carry = (reg_P & FLAG_C);
         uint16_t sum = reg_A + val + carry;
@@ -76,10 +75,9 @@ extern "C" {
     void cpu_bit(uint8_t val) {
         reg_P &= ~(FLAG_Z | FLAG_V | FLAG_N);
         if ((val & reg_A) == 0) reg_P |= FLAG_Z;
-        reg_P |= (val & 0xC0); // Copy bits 7 and 6 to N and V
+        reg_P |= (val & 0xC0); 
     }
 
-    // --- Shift/Rotate Helpers (Resolves Linker Errors) ---
     uint8_t cpu_asl(uint8_t val) {
         reg_P = (reg_P & ~FLAG_C) | ((val >> 7) & FLAG_C);
         uint8_t res = val << 1;
@@ -110,7 +108,10 @@ extern "C" {
         return res;
     }
 
-    // --- Addressing Helpers ---
+    uint16_t read_pointer(uint16_t addr) {
+        return bus_read(addr) | (bus_read(addr + 1) << 8);
+    }
+
     uint16_t read_pointer_indexed_y(uint16_t zp_addr) {
         uint16_t lo = bus_read(zp_addr);
         uint16_t hi = bus_read((zp_addr + 1) & 0xFF);
@@ -134,6 +135,7 @@ uint16_t ntable_mirror(uint16_t addr) {
 
 uint8_t read_palette(uint16_t addr) {
     uint8_t p_idx = addr & 0x1F;
+    // Mirrors $3F10, $3F14, $3F18, $3F1C to $3F00, $3F04, $3F08, $3F0C
     if (p_idx >= 0x10 && (p_idx % 4 == 0)) p_idx -= 0x10; 
     return palette_ram[p_idx];
 }
@@ -153,7 +155,7 @@ extern "C" uint8_t bus_read(uint16_t addr) {
             uint16_t p_addr = ppu_addr_reg & 0x3FFF;
             if (p_addr < 0x2000) ppu_data_buffer = mapper.read_chr(p_addr);
             else if (p_addr < 0x3F00) ppu_data_buffer = ppu_vram[ntable_mirror(p_addr)];
-            else data = read_palette(p_addr);
+            else data = read_palette(p_addr); // Direct read for palette
             ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
             return data;
         }
@@ -198,7 +200,7 @@ extern "C" void bus_write(uint16_t addr, uint8_t val) {
     else if (addr >= 0x6000) mapper.write(addr, val);
 }
 
-// --- Frame Rendering ---
+// --- Rendering ---
 void draw_frame() {
     std::lock_guard<std::mutex> lock(buffer_mutex);
     uint16_t nt_base = (ppu_ctrl & 0x03) * 1024;
@@ -220,7 +222,7 @@ void draw_frame() {
     }
 }
 
-// --- Entry Points ---
+// --- CPU Entry ---
 extern "C" void power_on_reset() {
     reg_PC = (bus_read(0xFFFD) << 8) | bus_read(0xFFFC);
     LOG_CPU("Reset! PC set to: %04X", reg_PC);
@@ -243,15 +245,30 @@ void engine_loop() {
             continue;
         }
         auto start = std::chrono::steady_clock::now();
-        
-        // Execute approx. cycles for 1 frame
-        for (int i = 0; i < 29780; i += 3) { 
-            execute_instruction(); 
-        }
-
+        for (int i = 0; i < 29780; i += 3) { execute_instruction(); }
         nmi_handler();
         draw_frame();
-        
         std::this_thread::sleep_until(start + std::chrono::microseconds(16666));
     }
+}
+
+// --- JNI Lifecycle ---
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_dwa_NativeLib_startEngine(JNIEnv *env, jobject thiz) {
+    if (!is_running) {
+        std::thread(engine_loop).detach();
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_dwa_NativeLib_updateSurface(JNIEnv *env, jobject thiz, jobject bitmap) {
+    AndroidBitmapInfo info;
+    void* pixels;
+    if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) return;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
+
+    std::lock_guard<std::mutex> lock(buffer_mutex);
+    memcpy(pixels, screen_buffer, 256 * 240 * 4);
+    
+    AndroidBitmap_unlockPixels(env, bitmap);
 }
