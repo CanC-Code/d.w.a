@@ -28,7 +28,6 @@ uint8_t controller_state = 0;
 uint8_t controller_shift = 0;
 uint8_t last_strobe = 0;
 
-// NES 2C02 Palette Data
 uint32_t nes_palette[64] = {
     0xFF666666, 0xFF002A88, 0xFF1412A7, 0xFF3B00A4, 0xFF5C007E, 0xFF6E0040, 0xFF6C0600, 0xFF561D00,
     0xFF333500, 0xFF0B4800, 0xFF005200, 0xFF004F08, 0xFF00404D, 0xFF000000, 0xFF000000, 0xFF000000,
@@ -38,7 +37,6 @@ uint32_t nes_palette[64] = {
     0xFFBCBE00, 0xFF88D100, 0xFF5CE430, 0xFF45E082, 0xFF48CDDE, 0xFF4F4F4F, 0xFF000000, 0xFF000000
 };
 
-// --- CPU Implementation (Shared with Recompiled Code) ---
 extern "C" {
     uint16_t reg_PC = 0;
     uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
@@ -61,7 +59,6 @@ extern "C" {
     void cpu_adc(uint8_t val) {
         uint16_t carry = (reg_P & FLAG_C) ? 1 : 0;
         uint16_t sum = reg_A + val + carry;
-        // Overflow logic
         if (~(reg_A ^ val) & (reg_A ^ sum) & 0x80) reg_P |= FLAG_V; else reg_P &= ~FLAG_V;
         if (sum > 0xFF) reg_P |= FLAG_C; else reg_P &= ~FLAG_C;
         reg_A = (uint8_t)sum;
@@ -73,7 +70,7 @@ extern "C" {
     void cpu_bit(uint8_t val) {
         reg_P &= ~(FLAG_Z | FLAG_V | FLAG_N);
         if ((val & reg_A) == 0) reg_P |= FLAG_Z;
-        reg_P |= (val & 0xC0); // Bits 7 and 6 map to N and V
+        reg_P |= (val & 0xC0);
     }
 
     uint8_t cpu_asl(uint8_t val) {
@@ -121,17 +118,13 @@ extern "C" {
     void bus_write(uint16_t addr, uint8_t val) {
         if (addr < 0x2000) cpu_ram[addr % 0x0800] = val;
         else if (addr >= 0x2000 && addr <= 0x3FFF) ppu.cpu_write(addr, val, mapper);
-        else if (addr == 0x4014) { // OAM DMA
+        else if (addr == 0x4014) { 
             uint16_t b = val << 8;
             for(int i=0; i<256; i++) ppu.oam_ram[i] = bus_read(b + i);
         }
         else if (addr == 0x4016) {
             if ((val & 0x01) == 0 && (last_strobe & 0x01) == 1) controller_shift = controller_state;
             last_strobe = val;
-        }
-        else if (addr == MusicTrack) {
-            LOG_CPU("Music Change Requested: %02X", val);
-            cpu_ram[MusicTrack] = val;
         }
         else if (addr >= 0x6000) mapper.write(addr, val);
     }
@@ -151,81 +144,63 @@ extern "C" {
     uint8_t pop_stack() { reg_S++; return cpu_ram[0x0100 | (reg_S & 0xFF)]; }
 }
 
-// --- Interrupt Handling ---
 void nmi_handler() {
-    // Satisfy DW1 Main Loop VBlank check ($002D)
     cpu_ram[VBlankFlag] = 1; 
     cpu_ram[FrameCounter]++;
-
     push_stack(reg_PC >> 8); 
     push_stack(reg_PC & 0xFF); 
     push_stack(reg_P);
-    
     uint16_t vector = bus_read(0xFFFA) | (bus_read(0xFFFB) << 8);
     reg_PC = vector;
 }
 
-// --- Engine Execution ---
 void engine_loop() {
     memset(cpu_ram, 0, sizeof(cpu_ram));
     mapper.reset();
     ppu.reset();
 
-    // Initial Vector Load ($FFFC)
-    uint8_t lo = mapper.read_prg(0xFFFC);
-    uint8_t hi = mapper.read_prg(0xFFFD);
-    reg_PC = (hi << 8) | lo;
-    
-    // Safety check for empty vectors
-    if (reg_PC < 0x8000) reg_PC = 0xFF8E; 
+    // Start at the Hardware Reset Label we found in Bank03.asm
+    reg_PC = 0xFFD8; 
 
     is_running = true;
     while (is_running) {
-        if (is_paused) { 
-            std::this_thread::sleep_for(std::chrono::milliseconds(16)); 
-            continue; 
-        }
-        
+        if (is_paused) { std::this_thread::sleep_for(std::chrono::milliseconds(16)); continue; }
         auto frame_start = std::chrono::steady_clock::now();
 
-        // Standard NTSC NES Frame Cycles
-        for (int i = 0; i < 29780; i++) {
-            uint16_t prev_pc = reg_PC;
-            execute_instruction();
-            // Failsafe to prevent infinite Dispatcher loop on missing addresses
-            if (reg_PC == prev_pc) reg_PC++; 
-            if (!is_running) break;
+        // INTERLEAVED EXECUTION: Split the frame to allow PPU Status updates
+        for (int step = 0; step < 2; step++) {
+            for (int i = 0; i < 14890; i++) {
+                uint16_t prev_pc = reg_PC;
+                execute_instruction();
+                if (reg_PC == prev_pc) reg_PC++; 
+            }
+            // Toggle VBlank bit halfway through so the boot loop can "see" it
+            if (step == 0) ppu.status |= 0x80; 
         }
 
-        // PPU Update
-        ppu.status |= 0x80; // Set VBlank bit
         if (ppu.ctrl & 0x80) nmi_handler();
+        ppu.status &= ~0x80; // Clear for next frame
 
-        // Thread-safe Render
         {
             std::lock_guard<std::mutex> lock(buffer_mutex);
             ppu.render_frame(mapper, nes_palette);
         }
-
         std::this_thread::sleep_until(frame_start + std::chrono::microseconds(16666));
     }
 }
 
-// --- JNI Bridge ---
-
+// JNI Methods
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstring romPath, jstring outDir) {
     const char *path = env->GetStringUTFChars(romPath, nullptr);
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {
         env->ReleaseStringUTFChars(romPath, path);
-        return env->NewStringUTF("Error: Could not open file");
+        return env->NewStringUTF("Error: Open failed");
     }
-
-    file.seekg(16, std::ios::beg); // Skip iNES Header
+    file.seekg(16, std::ios::beg);
     for (int i = 0; i < 4; i++) file.read((char*)mapper.prg_rom[i], 16384);
     for (int i = 0; i < 2; i++) file.read((char*)mapper.chr_rom[i], 4096);
-
     file.close();
     env->ReleaseStringUTFChars(romPath, path);
     return env->NewStringUTF("Success");
@@ -233,9 +208,7 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstri
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv *env, jobject thiz, jstring filesDir) {
-    if (!is_running) {
-        std::thread(engine_loop).detach();
-    }
+    if (!is_running) std::thread(engine_loop).detach();
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -249,14 +222,9 @@ Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv *env, jobject thiz, jo
     AndroidBitmap_unlockPixels(env, bitmap);
 }
 
-extern "C" JNIEXPORT void JNICALL 
-Java_com_canc_dwa_MainActivity_injectInput(JNIEnv *env, jobject thiz, jint bit, jboolean p) {
-    if (p) controller_state |= (uint8_t)bit; 
-    else controller_state &= ~((uint8_t)bit);
+extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_injectInput(JNIEnv *env, jobject thiz, jint bit, jboolean p) {
+    if (p) controller_state |= (uint8_t)bit; else controller_state &= ~((uint8_t)bit);
 }
 
-extern "C" JNIEXPORT void JNICALL 
-Java_com_canc_dwa_MainActivity_nativePauseEngine(JNIEnv *env, jobject thiz) { is_paused = true; }
-
-extern "C" JNIEXPORT void JNICALL 
-Java_com_canc_dwa_MainActivity_nativeResumeEngine(JNIEnv *env, jobject thiz) { is_paused = false; }
+extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativePauseEngine(JNIEnv *env, jobject thiz) { is_paused = true; }
+extern "C" JNIEXPORT void JNICALL Java_com_canc_dwa_MainActivity_nativeResumeEngine(JNIEnv *env, jobject thiz) { is_paused = false; }
