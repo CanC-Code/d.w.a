@@ -1,4 +1,4 @@
-#include "CPU_SHARED.h"
+#include "cpu_shared.h"
 #include "../MapperMMC1.h" // Go up one level to find the header
 
 // Access the global mapper defined in native-lib.cpp
