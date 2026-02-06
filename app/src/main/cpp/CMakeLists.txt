@@ -10,7 +10,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(DWA_SOURCES
     native-lib.cpp
     MapperMMC1.cpp
-    recompiled/dispatcher.cpp
+    recompiled/Dispatcher.cpp
     recompiled/Bank00.cpp
     recompiled/Bank01.cpp
     recompiled/Bank02.cpp
