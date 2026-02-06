@@ -11,32 +11,48 @@ MapperMMC1::MapperMMC1() {
 void MapperMMC1::reset() {
     shift_register = 0x10;
     write_count = 0;
-    // Mode 3: $8000 switchable, $C000 fixed to last bank.
+    // MMC1 default: PRG mode 3 ($C000 fixed to last), Vertical Mirroring
     control = 0x1C; 
+    mirroring = 0x02; // Vertical
     prg_bank = 0;
     chr_bank_0 = 0;
     chr_bank_1 = 0;
-    ram_enabled = true;
 }
+
+
 
 void MapperMMC1::write(uint16_t addr, uint8_t val) {
     if (val & 0x80) {
+        // Reset Signal
         shift_register = 0x10;
         write_count = 0;
-        control |= 0x0C; 
+        control |= 0x0C; // Set PRG mode to 3
     } else {
-        shift_register = ((val & 0x01) << 4) | (shift_register >> 1);
+        // Shift bit into register (LSB first)
+        bool bit = val & 0x01;
+        shift_register = (shift_register >> 1) | (bit << 4);
         write_count++;
 
         if (write_count == 5) {
             uint8_t data = shift_register & 0x1F;
-            if (addr >= 0x8000 && addr <= 0x9FFF)      control = data;
-            else if (addr >= 0xA000 && addr <= 0xBFFF) chr_bank_0 = data;
-            else if (addr >= 0xC000 && addr <= 0xDFFF) chr_bank_1 = data;
+            
+            if (addr >= 0x8000 && addr <= 0x9FFF) {
+                control = data;
+                // Update mirroring immediately for PPU synchronization
+                mirroring = control & 0x03; 
+            }
+            else if (addr >= 0xA000 && addr <= 0xBFFF) {
+                chr_bank_0 = data;
+            }
+            else if (addr >= 0xC000 && addr <= 0xDFFF) {
+                chr_bank_1 = data;
+            }
             else if (addr >= 0xE000) {
                 prg_bank = data & 0x0F;
-                ram_enabled = !(data & 0x10); 
+                // Bit 4 of PRG bank register often enables/disables RAM
             }
+
+            // Reset for next command
             shift_register = 0x10;
             write_count = 0;
         }
@@ -45,18 +61,19 @@ void MapperMMC1::write(uint16_t addr, uint8_t val) {
 
 uint8_t MapperMMC1::read_prg(uint16_t addr) {
     if (addr >= 0x6000 && addr <= 0x7FFF) {
-        return ram_enabled ? prg_ram[addr - 0x6000] : 0x00;
+        return prg_ram[addr - 0x6000];
     }
 
     uint16_t offset = addr & 0x3FFF;
-    uint8_t mode = (control >> 2) & 0x03;
+    uint8_t mode = get_prg_mode();
 
     switch (mode) {
         case 0: 
-        case 1: // 32KB Mode
+        case 1: // 32KB Mode: Switch 32KB at $8000
         {
             uint8_t bank = (prg_bank & 0x0E); 
-            return prg_rom[(bank + ((addr >= 0xC000) ? 1 : 0)) % 4][offset];
+            if (addr < 0xC000) return prg_rom[bank % 4][offset];
+            return prg_rom[(bank + 1) % 4][offset];
         }
         case 2: // Fix first bank ($8000), switch second ($C000)
             if (addr < 0xC000) return prg_rom[0][offset];
@@ -73,26 +90,27 @@ uint8_t MapperMMC1::read_prg(uint16_t addr) {
 uint8_t MapperMMC1::read_chr(uint16_t addr) {
     uint16_t offset = addr & 0x0FFF;
 
-    // Dragon Warrior only has 8KB CHR (2 banks of 4KB). 
-    // We use % 2 to prevent reading out of bounds.
-    if (control & 0x10) { // 4KB mode
-        if (addr < 0x1000) return chr_rom[chr_bank_0 % 2][offset];
-        return chr_rom[chr_bank_1 % 2][offset];
-    } else { // 8KB mode
+    if (get_chr_mode()) { 
+        // 4KB Mode: Switch two independent 4KB banks
+        if (addr < 0x1000) return chr_rom[chr_bank_0 % 4][offset];
+        return chr_rom[chr_bank_1 % 4][offset];
+    } else { 
+        // 8KB Mode: Switch 8KB at a time
         uint8_t bank = (chr_bank_0 & 0x0E);
-        return chr_rom[(bank + ((addr >= 0x1000) ? 1 : 0)) % 2][offset];
+        if (addr < 0x1000) return chr_rom[bank % 4][offset];
+        return chr_rom[(bank + 1) % 4][offset];
     }
 }
 
 void MapperMMC1::write_chr(uint16_t addr, uint8_t val) {
-    // Dragon Warrior uses CHR-ROM, so writes are usually ignored by hardware.
-    // However, we allow it for compatibility with some translation hacks.
     uint16_t offset = addr & 0x0FFF;
-    if (control & 0x10) {
-        if (addr < 0x1000) chr_rom[chr_bank_0 % 2][offset] = val;
-        else chr_rom[chr_bank_1 % 2][offset] = val;
+    // Note: DW1 is CHR-ROM, but we allow writes for dev/hacks
+    if (get_chr_mode()) {
+        if (addr < 0x1000) chr_rom[chr_bank_0 % 4][offset] = val;
+        else chr_rom[chr_bank_1 % 4][offset] = val;
     } else {
         uint8_t bank = (chr_bank_0 & 0x0E);
-        chr_rom[(bank + ((addr >= 0x1000) ? 1 : 0)) % 2][offset] = val;
+        if (addr < 0x1000) chr_rom[bank % 4][offset] = val;
+        else chr_rom[(bank + 1) % 4][offset] = val;
     }
 }
