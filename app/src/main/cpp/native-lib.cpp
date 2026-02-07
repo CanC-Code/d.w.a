@@ -15,13 +15,14 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 // ============================================================================
-// GLOBAL CPU STATE
+// GLOBAL CPU & EMULATOR STATE
 // ============================================================================
 uint16_t reg_PC = 0;
 uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
 
 uint8_t cpu_ram[0x0800] = {0};
 uint8_t ppu_status = 0, ppu_ctrl = 0, ppu_mask = 0, ppu_addr_latch = 0;
+uint8_t controller_state = 0; // Standard NES controller bitmask
 
 uint32_t screen_buffer[256 * 240] = {0};
 
@@ -37,7 +38,6 @@ namespace Dispatcher { void execute(); }
 // ============================================================================
 // DEBUG RENDERER (Manual Pixel Font)
 // ============================================================================
-// Simple 5x7 Font Bitmaps (Minimal set: 0-9, A-F, ':', ' ')
 const uint8_t font5x7[] = {
     0x3E, 0x51, 0x49, 0x45, 0x3E, // 0
     0x00, 0x42, 0x7F, 0x40, 0x00, // 1
@@ -48,40 +48,48 @@ const uint8_t font5x7[] = {
     0x3C, 0x4A, 0x49, 0x49, 0x30, // 6
     0x01, 0x71, 0x09, 0x05, 0x03, // 7
     0x36, 0x49, 0x49, 0x49, 0x36, // 8
-    0x06, 0x49, 0x49, 0x29, 0x1E  // 9
+    0x06, 0x49, 0x49, 0x29, 0x1E, // 9
+    0x7E, 0x11, 0x11, 0x11, 0x7E, // A
+    0x7F, 0x49, 0x49, 0x49, 0x36, // B
+    0x3E, 0x41, 0x41, 0x41, 0x22, // C
+    0x7F, 0x41, 0x41, 0x22, 0x1C, // D
+    0x7F, 0x49, 0x49, 0x49, 0x41, // E
+    0x7F, 0x09, 0x09, 0x09, 0x01  // F
 };
-
-void draw_pixel(int x, int y, uint32_t color) {
-    if (x >= 0 && x < 256 && y >= 0 && y < 240) {
-        screen_buffer[y * 256 + x] = color;
-    }
-}
 
 void draw_char(int x, int y, char c, uint32_t color) {
     int idx = -1;
     if (c >= '0' && c <= '9') idx = (c - '0') * 5;
-    if (idx == -1) return; // Simplified: only numbers for now
+    else if (c >= 'A' && c <= 'F') idx = (10 + (c - 'A')) * 5;
+    if (idx == -1) return;
     for (int i = 0; i < 5; i++) {
         uint8_t line = font5x7[idx + i];
         for (int j = 0; j < 7; j++) {
-            if (line & (1 << j)) draw_pixel(x + i, y + j, color);
+            if (line & (1 << j)) {
+                if ((x + i) < 256 && (y + j) < 240)
+                    screen_buffer[(y + j) * 256 + (x + i)] = color;
+            }
         }
     }
 }
 
 void draw_debug_ui() {
-    char buf[64];
-    // Render PC to screen buffer as simple pixels
+    char buf[16];
     sprintf(buf, "%04X", reg_PC);
-    for(int i=0; i<4; i++) draw_char(10 + (i*6), 10, buf[i], 0xFFFF0000); // Red PC
+    for(int i=0; i<4; i++) draw_char(10 + (i*6), 10, buf[i], 0xFFFF0000);
 }
 
 // ============================================================================
-// BUS INTERFACE
+// BUS INTERFACE (Critical for Dragon Warrior/MMC1)
 // ============================================================================
 extern "C" {
     uint8_t bus_read(uint16_t addr) {
         if (addr < 0x2000) return cpu_ram[addr & 0x07FF];
+        if (addr == 0x4016) { // Read Controller
+            uint8_t ret = (controller_state & 0x80) ? 1 : 0;
+            controller_state <<= 1;
+            return ret;
+        }
         if (addr >= 0x6000) return mapper.read_prg(addr);
         return 0;
     }
@@ -121,11 +129,8 @@ void engine_loop() {
     while(is_running) {
         auto frame_start = std::chrono::steady_clock::now();
 
-        // Safety: Fill with Dark Blue if no game pixels are being drawn
-        // This proves the engine is actually looping and JNI is updating
-        if (frame_count % 60 == 0) {
-             memset(screen_buffer, 0x11, sizeof(screen_buffer)); 
-        }
+        // Clear only if needed, or the game will flicker
+        // memset(screen_buffer, 0, sizeof(screen_buffer));
 
         ppu_status &= ~0x80; 
         for(int i = 0; i < 400; i++) Dispatcher::execute();
@@ -155,10 +160,18 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstri
 
     const char *path = env->GetStringUTFChars(romPath, nullptr);
     std::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) return env->NewStringUTF("Fail");
+    if (!file.is_open()) return env->NewStringUTF("Fail: File Not Found");
 
-    file.seekg(16, std::ios::beg);
-    for(int i=0; i<4; i++) file.read((char*)mapper.prg_rom[i], 16384);
+    file.seekg(16, std::ios::beg); // Skip iNES header
+    
+    // Dragon Warrior is 64KB PRG. We must fill all 4 banks to avoid "empty" memory.
+    for(int i=0; i<4; i++) {
+        file.read((char*)mapper.prg_rom[i], 16384);
+        if (file.gcount() < 16384) {
+            LOGI("Mirroring ROM Bank %d", i);
+            memcpy(mapper.prg_rom[i], mapper.prg_rom[i%2], 16384);
+        }
+    }
     file.close();
 
     env->ReleaseStringUTFChars(romPath, path);
@@ -183,7 +196,8 @@ Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv *env, jobject thiz, jo
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_injectInput(JNIEnv *env, jobject thiz, jint buttonBit, jboolean isPressed) {
-    // Controller logic will go here
+    if (isPressed) controller_state |= buttonBit;
+    else controller_state &= ~buttonBit;
 }
 
 extern "C" JNIEXPORT void JNICALL
