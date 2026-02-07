@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Dragon Warrior ASM to C++ Converter (Complete Version)
-Generates recompiled C++ code with execute_at(uint16_t pc) signature.
+Dragon Warrior ASM to C++ Converter - COMPLETE PRODUCTION VERSION
+Full addressing mode support + execute_at(uint16_t pc) signature.
 """
 
 import os
@@ -28,9 +28,11 @@ VALID_OPCODES = {
 
 def get_instruction_size(opcode, operand):
     opcode = opcode.lower()
-    if opcode in ['.byte', '.db']: return 1
+    if opcode in ['.byte', '.db', '.asc']: return 1
     if opcode in ['.word', '.dw', '.addr']: return 2
-    
+    if opcode in ['.ds']: return 0 # Size determined elsewhere
+
+    # Implied / Accumulator
     implied_opcodes = {
         'brk', 'clc', 'cld', 'cli', 'clv', 'dex', 'dey', 'inx', 'iny',
         'nop', 'pha', 'php', 'pla', 'plp', 'rti', 'rts', 'sec', 'sed',
@@ -39,17 +41,27 @@ def get_instruction_size(opcode, operand):
     if opcode in implied_opcodes: return 1
     if opcode in ['asl', 'lsr', 'rol', 'ror'] and (not operand or operand.strip().upper() == 'A'):
         return 1
+
     if not operand or operand.strip() == "": return 1
-    if operand.startswith('#'): return 2
-    if '(' in operand: return 2
-    if opcode in ['bcc', 'bcs', 'beq', 'bmi', 'bne', 'bpl', 'bvc', 'bvs']: return 2
-    if ',' in operand:
-        clean = re.sub(r'[#$(),\sXY%]', '', operand)
-        return 2 if len(clean) <= 2 else 3
+    
+    # Addressing Mode Detection
+    operand = operand.strip()
+    if operand.startswith('#'): return 2                 # Immediate
+    if operand.startswith('('): return 2                 # Indirect (assuming ZP for DW)
+    if opcode in ['bcc', 'bcs', 'beq', 'bmi', 'bne', 'bpl', 'bvc', 'bvs']: return 2 # Relative
+    
+    # Check for Absolute vs Zero Page
     clean = re.sub(r'[#$(),\sXY%]', '', operand)
     if clean in global_symbols:
         val = int(global_symbols[clean], 16)
         return 2 if val <= 0xFF else 3
+    
+    # Literal check
+    if '$' in operand:
+        hex_val = re.search(r'\$([0-9A-Fa-f]+)', operand)
+        if hex_val:
+            return 2 if len(hex_val.group(1)) <= 2 else 3
+            
     return 2 if len(clean) <= 2 else 3
 
 def resolve_symbol(symbol):
@@ -66,178 +78,210 @@ def resolve_symbol(symbol):
 def translate_instruction(opcode, operand, pc):
     opcode = opcode.lower()
     if opcode in ['.byte', '.db', '.word', '.dw', '.addr', '.asc', '.ds']:
-        return "// Data directive", get_instruction_size(opcode, operand)
+        return f"// Data: {opcode} {operand}", get_instruction_size(opcode, operand)
+    
     if opcode not in VALID_OPCODES:
-        return f"// Unknown: {opcode}", 0
+        return f"// Unsupported Opcode: {opcode}", 0
 
     size = get_instruction_size(opcode, operand)
     val = resolve_symbol(operand)
-
-    # === IMMEDIATE ADDRESSING ===
-    if operand and operand.startswith('#'):
-        imm = int(val, 16) & 0xFF
-        imm_hex = f"0x{imm:02X}"
-        immediate_ops = {
-            'lda': f'reg_A = {imm_hex}; update_nz(reg_A);',
-            'ldx': f'reg_X = {imm_hex}; update_nz(reg_X);',
-            'ldy': f'reg_Y = {imm_hex}; update_nz(reg_Y);',
-            'cmp': f'update_flags_cmp(reg_A, {imm_hex});',
-            'cpx': f'update_flags_cmp(reg_X, {imm_hex});',
-            'cpy': f'update_flags_cmp(reg_Y, {imm_hex});',
-            'ora': f'reg_A |= {imm_hex}; update_nz(reg_A);',
-            'and': f'reg_A &= {imm_hex}; update_nz(reg_A);',
-            'eor': f'reg_A ^= {imm_hex}; update_nz(reg_A);',
-            'adc': f'cpu_adc({imm_hex});',
-            'sbc': f'cpu_sbc({imm_hex});',
+    addr_val = int(val, 16) & 0xFFFF
+    addr_str = f"0x{addr_val:04X}"
+    
+    # 1. IMMEDIATE
+    if operand.startswith('#'):
+        imm = f"0x{addr_val & 0xFF:02X}"
+        ops = {
+            'lda': f'reg_A = {imm}; update_nz(reg_A);',
+            'ldx': f'reg_X = {imm}; update_nz(reg_X);',
+            'ldy': f'reg_Y = {imm}; update_nz(reg_Y);',
+            'cmp': f'update_flags_cmp(reg_A, {imm});',
+            'cpx': f'update_flags_cmp(reg_X, {imm});',
+            'cpy': f'update_flags_cmp(reg_Y, {imm});',
+            'ora': f'reg_A |= {imm}; update_nz(reg_A);',
+            'and': f'reg_A &= {imm}; update_nz(reg_A);',
+            'eor': f'reg_A ^= {imm}; update_nz(reg_A);',
+            'adc': f'cpu_adc({imm});',
+            'sbc': f'cpu_sbc({imm});'
         }
-        if opcode in immediate_ops: return immediate_ops[opcode], size
+        return ops.get(opcode, f"// Error {opcode} imm"), size
 
-    # === INDIRECT ADDRESSING ===
-    if operand and '(' in operand:
-        addr = int(val, 16) & 0xFF
-        if opcode == 'jmp': return f'reg_PC = read_pointer(0x{addr:04X}); return;', size
+    # 2. INDIRECT (e.g., ($20),Y or ($20,X))
+    if '(' in operand:
+        zp = f"0x{addr_val & 0xFF:02X}"
         if '),Y' in operand.upper():
-            indirect_y_ops = {
-                'lda': f'reg_A = bus_read(read_pointer_indexed_y(0x{addr:02X})); update_nz(reg_A);',
-                'sta': f'bus_write(read_pointer_indexed_y(0x{addr:02X}), reg_A);',
-                'cmp': f'update_flags_cmp(reg_A, bus_read(read_pointer_indexed_y(0x{addr:02X})));',
+            ops = {
+                'lda': f'reg_A = bus_read(read_pointer_indexed_y({zp})); update_nz(reg_A);',
+                'sta': f'bus_write(read_pointer_indexed_y({zp}), reg_A);',
+                'ora': f'reg_A |= bus_read(read_pointer_indexed_y({zp})); update_nz(reg_A);',
+                'and': f'reg_A &= bus_read(read_pointer_indexed_y({zp})); update_nz(reg_A);',
+                'eor': f'reg_A ^= bus_read(read_pointer_indexed_y({zp})); update_nz(reg_A);',
+                'adc': f'cpu_adc(bus_read(read_pointer_indexed_y({zp})));',
+                'sbc': f'cpu_sbc(bus_read(read_pointer_indexed_y({zp})));',
+                'cmp': f'update_flags_cmp(reg_A, bus_read(read_pointer_indexed_y({zp})));'
             }
-            if opcode in indirect_y_ops: return indirect_y_ops[opcode], size
+            return ops.get(opcode, f"// Error {opcode} ind_y"), size
         if ',X)' in operand.upper():
-            return f'reg_A = bus_read(read_pointer_indexed_x(0x{addr:02X})); update_nz(reg_A);', size
+            return f'reg_A = bus_read(read_pointer_indexed_x({zp})); update_nz(reg_A);', size
+        if opcode == 'jmp':
+            return f'reg_PC = read_pointer({addr_str}); return;', size
 
-    # === ABSOLUTE / INDEXED / ZERO PAGE ===
-    addr = int(val, 16) & 0xFFFF
-    addr_str = f"0x{addr:04X}"
-    is_accumulator = (not operand or operand.strip().upper() == 'A') and opcode in ['asl', 'lsr', 'rol', 'ror']
+    # 3. ACCUMULATOR
+    if not operand or operand.strip().upper() == 'A':
+        if opcode == 'asl': return 'reg_A = cpu_asl(reg_A);', size
+        if opcode == 'lsr': return 'reg_A = cpu_lsr(reg_A);', size
+        if opcode == 'rol': return 'reg_A = cpu_rol(reg_A);', size
+        if opcode == 'ror': return 'reg_A = cpu_ror(reg_A);', size
 
-    if operand and ',' in operand:
-        final_addr = f"(uint16_t)({addr_str} + reg_X)" if ',X' in operand.upper() else f"(uint16_t)({addr_str} + reg_Y)"
-    else:
-        final_addr = addr_str
+    # 4. RELATIVE (Branches)
+    branch_conds = {
+        'beq': 'reg_P & FLAG_Z', 'bne': '!(reg_P & FLAG_Z)',
+        'bcs': 'reg_P & FLAG_C', 'bcc': '!(reg_P & FLAG_C)',
+        'bmi': 'reg_P & FLAG_N', 'bpl': '!(reg_P & FLAG_N)',
+        'bvs': 'reg_P & FLAG_V', 'bvc': '!(reg_P & FLAG_V)'
+    }
+    if opcode in branch_conds:
+        return f'if ({branch_conds[opcode]}) {{ reg_PC = {addr_str}; return; }}', size
 
-    memory_ops = {
+    # 5. ABSOLUTE / ZERO PAGE / INDEXED
+    final_addr = addr_str
+    if ',X' in operand.upper(): final_addr = f"(uint16_t)({addr_str} + reg_X)"
+    if ',Y' in operand.upper(): final_addr = f"(uint16_t)({addr_str} + reg_Y)"
+
+    mem_ops = {
         'lda': f'reg_A = bus_read({final_addr}); update_nz(reg_A);',
         'ldx': f'reg_X = bus_read({final_addr}); update_nz(reg_X);',
         'ldy': f'reg_Y = bus_read({final_addr}); update_nz(reg_Y);',
         'sta': f'bus_write({final_addr}, reg_A);',
         'stx': f'bus_write({final_addr}, reg_X);',
         'sty': f'bus_write({final_addr}, reg_Y);',
-        'bit': f'cpu_bit(bus_read({final_addr}));',
         'cmp': f'update_flags_cmp(reg_A, bus_read({final_addr}));',
         'cpx': f'update_flags_cmp(reg_X, bus_read({final_addr}));',
         'cpy': f'update_flags_cmp(reg_Y, bus_read({final_addr}));',
-        'jmp': f'reg_PC = {final_addr}; return;',
-        'jsr': f'{{ uint16_t ret = reg_PC + {size - 1}; push_stack(ret >> 8); push_stack(ret & 0xFF); reg_PC = {final_addr}; return; }}',
+        'bit': f'cpu_bit(bus_read({final_addr}));',
         'inc': f'{{ uint8_t v = bus_read({final_addr}) + 1; bus_write({final_addr}, v); update_nz(v); }}',
         'dec': f'{{ uint8_t v = bus_read({final_addr}) - 1; bus_write({final_addr}, v); update_nz(v); }}',
+        'asl': f'{{ uint8_t v = cpu_asl(bus_read({final_addr})); bus_write({final_addr}, v); }}',
+        'lsr': f'{{ uint8_t v = cpu_lsr(bus_read({final_addr})); bus_write({final_addr}, v); }}',
+        'rol': f'{{ uint8_t v = cpu_rol(bus_read({final_addr})); bus_write({final_addr}, v); }}',
+        'ror': f'{{ uint8_t v = cpu_ror(bus_read({final_addr})); bus_write({final_addr}, v); }}',
+        'jmp': f'reg_PC = {final_addr}; return;',
+        'jsr': f'{{ uint16_t ret = reg_PC + {size-1}; push_stack(ret >> 8); push_stack(ret & 0xFF); reg_PC = {final_addr}; return; }}',
         'adc': f'cpu_adc(bus_read({final_addr}));',
         'sbc': f'cpu_sbc(bus_read({final_addr}));',
         'ora': f'reg_A |= bus_read({final_addr}); update_nz(reg_A);',
         'and': f'reg_A &= bus_read({final_addr}); update_nz(reg_A);',
-        'eor': f'reg_A ^= bus_read({final_addr}); update_nz(reg_A);',
+        'eor': f'reg_A ^= bus_read({final_addr}); update_nz(reg_A);'
     }
+    if opcode in mem_ops: return mem_ops[opcode], size
 
-    if opcode == 'asl':
-        return ('reg_A = cpu_asl(reg_A);' if is_accumulator else f'{{ uint8_t v = cpu_asl(bus_read({final_addr})); bus_write({final_addr}, v); }}'), size
-    elif opcode == 'lsr':
-        return ('reg_A = cpu_lsr(reg_A);' if is_accumulator else f'{{ uint8_t v = cpu_lsr(bus_read({final_addr})); bus_write({final_addr}, v); }}'), size
-    elif opcode == 'rol':
-        return ('reg_A = cpu_rol(reg_A);' if is_accumulator else f'{{ uint8_t v = cpu_rol(bus_read({final_addr})); bus_write({final_addr}, v); }}'), size
-    elif opcode == 'ror':
-        return ('reg_A = cpu_ror(reg_A);' if is_accumulator else f'{{ uint8_t v = cpu_ror(bus_read({final_addr})); bus_write({final_addr}, v); }}'), size
-
-    branch_ops = {
-        'beq': 'reg_P & FLAG_Z', 'bne': '!(reg_P & FLAG_Z)', 'bcs': 'reg_P & FLAG_C', 'bcc': '!(reg_P & FLAG_C)',
-        'bmi': 'reg_P & FLAG_N', 'bpl': '!(reg_P & FLAG_N)', 'bvs': 'reg_P & FLAG_V', 'bvc': '!(reg_P & FLAG_V)',
-    }
-    if opcode in branch_ops: return f'if ({branch_ops[opcode]}) {{ reg_PC = {addr_str}; return; }}', size
-
-    standalone_ops = {
-        'rts': 'reg_PC = (pop_stack() | (pop_stack() << 8)) + 1; return;',
-        'rti': 'reg_P = pop_stack(); reg_PC = (pop_stack() | (pop_stack() << 8)); return;',
-        'brk': 'push_stack((reg_PC + 2) >> 8); push_stack((reg_PC + 2) & 0xFF); push_stack(reg_P | 0x10); reg_P |= FLAG_I; reg_PC = read_pointer(0xFFFE); return;',
-        'tax': 'reg_X = reg_A; update_nz(reg_X);', 'txa': 'reg_A = reg_X; update_nz(reg_A);',
-        'tay': 'reg_Y = reg_A; update_nz(reg_Y);', 'tya': 'reg_A = reg_Y; update_nz(reg_A);',
-        'tsx': 'reg_X = reg_S; update_nz(reg_X);', 'txs': 'reg_S = reg_X;',
+    # 6. IMPLIED
+    implied_ops = {
         'clc': 'reg_P &= ~FLAG_C;', 'sec': 'reg_P |= FLAG_C;',
         'cli': 'reg_P &= ~FLAG_I;', 'sei': 'reg_P |= FLAG_I;',
         'clv': 'reg_P &= ~FLAG_V;', 'cld': 'reg_P &= ~FLAG_D;', 'sed': 'reg_P |= FLAG_D;',
+        'tax': 'reg_X = reg_A; update_nz(reg_X);', 'txa': 'reg_A = reg_X; update_nz(reg_A);',
+        'tay': 'reg_Y = reg_A; update_nz(reg_Y);', 'tya': 'reg_A = reg_Y; update_nz(reg_A);',
+        'tsx': 'reg_X = reg_S; update_nz(reg_X);', 'txs': 'reg_S = reg_X;',
         'dex': 'reg_X--; update_nz(reg_X);', 'inx': 'reg_X++; update_nz(reg_X);',
         'dey': 'reg_Y--; update_nz(reg_Y);', 'iny': 'reg_Y++; update_nz(reg_Y);',
         'pha': 'push_stack(reg_A);', 'pla': 'reg_A = pop_stack(); update_nz(reg_A);',
         'php': 'push_stack(reg_P | 0x10);', 'plp': 'reg_P = pop_stack();',
+        'rts': 'reg_PC = (pop_stack() | (pop_stack() << 8)) + 1; return;',
+        'rti': 'reg_P = pop_stack(); reg_PC = (pop_stack() | (pop_stack() << 8)); return;',
         'nop': '// NOP',
+        'brk': 'push_stack((reg_PC+2) >> 8); push_stack((reg_PC+2) & 0xFF); push_stack(reg_P | 0x10); reg_P |= FLAG_I; reg_PC = read_pointer(0xFFFE); return;'
     }
-    if opcode in standalone_ops: return standalone_ops[opcode], size
-    if opcode in memory_ops: return memory_ops[opcode], size
+    if opcode in implied_ops: return implied_ops[opcode], size
 
     return f"// Unsupported: {opcode} {operand}", size
 
 def convert_asm_file(filename):
     filepath = os.path.join(SOURCE_DIR, filename)
     bank_name = os.path.splitext(filename)[0].replace("-", "_")
+    
+    # Starting PC context
     current_pc = 0xC000 if "Bank03" in filename else 0x8000
+    
     output_path = os.path.join(OUTPUT_DIR, f"{bank_name}.cpp")
-
+    print(f"Generating {output_path}...")
+    
     with open(output_path, 'w') as out:
+        out.write(f'// Auto-generated from {filename}\n')
         out.write('#include "cpu_shared.h"\n\n')
         out.write(f'namespace {bank_name} {{\n')
         out.write('void execute_at(uint16_t pc) {\n')
         out.write('    switch (pc) {\n')
 
-        with open(filepath, 'r') as f:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
+                # 1. Strip comments and whitespace
+                raw_line = line.strip()
                 clean = line.split(';')[0].strip()
                 if not clean: continue
+
+                # 2. Handle ORG
                 org_match = re.match(r'^\.org\s+\$?([0-9A-Fa-f]+)', clean)
                 if org_match:
                     current_pc = int(org_match.group(1), 16)
                     continue
+
+                # 3. Split Label, Opcode, Operand
                 match = re.match(r'^(?:(\w+):)?\s*(\.?\w+)?\s*(.*)$', clean)
                 if not match: continue
                 label, opcode, operand = match.groups()
+                
                 if not opcode: continue
 
+                # 4. Translate
                 code, size = translate_instruction(opcode, operand, current_pc)
+                
+                # 5. Output Switch Case
                 if size > 0 and opcode.lower() in VALID_OPCODES:
-                    out.write(f'        case 0x{current_pc & 0xFFFF:04X}: ')
+                    addr_hex = f"0x{current_pc & 0xFFFF:04X}"
+                    out.write(f'        case {addr_hex}: ')
                     out.write(code)
                     if 'return' not in code:
                         out.write(f' reg_PC += {size}; return;')
                     out.write(f' // {clean}\n')
+                
                 current_pc += size
 
         out.write('        default: reg_PC++; return;\n')
         out.write('    }\n}\n}\n')
 
 def pre_parse_symbols(asm_files):
+    print("Pre-parsing symbols...")
     for filename in sorted(asm_files):
         filepath = os.path.join(SOURCE_DIR, filename)
         current_pc = 0xC000 if "Bank03" in filename else 0x8000
-        with open(filepath, 'r') as f:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
                 line = line.split(';')[0].strip()
                 if not line: continue
                 org_match = re.match(r'^\.org\s+\$?([0-9A-Fa-f]+)', line)
-                if org_match: current_pc = int(org_match.group(1), 16); continue
+                if org_match:
+                    current_pc = int(org_match.group(1), 16)
+                    continue
                 label_match = re.match(r'^(\w+):', line)
                 if label_match:
                     global_symbols[label_match.group(1)] = hex(current_pc & 0xFFFF)
-                    line = re.sub(r'^\w+:\s*', '', line).strip()
                 match = re.match(r'^(\.?\w+)\s*(.*)$', line)
                 if match:
                     opcode, operand = match.groups()
                     current_pc += get_instruction_size(opcode, operand)
 
 def main():
-    if not os.path.exists(SOURCE_DIR): return 1
+    if not os.path.exists(SOURCE_DIR):
+        print(f"Error: {SOURCE_DIR} missing")
+        return 1
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     asm_files = [f for f in os.listdir(SOURCE_DIR) if f.endswith('.asm') and "Defines" not in f]
     pre_parse_symbols(asm_files)
     for filename in asm_files:
         convert_asm_file(filename)
+    print("Done.")
     return 0
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
