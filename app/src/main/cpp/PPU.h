@@ -7,65 +7,72 @@
 
 /**
  * NES PPU (Picture Processing Unit)
- * Handles Nametables, Palettes, OAM (Sprites), and Rendering.
+ * Optimized for recompiled Dragon Warrior execution.
  */
 class PPU {
 public:
     // --- Memory Layout ---
     uint8_t vram[2048];                // Internal Name Tables (2KB)
-    uint8_t palette_ram[32];           // Internal Palette Memory
-    uint8_t oam_ram[256];              // Object Attribute Memory (Sprites)
-    uint32_t screen_buffer[256 * 240]; // Final RGBA pixels (Output for JNI)
+    uint8_t palette_ram[32];           // Internal Palette Memory (Background + Sprites)
+    uint8_t oam_ram[256];              // Object Attribute Memory (64 sprites)
+    uint32_t screen_buffer[256 * 240]; // Final 32-bit RGBA output for Android Surface
 
     // --- Standard PPU Registers ($2000-$2007) ---
-    uint8_t ctrl;     // $2000: Control (NMI, Sprite Size, PT base)
-    uint8_t mask;     // $2001: Mask (Color effects, show/hide layers)
-    uint8_t status;   // $2002: Status (VBlank, Sprite 0 Hit)
+    uint8_t ctrl;     // $2000: Control
+    uint8_t mask;     // $2001: Mask
+    uint8_t status;   // $2002: Status
     uint8_t oam_addr; // $2003: OAM Address
 
-    // --- Internal State (Scrolling & VRAM) ---
-    uint16_t addr_reg;    // Current VRAM address (Looped via $2006)
-    uint8_t addr_latch;   // Toggle for high/low byte writes
-    uint8_t data_buffer;  // Delayed read buffer for PPUDATA
+    // --- Loopy's Internal Registers (Essential for Scrolling) ---
+    // The NES doesn't just use a simple X/Y scroll; it uses a complex
+    // internal address system to track where it is in a frame.
+    union {
+        struct {
+            uint16_t coarse_x : 5;
+            uint16_t coarse_y : 5;
+            uint16_t nametable_x : 1;
+            uint16_t nametable_y : 1;
+            uint16_t fine_y : 3;
+            uint16_t unused : 1;
+        };
+        uint16_t raw;
+    } v_addr, t_addr; // v: Current VRAM address, t: Temporary VRAM address
 
-    // Scroll tracking (Essential for Dragon Warrior map movement)
-    uint8_t scroll_x;     
-    uint8_t scroll_y;
+    uint8_t fine_x;     // Fine X scroll (3 bits)
+    uint8_t addr_latch; // 1-bit write toggle (w)
 
-    // Interrupt handling
-    // Updated: nmi_pending is used by the CPU loop to trigger the NMI routine
-    bool nmi_pending;
+    // --- State & Interrupts ---
+    uint8_t data_buffer;  // Delayed read buffer for $2007
+    bool nmi_pending;     // Trigger for CPU NMI vector
+    int scanline;         // Current rendering line (0-261)
+    int cycle;            // Current pixel clock (0-340)
 
     PPU();
-    
-    /**
-     * Resets PPU state to power-on defaults.
-     */
     void reset();
 
-    // --- CPU Interface ---
-    /**
-     * Handles CPU reads from PPU registers $2000-$2007.
-     * Note: PPUSTATUS ($2002) and PPUDATA ($2007) have side effects.
-     */
+    // --- Bus Communication ---
     uint8_t cpu_read(uint16_t addr, MapperMMC1& mapper);
-
-    /**
-     * Handles CPU writes to PPU registers $2000-$2007.
-     */
     void cpu_write(uint16_t addr, uint8_t val, MapperMMC1& mapper);
 
-    // --- Frame Generation ---
+    // --- OAM DMA ---
     /**
-     * Renders a full 256x240 frame into the screen_buffer.
-     * Uses the Mapper to fetch CHR data for background and sprites.
+     * Rapidly fills OAM memory from CPU RAM ($4014).
+     * This is how the game moves the Hero and NPCs every frame.
+     */
+    void do_dma(const uint8_t* cpu_ram_page) {
+        std::memcpy(oam_ram, cpu_ram_page, 256);
+    }
+
+    // --- Rendering Pipeline ---
+    /**
+     * Renders the frame according to NES hardware timings.
+     * Integrates with the Android Choreographer via the JNI layer.
      */
     void render_frame(MapperMMC1& mapper, const uint32_t* nes_palette);
 
     /**
-     * Helper to signal VBlank and prepare for NMI.
-     * In Dragon Warrior, this is usually called at the end of the frame
-     * to trigger the music and input polling routines.
+     * Signals the end of the visible frame.
+     * Dragon Warrior uses this to trigger the 'MainLoop' for game logic.
      */
     void trigger_vblank() { 
         status |= 0x80; 
@@ -74,10 +81,15 @@ public:
 
 private:
     /**
-     * Handles MMC1-controlled Mirroring (Horizontal, Vertical, One-Screen).
-     * Maps addresses $2000-$3EFF to the 2KB internal VRAM.
+     * Handles hardware-level mirroring.
+     * Maps $2000-$3EFF to the physical 2KB VRAM array.
      */
-    uint16_t get_mirrored_addr(uint16_t addr, uint8_t mirror_mode);
+    uint16_t get_mirrored_addr(uint16_t addr, Mirroring mode);
+
+    /**
+     * Internal helper to fetch tile data from the Mapper.
+     */
+    uint8_t fetch_tile_pixel(MapperMMC1& mapper, uint16_t pt_base, uint8_t tile_id, int x, int y);
 };
 
 #endif // PPU_H
