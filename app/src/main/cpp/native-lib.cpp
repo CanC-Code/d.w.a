@@ -38,6 +38,7 @@ MapperMMC1 mapper;
 bool is_running = false, is_paused = false, rom_loaded = false;
 int frame_count = 0;
 
+// Standard NES Palette
 const uint32_t nes_palette[64] = {
     0xFF666666, 0xFF002A88, 0xFF1412A7, 0xFF3B00A4, 0xFF5C007E, 0xFF6E0040, 0xFF6C0600, 0xFF561D00,
     0xFF333500, 0xFF0B4800, 0xFF005200, 0xFF004F08, 0xFF00404D, 0xFF000000, 0xFF000000, 0xFF000000,
@@ -50,7 +51,7 @@ const uint32_t nes_palette[64] = {
 };
 
 // ============================================================================
-// 6502 CPU CORE & BUS
+// 6502 CPU CORE & BUS (Extern "C" for Recompiled Linkage)
 // ============================================================================
 extern "C" {
     uint16_t reg_PC = 0;
@@ -58,7 +59,7 @@ extern "C" {
 
     void execute_instruction() { Dispatcher::execute(); }
 
-    // Memory Access
+    // --- Memory Access ---
     uint8_t bus_read(uint16_t addr) {
         if (addr < 0x2000) return cpu_ram[addr & 0x07FF];
         if (addr < 0x4000) {
@@ -107,19 +108,98 @@ extern "C" {
         if (addr >= 0x6000) mapper.write(addr, val);
     }
 
-    // Stack and Flags helpers
+    // --- Flag Helpers ---
+    void update_nz(uint8_t v) { 
+        reg_P &= ~(FLAG_N|FLAG_Z); 
+        if(!v) reg_P |= FLAG_Z; 
+        if(v&0x80) reg_P |= FLAG_N; 
+    }
+
+    void update_flags_cmp(uint8_t r, uint8_t v) {
+        reg_P &= ~(FLAG_N | FLAG_Z | FLAG_C);
+        if (r >= v) reg_P |= FLAG_C;
+        if (r == v) reg_P |= FLAG_Z;
+        if ((uint8_t)(r - v) & 0x80) reg_P |= FLAG_N;
+    }
+
+    // --- Math/Bit Operations ---
+    void cpu_adc(uint8_t val) {
+        uint16_t c = (reg_P & FLAG_C) ? 1 : 0;
+        uint16_t sum = reg_A + val + c;
+        if (~(reg_A ^ val) & (reg_A ^ (uint8_t)sum) & 0x80) reg_P |= FLAG_V; else reg_P &= ~FLAG_V;
+        if (sum > 0xFF) reg_P |= FLAG_C; else reg_P &= ~FLAG_C;
+        reg_A = (uint8_t)sum;
+        update_nz(reg_A);
+    }
+
+    void cpu_sbc(uint8_t val) { cpu_adc(~val); }
+
+    void cpu_bit(uint8_t val) {
+        reg_P &= ~(FLAG_Z | FLAG_V | FLAG_N);
+        if (!(val & reg_A)) reg_P |= FLAG_Z;
+        reg_P |= (val & 0xC0);
+    }
+
+    uint8_t cpu_asl(uint8_t val) {
+        reg_P = (reg_P & ~FLAG_C) | ((val >> 7) & 0x01);
+        uint8_t res = val << 1;
+        update_nz(res);
+        return res;
+    }
+
+    uint8_t cpu_lsr(uint8_t val) {
+        reg_P = (reg_P & ~FLAG_C) | (val & 0x01);
+        uint8_t res = val >> 1;
+        update_nz(res);
+        return res;
+    }
+
+    uint8_t cpu_rol(uint8_t val) {
+        uint8_t c = (reg_P & FLAG_C) ? 1 : 0;
+        reg_P = (reg_P & ~FLAG_C) | ((val >> 7) & 0x01);
+        uint8_t res = (val << 1) | c;
+        update_nz(res);
+        return res;
+    }
+
+    uint8_t cpu_ror(uint8_t val) {
+        uint8_t c = (reg_P & FLAG_C) ? 0x80 : 0;
+        reg_P = (reg_P & ~FLAG_C) | (val & 0x01);
+        uint8_t res = (val >> 1) | c;
+        update_nz(res);
+        return res;
+    }
+
+    // --- Addressing Helpers ---
+    uint16_t read_pointer(uint16_t addr) {
+        return bus_read(addr) | (bus_read(addr + 1) << 8);
+    }
+
+    uint16_t read_pointer_indexed_y(uint16_t zp) {
+        uint16_t lo = bus_read(zp);
+        uint16_t hi = bus_read((zp + 1) & 0xFF);
+        return (lo | (hi << 8)) + reg_Y;
+    }
+
+    uint16_t read_pointer_indexed_x(uint16_t zp) {
+        uint8_t base = (zp + reg_X) & 0xFF;
+        return bus_read(base) | (bus_read((base + 1) & 0xFF) << 8);
+    }
+
+    // --- Stack ---
     void push_stack(uint8_t val) { cpu_ram[0x0100 | (reg_S--)] = val; }
     uint8_t pop_stack() { return cpu_ram[0x0100 | (++reg_S)]; }
-    void update_nz(uint8_t v) { reg_P &= ~(FLAG_N|FLAG_Z); if(!v) reg_P |= FLAG_Z; if(v&0x80) reg_P |= FLAG_N; }
 }
 
 // ============================================================================
 // ENGINE LIFECYCLE
 // ============================================================================
+
+
 void power_on_reset() {
     mapper.reset();
-    uint8_t lo = mapper.read_prg(0xFFFC);
-    uint8_t hi = mapper.read_prg(0xFFFD);
+    uint8_t lo = bus_read(0xFFFC);
+    uint8_t hi = bus_read(0xFFFD);
     reg_PC = (hi << 8) | lo;
     reg_S = 0xFD; reg_P = 0x24; reg_A = reg_X = reg_Y = 0;
     ppu_status = 0; ppu_addr_latch = 0;
@@ -127,7 +207,7 @@ void power_on_reset() {
 
 void nmi_handler() {
     push_stack(reg_PC >> 8); push_stack(reg_PC & 0xFF); push_stack(reg_P);
-    uint8_t lo = mapper.read_prg(0xFFFA); uint8_t hi = mapper.read_prg(0xFFFB);
+    uint8_t lo = bus_read(0xFFFA); uint8_t hi = bus_read(0xFFFB);
     reg_PC = (hi << 8) | lo;
     ppu_status |= 0x80; // Set VBlank
 }
@@ -139,7 +219,8 @@ void engine_loop() {
     while(is_running) {
         if(is_paused) { std::this_thread::sleep_for(std::chrono::milliseconds(16)); continue; }
         auto start = std::chrono::steady_clock::now();
-        for(int i=0; i<29780; i++) execute_instruction(); // Run frame cycles
+        // Standard NES Frame: ~29780 CPU cycles
+        for(int i=0; i<29780; i++) execute_instruction(); 
         nmi_handler();
         frame_count++;
         std::this_thread::sleep_until(start + std::chrono::microseconds(16666));
@@ -153,11 +234,15 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstring romPath, jstring outDir) {
     const char *path = env->GetStringUTFChars(romPath, nullptr);
     std::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) return env->NewStringUTF("Error: Open failed");
+    if (!file.is_open()) {
+        env->ReleaseStringUTFChars(romPath, path);
+        return env->NewStringUTF("Error: Open failed");
+    }
     file.seekg(16, std::ios::beg); // Skip iNES Header
     for(int i=0; i<4; i++) file.read((char*)mapper.prg_rom[i], 16384);
-    for(int i=0; i<4; i++) file.read((char*)mapper.chr_rom[i], 4096);
+    for(int i=0; i<2; i++) file.read((char*)mapper.chr_rom[i], 4096);
     file.close();
+    env->ReleaseStringUTFChars(romPath, path);
     rom_loaded = true;
     return env->NewStringUTF("Success");
 }
@@ -171,7 +256,6 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv *env, jobject thiz, jobject bitmap) {
     AndroidBitmapInfo info; void* pixels;
     if (AndroidBitmap_getInfo(env, bitmap, &info) < 0 || AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
-    // Basic software render: simple color dump or PPU logic here
     std::memcpy(pixels, screen_buffer, 256 * 240 * 4);
     AndroidBitmap_unlockPixels(env, bitmap);
 }
