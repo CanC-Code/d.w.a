@@ -7,6 +7,7 @@
 #include <chrono>
 #include <mutex>
 #include <atomic>
+#include <cstring>
 #include "MapperMMC1.h"
 #include "PPU.h"
 #include "recompiled/cpu_shared.h"
@@ -15,17 +16,16 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
 // ============================================================================
-// SYSTEM GLOBALS
+// CPU REGISTERS & MEMORY
 // ============================================================================
 uint16_t reg_PC = 0;
 uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
 uint8_t cpu_ram[0x0800] = {0};
 
-// Hardware Components
 MapperMMC1 mapper;
 PPU ppu;
 
-// NES Classic Palette (RGBA)
+// NES Classic Palette
 const uint32_t nes_palette[64] = {
     0xFF545454, 0xFF741E00, 0xFF901008, 0xFF880030, 0xFF640044, 0xFF30005C, 0xFF000454, 0xFF00183C,
     0xFF002A20, 0xFF003A08, 0xFF004000, 0xFF003C00, 0xFF3C3200, 0xFF000000, 0xFF000000, 0xFF000000,
@@ -37,20 +37,25 @@ const uint32_t nes_palette[64] = {
     0xFFB0E8E4, 0xFFB8F0D0, 0xFFC8F0AC, 0xFFD8F4A0, 0xFFFCF4B8, 0xFFB8B8B8, 0xFF000000, 0xFF000000
 };
 
-// State Control
+// ============================================================================
+// SYSTEM STATE
+// ============================================================================
 std::atomic<bool> is_running{false};
-bool rom_loaded = false;
+std::atomic<bool> rom_ready{false};
 float speed_multiplier = 1.0f;
 uint8_t controller_state = 0;
 uint8_t latched_controller = 0;
 std::mutex state_mutex;
 
-namespace Dispatcher { void execute(); }
+namespace Dispatcher { void execute_at(uint16_t pc); }
 
 // ============================================================================
-// BUS INTERFACE
+// BUS & CPU HELPERS (Called by Recompiled Code)
 // ============================================================================
 extern "C" {
+    void push_stack(uint8_t val) { cpu_ram[0x0100 + (reg_S--)] = val; }
+    uint8_t pop_stack() { return cpu_ram[0x0100 + (++reg_S)]; }
+
     uint8_t bus_read(uint16_t addr) {
         if (addr < 0x2000) return cpu_ram[addr & 0x07FF];
         if (addr >= 0x2000 && addr < 0x4000) return ppu.cpu_read(addr, mapper);
@@ -59,8 +64,7 @@ extern "C" {
             latched_controller <<= 1;
             return ret | 0x40;
         }
-        if (addr >= 0x6000 && addr < 0x8000) return mapper.read_prg(addr);
-        if (addr >= 0x8000) return mapper.read_prg(addr);
+        if (addr >= 0x6000) return mapper.read_prg(addr);
         return 0;
     }
 
@@ -69,12 +73,9 @@ extern "C" {
             cpu_ram[addr & 0x07FF] = val;
         } else if (addr >= 0x2000 && addr < 0x4000) {
             ppu.cpu_write(addr, val, mapper);
-        } else if (addr == 0x4014) {
-            // DMA Transfer: $XX00-$XXFF to PPU OAM
-            uint16_t source_addr = val << 8;
-            for (int i = 0; i < 256; i++) {
-                ppu.oam_ram[i] = bus_read(source_addr + i);
-            }
+        } else if (addr == 0x4014) { // OAM DMA
+            uint16_t source = val << 8;
+            for (int i = 0; i < 256; i++) ppu.oam_ram[i] = bus_read(source + i);
         } else if (addr == 0x4016) {
             if ((val & 0x01) == 0) latched_controller = controller_state;
         } else if (addr >= 0x6000) {
@@ -82,55 +83,59 @@ extern "C" {
         }
     }
 
-    void power_on_reset() {
-        reg_PC = (bus_read(0xFFFD) << 8) | bus_read(0xFFFC);
-        reg_S = 0xFD; reg_P = 0x24;
-    }
-
-    void nmi_handler() {
-        push_stack((reg_PC >> 8) & 0xFF);
-        push_stack(reg_PC & 0xFF);
-        push_stack(reg_P);
-        reg_PC = (bus_read(0xFFFB) << 8) | bus_read(0xFFFA);
-        reg_P |= 0x04;
+    // Required by recompiled flags logic
+    void update_nz(uint8_t val) {
+        reg_P &= ~(0x80 | 0x02);
+        if (val == 0) reg_P |= 0x02;
+        if (val & 0x80) reg_P |= 0x80;
     }
 }
 
 // ============================================================================
-// ENGINE LOOP
+// MAIN ENGINE
 // ============================================================================
 void engine_loop() {
-    power_on_reset();
+    while (!rom_ready) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    
+    // Power on Reset
+    reg_PC = (bus_read(0xFFFD) << 8) | bus_read(0xFFFC);
     is_running = true;
+    LOGI("Engine Started. Entry PC: 0x%04X", reg_PC);
 
     while (is_running) {
         auto frame_start = std::chrono::steady_clock::now();
 
         {
             std::lock_guard<std::mutex> lock(state_mutex);
-            // 1. Execute CPU cycles for one frame (~29780 cycles)
-            // We run instructions until we hit the simulated VBlank point
-            for (int i = 0; i < 29000; i++) {
-                Dispatcher::execute();
+            
+            // 1. Run CPU instructions for roughly 1 frame's worth of cycles
+            for (int i = 0; i < 20000; i++) {
+                Dispatcher::execute_at(reg_PC);
             }
 
-            // 2. Trigger VBlank / NMI
-            ppu.status |= 0x80; 
-            if (ppu.ctrl & 0x80) {
-                nmi_handler();
+            // 2. VBlank Handshake
+            ppu.status |= 0x80; // Set VBlank flag
+            if (ppu.ctrl & 0x80) { // If NMI enabled
+                push_stack((reg_PC >> 8) & 0xFF);
+                push_stack(reg_PC & 0xFF);
+                push_stack(reg_P);
+                reg_PC = (bus_read(0xFFFB) << 8) | bus_read(0xFFFA);
             }
 
-            // 3. Render the graphics to screen_buffer
+            // 3. Render
             ppu.render_frame(mapper, nes_palette);
+            ppu.status &= ~0x80; // Clear VBlank flag
         }
 
-        long delay = (long)(16666 / speed_multiplier);
-        std::this_thread::sleep_until(frame_start + std::chrono::microseconds(delay));
+        auto frame_end = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(frame_end - frame_start).count();
+        long sleep_us = (16666 / speed_multiplier) - elapsed;
+        if (sleep_us > 0) std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
     }
 }
 
 // ============================================================================
-// JNI INTERFACE
+// JNI EXPORTS
 // ============================================================================
 extern "C" {
 
@@ -138,19 +143,18 @@ JNIEXPORT jstring JNICALL
 Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstring romPath, jstring outDir) {
     const char* c_path = env->GetStringUTFChars(romPath, nullptr);
     std::ifstream file(c_path, std::ios::binary);
-    if (!file.is_open()) return env->NewStringUTF("Error: ROM Access Denied");
+    if (!file.is_open()) return env->NewStringUTF("Error: Access Denied");
 
-    file.seekg(16, std::ios::beg); // Skip iNES
-    for (int i = 0; i < 4; i++) file.read((char*)mapper.prg_rom[i], 16384);
+    file.seekg(16); // Skip 16-byte iNES header
+    for (int i = 0; i < 4; i++) {
+        file.read((char*)mapper.prg_rom[i], 16384);
+    }
     
-    // Dragon Warrior 1 specific: If ROM has CHR data, load it. 
-    // If not, it uses CHR-RAM which MapperMMC1 handles.
-    file.read((char*)mapper.chr_rom[0], 4096);
-    file.read((char*)mapper.chr_rom[1], 4096);
-
+    // DW1 uses CHR-RAM, so we don't strictly need to load CHR from ROM, 
+    // but we initialize the mapper buffers here just in case.
+    rom_ready = true;
     file.close();
     env->ReleaseStringUTFChars(romPath, c_path);
-    rom_loaded = true;
     return env->NewStringUTF("Success");
 }
 
@@ -164,15 +168,14 @@ JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv* env, jobject thiz, jobject bitmap) {
     void* pixels;
     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
-    
     std::lock_guard<std::mutex> lock(state_mutex);
     memcpy(pixels, ppu.screen_buffer, 256 * 240 * 4);
-    
     AndroidBitmap_unlockPixels(env, bitmap);
 }
 
 JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_injectInput(JNIEnv* env, jobject thiz, jint bit, jboolean pressed) {
+    std::lock_guard<std::mutex> lock(state_mutex);
     if (pressed) controller_state |= (uint8_t)bit; 
     else controller_state &= ~(uint8_t)bit;
 }
