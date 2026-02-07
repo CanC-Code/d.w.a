@@ -29,7 +29,8 @@ import java.io.InputStream;
 
 public class MainActivity extends AppCompatActivity implements SurfaceHolder.Callback, Choreographer.FrameCallback {
 
-    static { System.loadLibrary("dwa"); }
+    // IMPORTANT: Ensure this matches the library name in your CMakeLists.txt
+    static { System.loadLibrary("native-lib"); }
 
     private static final int PICK_ROM_REQUEST = 1;
     private static final String PREFS_NAME = "ControllerPrefs";
@@ -44,6 +45,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     private boolean isSurfaceReady = false; 
     private boolean isPaused = false;
     private boolean isEditMode = false;
+    private boolean isRomLoadedInNative = false;
 
     private final Rect destRect = new Rect();
     private float gameScreenYOffset = 0;
@@ -71,33 +73,27 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         findViewById(R.id.btn_select_rom).setOnClickListener(v -> openFilePicker());
 
         if (isRomExtracted()) {
+            // If already extracted, we need to tell the native side to re-load it
+            String path = new File(getFilesDir(), "base.nes").getAbsolutePath();
+            nativeExtractRom(path, getFilesDir().getAbsolutePath());
+            isRomLoadedInNative = true;
             showGameLayout();
         }
     }
 
-    /**
-     * The Frame Callback (V-Sync)
-     * This is the heartbeat of the emulator.
-     */
     @Override
     public void doFrame(long frameTimeNanos) {
-        if (isPaused || !isSurfaceReady || !isEngineInitialized) return;
+        if (isPaused || !isSurfaceReady || !isRomLoadedInNative) return;
 
-        // 1. Trigger NMI (Non-Maskable Interrupt)
-        // This tells the recompiled 6502 code that V-Blank has occurred.
-        // Without this, the game hangs on a grey screen.
+        // V-Sync Heartbeat
         nativeTriggerNMI();
-
-        // 2. Run the Engine for one frame and update our Bitmap
         nativeUpdateSurface(screenBitmap);
 
-        // 3. Draw the Bitmap to the SurfaceView
         SurfaceHolder holder = gameSurface.getHolder();
         Canvas canvas = holder.lockCanvas();
         if (canvas != null) {
             try {
-                canvas.drawColor(0xFF000000); // Black background
-
+                canvas.drawColor(0xFF000000); 
                 float baseScale = Math.min((float)gameSurface.getWidth() / 256f, (float)gameSurface.getHeight() / 240f);
                 float finalScale = baseScale * gameScaleFactor;
 
@@ -112,19 +108,16 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
                 holder.unlockCanvasAndPost(canvas); 
             }
         }
-
-        // 4. Queue the next frame
         Choreographer.getInstance().postFrameCallback(this);
     }
 
     private void startNativeEngine() {
         if (!isEngineInitialized) {
-            Log.d(TAG, "Initializing Native Engine...");
             nativeInitEngine(getFilesDir().getAbsolutePath());
             isEngineInitialized = true;
         }
 
-        showGameLayout();
+        runOnUiThread(this::showGameLayout);
 
         if (isSurfaceReady && !isPaused) {
             Choreographer.getInstance().removeFrameCallback(this);
@@ -154,14 +147,12 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     @Override public void surfaceCreated(@NonNull SurfaceHolder h) { 
         isSurfaceReady = true; 
-        if (isRomExtracted()) startNativeEngine(); 
+        if (isRomLoadedInNative) startNativeEngine(); 
     }
 
     @Override public void surfaceDestroyed(@NonNull SurfaceHolder h) { 
         isSurfaceReady = false; 
     }
-
-    // --- ROM Handling ---
 
     private void openFilePicker() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -175,7 +166,10 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == PICK_ROM_REQUEST && resultCode == Activity.RESULT_OK && data != null) {
             Uri uri = data.getData();
-            if (uri != null) copyAndExtract(uri);
+            if (uri != null) {
+                // Run heavy file IO on a background thread to prevent UI hang/crash
+                new Thread(() -> copyAndExtract(uri)).start();
+            }
         }
     }
 
@@ -189,9 +183,15 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             os.close(); is.close();
 
             String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
-            if ("Success".equals(result)) startNativeEngine();
-            else Toast.makeText(this, "ROM Error: " + result, Toast.LENGTH_SHORT).show();
-        } catch (Exception e) { Log.e(TAG, "File error", e); }
+            if ("Success".equals(result)) {
+                isRomLoadedInNative = true;
+                startNativeEngine();
+            } else {
+                runOnUiThread(() -> Toast.makeText(this, "ROM Error: " + result, Toast.LENGTH_SHORT).show());
+            }
+        } catch (Exception e) { 
+            Log.e(TAG, "File error", e); 
+        }
     }
 
     private boolean isRomExtracted() { return new File(getFilesDir(), "base.nes").exists(); }
@@ -201,8 +201,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         if (gameContainer != null) gameContainer.setVisibility(View.VISIBLE);
         setupTouchControls();
     }
-
-    // --- Input & Layout Scaling ---
 
     private void setupScaleDetector() {
         scaleDetector = new ScaleGestureDetector(this, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -219,7 +217,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     @SuppressLint("ClickableViewAccessibility")
     private void setupTouchControls() {
-        // NES Controller Mapping: A=0x80, B=0x40, Select=0x20, Start=0x10, U=0x08, D=0x04, L=0x02, R=0x01
         bindButton(R.id.btn_up, 0x08, "up");
         bindButton(R.id.btn_down, 0x04, "down");
         bindButton(R.id.btn_left, 0x02, "left");
@@ -250,8 +247,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
                 savePosition(key, v1.getX(), v1.getY()); 
                 return true;
             }
-            
-            // Handle Gameplay Input
             if (event.getAction() == MotionEvent.ACTION_DOWN) {
                 injectInput(mask, true);
                 v1.setPressed(true);
@@ -266,7 +261,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     private void saveLayout() { getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().putFloat("screen_y_offset", gameScreenYOffset).putFloat("screen_scale", gameScaleFactor).apply(); }
     private void savePosition(String k, float x, float y) { getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().putFloat(k + "_x", x).putFloat(k + "_y", y).apply(); }
     private void loadPosition(View v, String k) { SharedPreferences p = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE); float x = p.getFloat(k + "_x", -1); float y = p.getFloat(k + "_y", -1); if (x != -1 && y != -1) { v.setX(x); v.setY(y); } }
-    
+
     private void showSettingsMenu() {
         nativePauseEngine();
         String[] options = {"Toggle Orientation", "Edit Layout", "Reset Layout", "Resume"};
@@ -302,5 +297,5 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     public native void injectInput(int buttonBit, boolean isPressed);
     public native void nativePauseEngine();
     public native void nativeResumeEngine();
-    public native void nativeTriggerNMI(); // Essential for Dragon Warrior's frame loop
+    public native void nativeTriggerNMI(); 
 }
