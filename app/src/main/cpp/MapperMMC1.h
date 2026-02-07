@@ -26,7 +26,7 @@ public:
     uint8_t mirroring; 
 
     MapperMMC1();
-    
+
     /**
      * Resets the mapper to its power-on state.
      * MMC1 usually starts with the last PRG bank fixed at $C000.
@@ -35,7 +35,6 @@ public:
 
     /**
      * Handles writes to the mapper registers via the shift register.
-     * 
      */
     void write(uint16_t addr, uint8_t val);
 
@@ -48,6 +47,12 @@ public:
      * Redirects PPU memory reads ($0000-$1FFF) to the correct CHR-ROM bank.
      */
     uint8_t read_chr(uint16_t addr);
+
+    /**
+     * Handles PPU writes to the CHR address space ($0000-$1FFF).
+     * Necessary for games using CHR-RAM or for mapper-controlled CHR access.
+     */
+    void write_chr(uint16_t addr, uint8_t val);
 
     // Helpers to interpret the control register
     uint8_t get_prg_mode() const { return (control >> 2) & 0x03; }
