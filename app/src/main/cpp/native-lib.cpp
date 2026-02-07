@@ -22,7 +22,10 @@ uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
 
 uint8_t cpu_ram[0x0800] = {0};
 uint8_t ppu_status = 0, ppu_ctrl = 0, ppu_mask = 0, ppu_addr_latch = 0;
-uint8_t controller_state = 0; // Standard NES controller bitmask
+
+// Controller state
+uint8_t controller_state = 0;   // Live input from JNI
+uint8_t latched_controller = 0; // Latched state for the CPU to read
 
 uint32_t screen_buffer[256 * 240] = {0};
 
@@ -80,30 +83,61 @@ void draw_debug_ui() {
 }
 
 // ============================================================================
-// BUS INTERFACE (Critical for Dragon Warrior/MMC1)
+// BUS INTERFACE (Corrected Memory Map)
 // ============================================================================
 extern "C" {
     uint8_t bus_read(uint16_t addr) {
+        // 1. Internal RAM (0x0000 - 0x1FFF including mirrors)
         if (addr < 0x2000) return cpu_ram[addr & 0x07FF];
-        if (addr == 0x4016) { // Read Controller
-            uint8_t ret = (controller_state & 0x80) ? 1 : 0;
-            controller_state <<= 1;
-            return ret;
+        
+        // 2. PPU Registers (0x2000 - 0x3FFF mirrors)
+        if (addr >= 0x2000 && addr < 0x4000) {
+            uint16_t ppu_reg = addr & 0x2007;
+            if (ppu_reg == 0x2002) {
+                uint8_t tmp = ppu_status;
+                ppu_status &= ~0x80; // Clear VBlank flag on read
+                return tmp;
+            }
+            return 0;
         }
-        if (addr >= 0x6000) return mapper.read_prg(addr);
+
+        // 3. Controller Input (0x4016)
+        if (addr == 0x4016) {
+            uint8_t ret = (latched_controller & 0x80) ? 1 : 0;
+            latched_controller <<= 1;
+            return ret | 0x40; // 0x40 provides "open bus" signature
+        }
+
+        // 4. Cartridge PRG-ROM (Dragon Warrior starts code here)
+        if (addr >= 0x8000) return mapper.read_prg(addr);
+
+        // 5. Cartridge PRG-RAM / SRAM (Saves)
+        if (addr >= 0x6000) return mapper.read_ram(addr);
+
         return 0;
     }
 
     void bus_write(uint16_t addr, uint8_t val) {
-        if (addr < 0x2000) cpu_ram[addr & 0x07FF] = val;
-        else if (addr >= 0x6000) mapper.write(addr, val);
+        if (addr < 0x2000) {
+            cpu_ram[addr & 0x07FF] = val;
+        } else if (addr >= 0x2000 && addr < 0x4000) {
+            uint16_t ppu_reg = addr & 0x2007;
+            if (ppu_reg == 0x2000) ppu_ctrl = val;
+            if (ppu_reg == 0x2001) ppu_mask = val;
+        } else if (addr == 0x4016) {
+            // NES Controller Strobe: Writing 1-then-0 latches button states
+            if ((val & 0x01) == 0) latched_controller = controller_state;
+        } else if (addr >= 0x6000) {
+            mapper.write(addr, val);
+        }
     }
 
     void power_on_reset() {
         uint8_t lo = bus_read(0xFFFC);
         uint8_t hi = bus_read(0xFFFD);
         reg_PC = (hi << 8) | lo;
-        reg_S = 0xFD; reg_P = 0x24;
+        reg_S = 0xFD; 
+        reg_P = 0x24;
         LOGI("Dragon Warrior Reset: PC=$%04X", reg_PC);
     }
 
@@ -129,11 +163,8 @@ void engine_loop() {
     while(is_running) {
         auto frame_start = std::chrono::steady_clock::now();
 
-        // Clear only if needed, or the game will flicker
-        // memset(screen_buffer, 0, sizeof(screen_buffer));
-
         ppu_status &= ~0x80; 
-        for(int i = 0; i < 400; i++) Dispatcher::execute();
+        for(int i = 0; i < 450; i++) Dispatcher::execute();
 
         ppu_status |= 0x80; 
         if (ppu_ctrl & 0x80) nmi_handler();
@@ -164,12 +195,11 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstri
 
     file.seekg(16, std::ios::beg); // Skip iNES header
     
-    // Dragon Warrior is 64KB PRG. We must fill all 4 banks to avoid "empty" memory.
     for(int i=0; i<4; i++) {
         file.read((char*)mapper.prg_rom[i], 16384);
-        if (file.gcount() < 16384) {
-            LOGI("Mirroring ROM Bank %d", i);
-            memcpy(mapper.prg_rom[i], mapper.prg_rom[i%2], 16384);
+        // Ensure proper mirroring for 64KB ROMs
+        if (file.gcount() < 16384 && i >= 2) {
+            memcpy(mapper.prg_rom[i], mapper.prg_rom[i-2], 16384);
         }
     }
     file.close();
@@ -203,4 +233,5 @@ Java_com_canc_dwa_MainActivity_injectInput(JNIEnv *env, jobject thiz, jint butto
 extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_toggleDebugMenu(JNIEnv *env, jobject thiz) {
     show_debug_menu = !show_debug_menu;
+    LOGI("Native Debug Menu Toggled: %s", show_debug_menu ? "ON" : "OFF");
 }
