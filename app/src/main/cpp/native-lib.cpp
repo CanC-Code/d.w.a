@@ -23,9 +23,9 @@ uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
 uint8_t cpu_ram[0x0800] = {0};
 bool is_running = false;
 bool is_paused = false;
-bool rom_loaded = false; // Guard to prevent execution before loading
+bool rom_loaded = false; 
 
-// Controller State
+// Controller State (NES Standard 8-bit latch)
 uint8_t controller_state = 0;
 uint8_t controller_shift = 0;
 
@@ -37,7 +37,7 @@ std::mutex buffer_mutex;
 // Recompiled Dispatcher Namespace
 namespace Dispatcher { void execute(); }
 
-// NES Color Palette (64 Colors)
+// NES Color Palette (Standard NTSC 64-color palette)
 const uint32_t nes_palette[64] = {
     0xFF666666, 0xFF002A88, 0xFF1412A7, 0xFF3B00A4, 0xFF5C007E, 0xFF6E0040, 0xFF6C0600, 0xFF561D00,
     0xFF333500, 0xFF0B4800, 0xFF005200, 0xFF004F08, 0xFF00404D, 0xFF000000, 0xFF000000, 0xFF000000,
@@ -49,7 +49,7 @@ const uint32_t nes_palette[64] = {
     0xFFF1E094, 0xFFD7EB94, 0xFFB9F1B2, 0xFFAEF1D1, 0xFFAFF1F1, 0xFFC8C8C8, 0xFF000000, 0xFF000000
 };
 
-// --- Shared 6502 CPU Implementation ---
+// --- Shared 6502 CPU Logic (C-Linkage for Recompiled Code) ---
 extern "C" {
 
 void execute_instruction() { Dispatcher::execute(); }
@@ -70,7 +70,6 @@ void update_flags_cmp(uint8_t reg, uint8_t val) {
 void cpu_adc(uint8_t val) {
     uint16_t carry = (reg_P & FLAG_C) ? 1 : 0;
     uint16_t sum = reg_A + val + carry;
-    // Overflow flag logic
     if (~(reg_A ^ val) & (reg_A ^ (uint8_t)sum) & 0x80) reg_P |= FLAG_V; else reg_P &= ~FLAG_V;
     if (sum > 0xFF) reg_P |= FLAG_C; else reg_P &= ~FLAG_C;
     reg_A = (uint8_t)sum;
@@ -82,7 +81,7 @@ void cpu_sbc(uint8_t val) { cpu_adc(~val); }
 void cpu_bit(uint8_t val) {
     reg_P &= ~(FLAG_Z | FLAG_V | FLAG_N);
     if ((val & reg_A) == 0) reg_P |= FLAG_Z;
-    reg_P |= (val & 0xC0); // Bits 7 and 6 of value are copied to N and V flags
+    reg_P |= (val & 0xC0);
 }
 
 uint8_t cpu_asl(uint8_t val) {
@@ -115,34 +114,34 @@ uint8_t cpu_ror(uint8_t val) {
     return res;
 }
 
-// --- Memory Bus Implementation ---
+// --- Bus Operations ---
 
 uint8_t bus_read(uint16_t addr) {
     if (addr < 0x2000) return cpu_ram[addr % 0x0800];
     if (addr >= 0x2000 && addr <= 0x3FFF) return ppu.cpu_read(addr, mapper);
-    if (addr >= 0x6000) return mapper.read_prg(addr);
     if (addr == 0x4016) {
         uint8_t ret = (controller_shift & 0x80) >> 7;
         controller_shift <<= 1;
         return ret;
     }
+    if (addr >= 0x6000) return mapper.read_prg(addr);
     return 0;
 }
 
 void bus_write(uint16_t addr, uint8_t val) {
     if (addr < 0x2000) cpu_ram[addr % 0x0800] = val;
     else if (addr >= 0x2000 && addr <= 0x3FFF) ppu.cpu_write(addr, val, mapper);
-    else if (addr == 0x4014) { // OAM DMA
+    else if (addr == 0x4014) { // OAM DMA (Sprite memory transfer)
         uint16_t base = val << 8;
         for (int i = 0; i < 256; i++) ppu.oam_ram[i] = bus_read(base + i);
     }
     else if (addr == 0x4016) { 
         if ((val & 0x01) == 0) controller_shift = controller_state; 
     }
-    else if (addr >= 0x6000) mapper.write(addr, val);
+    else if (addr >= 0x6000) mapper.write_register(addr, val);
 }
 
-// Helpers for recompiled logic
+// Memory Helpers
 uint16_t read_pointer(uint16_t addr) { return bus_read(addr) | (bus_read(addr + 1) << 8); }
 uint16_t read_pointer_indexed_x(uint16_t zp) { return bus_read((uint8_t)(zp + reg_X)) | (bus_read((uint8_t)(zp + reg_X + 1)) << 8); }
 uint16_t read_pointer_indexed_y(uint16_t zp) { return (bus_read(zp) | (bus_read((uint8_t)(zp + 1)) << 8)) + reg_Y; }
@@ -152,7 +151,7 @@ void clear_screen_to_black() { std::lock_guard<std::mutex> lock(buffer_mutex); s
 
 } // extern "C"
 
-// --- Emulator Cycle ---
+// --- Lifecycle & Interrupts ---
 
 void power_on_reset() {
     mapper.reset();
@@ -161,34 +160,36 @@ void power_on_reset() {
     uint8_t hi = bus_read(0xFFFD);
     reg_PC = (hi << 8) | lo;
     reg_S = 0xFD; reg_P = 0x24; reg_A = 0; reg_X = 0; reg_Y = 0;
-    LOGI("CPU Reset. Entry Point: $%04X", reg_PC);
+    LOGI("Dragon Warrior Recompiled: PC set to $%04X", reg_PC);
 }
 
 void nmi_handler() {
     push_stack(reg_PC >> 8);
     push_stack(reg_PC & 0xFF);
     push_stack(reg_P);
-    reg_PC = bus_read(0xFFFA) | (bus_read(0xFFFB) << 8);
+    uint8_t lo = bus_read(0xFFFA);
+    uint8_t hi = bus_read(0xFFFB);
+    reg_PC = (hi << 8) | lo;
 }
 
 void engine_loop() {
-    while(!rom_loaded) std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    
+    // Wait until JNI has loaded the ROM banks
+    while(!rom_loaded) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
     power_on_reset();
     is_running = true;
-    
+
     while (is_running) {
         if (is_paused) { std::this_thread::sleep_for(std::chrono::milliseconds(16)); continue; }
 
         auto start = std::chrono::steady_clock::now();
-        
-        // Execute frame cycles
+
+        // 29780 cycles is roughly one NTSC frame
         for (int i = 0; i < 29780; i++) {
             execute_instruction();
-            // In a real NES, NMI is triggered by PPU at start of VBlank
-            // Check if PPU wants an NMI (VBlank bit and NMI enabled bit)
-            if ((ppu.status & 0x80) && (ppu.ctrl & 0x80)) {
-                ppu.status &= ~0x80; // Clear flag to prevent loop
+            // Check for PPU NMI signal
+            if (ppu.nmi_pending) {
+                ppu.nmi_pending = false;
                 nmi_handler();
             }
         }
@@ -198,11 +199,12 @@ void engine_loop() {
             ppu.render_frame(mapper, nes_palette);
         }
 
+        // Maintain 60 FPS
         std::this_thread::sleep_until(start + std::chrono::microseconds(16666));
     }
 }
 
-// --- JNI Bridge ---
+// --- JNI Bridge (Targeting com.canc.dwa) ---
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstring romPath, jstring outDir) {
@@ -210,15 +212,15 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstri
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) { 
         env->ReleaseStringUTFChars(romPath, path); 
-        return env->NewStringUTF("Error: Could not open ROM file"); 
+        return env->NewStringUTF("Error: Could not open ROM"); 
     }
 
-    // Skip iNES Header
+    // Standard iNES header skip
     file.seekg(16, std::ios::beg);
-    
-    // Dragon Warrior 1: 4x16KB PRG Banks
+
+    // Map the 4 PRG banks (64KB total for DW1)
     for (int i = 0; i < 4; i++) file.read((char*)mapper.prg_rom[i], 16384);
-    // 2x8KB CHR Banks (represented as 4x4KB in our header)
+    // Map the CHR banks
     for (int i = 0; i < 4; i++) file.read((char*)mapper.chr_rom[i], 4096);
 
     file.close();
