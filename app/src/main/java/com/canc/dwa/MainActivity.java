@@ -37,7 +37,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     }
 
     private static final int PICK_ROM_REQUEST = 1;
-    private static final String ROM_FILE_NAME = "base.nes";
+    private static final String ROM_FILENAME = "base.nes";
 
     // UI Components
     private View setupContainer, gameContainer, debugOverlay;
@@ -68,51 +68,27 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         debugOverlay = findViewById(R.id.debug_overlay_bg);
 
         screenBitmap = Bitmap.createBitmap(256, 240, Bitmap.Config.ARGB_8888);
-        if (gameSurface != null) {
-            gameSurface.getHolder().addCallback(this);
-        }
+        if (gameSurface != null) gameSurface.getHolder().addCallback(this);
 
         findViewById(R.id.btn_select_rom).setOnClickListener(v -> openFilePicker());
         findViewById(R.id.btn_debug).setOnClickListener(v -> toggleDebugUI());
-
         View turboBtn = findViewById(R.id.btn_turbo);
         if (turboBtn != null) turboBtn.setOnClickListener(v -> toggleTurbo());
 
-        // FIRST LAUNCH CHECK: Does the ROM already exist locally?
-        checkLocalRomAndBoot();
+        // Check for existing ROM on launch
+        checkExistingRom();
     }
 
-    private void checkLocalRomAndBoot() {
-        File internalRom = new File(getFilesDir(), ROM_FILE_NAME);
-        if (internalRom.exists()) {
-            // Boot immediately
-            bootEngine(internalRom.getAbsolutePath());
-        } else {
-            // Show setup UI
-            setupContainer.setVisibility(View.VISIBLE);
-            gameContainer.setVisibility(View.GONE);
+    private void checkExistingRom() {
+        File romFile = new File(getFilesDir(), ROM_FILENAME);
+        if (romFile.exists()) {
+            // Automatically boot if ROM exists
+            initializeGameSession(romFile.getAbsolutePath());
         }
     }
 
-    private void bootEngine(String romPath) {
-        runOnUiThread(() -> {
-            setupContainer.setVisibility(View.GONE);
-            gameContainer.setVisibility(View.VISIBLE);
-            setupTouchControls();
-            
-            // Initialize the native engine (Recompiled banks + PPU)
-            nativeInitEngine(getFilesDir().getAbsolutePath());
-            isEngineRunning = true;
-            
-            // If the surface is already created (e.g. on orientation change), start drawing
-            if (isSurfaceReady) {
-                Choreographer.getInstance().postFrameCallback(this);
-            }
-        });
-    }
-
     // ============================================================================
-    // THE BACK MENU (EXIT & OPTIONS)
+    // MENU SYSTEM & ROM OFFLOADING
     // ============================================================================
 
     @Override
@@ -128,17 +104,17 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         String[] options = {
             isEditMode ? "Lock Controller Layout" : "Move Controller Layout",
             "Reset Game",
-            "Exit to Menu (Wipe ROM)",
+            "ROM Management...",
             "Close App"
         };
 
         new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-            .setTitle("Dragon Warrior Native")
+            .setTitle("Main Menu")
             .setItems(options, (dialog, which) -> {
                 switch (which) {
                     case 0: isEditMode = !isEditMode; break;
-                    case 1: nativeInitEngine(getFilesDir().getAbsolutePath()); break; 
-                    case 2: returnToSetup(); break;
+                    case 1: nativeInitEngine(getFilesDir().getAbsolutePath()); break;
+                    case 2: showRomSubmenu(); break;
                     case 3: finish(); break;
                 }
             })
@@ -146,87 +122,44 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             .show();
     }
 
+    private void showRomSubmenu() {
+        String[] options = {"Offload (Delete) Saved ROM", "Back"};
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("ROM Management")
+            .setItems(options, (dialog, which) -> {
+                if (which == 0) confirmRomDeletion();
+            })
+            .show();
+    }
+
+    private void confirmRomDeletion() {
+        new AlertDialog.Builder(this)
+            .setTitle("Delete ROM?")
+            .setMessage("This will remove the local copy of the ROM and return you to the setup screen.")
+            .setPositiveButton("Delete", (dialog, which) -> deleteLocalRom())
+            .setNegativeButton("Cancel", null)
+            .show();
+    }
+
+    private void deleteLocalRom() {
+        File romFile = new File(getFilesDir(), ROM_FILENAME);
+        if (romFile.exists() && romFile.delete()) {
+            showToast("ROM Removed");
+            returnToSetup();
+        }
+    }
+
     private void returnToSetup() {
         isEngineRunning = false;
         Choreographer.getInstance().removeFrameCallback(this);
-        
-        // Wipe local ROM to allow user to provide a different one
-        File internalRom = new File(getFilesDir(), ROM_FILE_NAME);
-        if (internalRom.exists()) internalRom.delete();
-
-        gameContainer.setVisibility(View.GONE);
-        setupContainer.setVisibility(View.VISIBLE);
-    }
-
-    // ============================================================================
-    // MOVABLE CONTROLS LOGIC
-    // ============================================================================
-
-    private float dX, dY;
-    @SuppressLint("ClickableViewAccessibility")
-    private void bindButton(int resId, int mask) {
-        View button = findViewById(resId);
-        if (button == null) return;
-
-        button.setOnTouchListener((v, event) -> {
-            if (isEditMode) {
-                switch (event.getAction()) {
-                    case MotionEvent.ACTION_DOWN:
-                        dX = v.getX() - event.getRawX();
-                        dY = v.getY() - event.getRawY();
-                        break;
-                    case MotionEvent.ACTION_MOVE:
-                        v.setX(event.getRawX() + dX);
-                        v.setY(event.getRawY() + dY);
-                        break;
-                }
-                return true;
-            } else {
-                switch (event.getAction()) {
-                    case MotionEvent.ACTION_DOWN:
-                        performHapticFeedback();
-                        injectInput(mask, true);
-                        v.setPressed(true);
-                        break;
-                    case MotionEvent.ACTION_UP:
-                    case MotionEvent.ACTION_CANCEL:
-                        injectInput(mask, false);
-                        v.setPressed(false);
-                        break;
-                }
-                return true;
-            }
-        });
-    }
-
-    private void setupTouchControls() {
-        bindButton(R.id.btn_up, 0x08);
-        bindButton(R.id.btn_down, 0x04);
-        bindButton(R.id.btn_left, 0x02);
-        bindButton(R.id.btn_right, 0x01);
-        bindButton(R.id.btn_a, 0x80);
-        bindButton(R.id.btn_b, 0x40);
-        bindButton(R.id.btn_start, 0x10);
-        bindButton(R.id.btn_select, 0x20);
-
-        View dpad = findViewById(R.id.dpad_container);
-        if (dpad != null) dpad.setOnTouchListener((v, event) -> {
-            if (isEditMode) {
-                if (event.getAction() == MotionEvent.ACTION_DOWN) {
-                    dX = v.getX() - event.getRawX();
-                    dY = v.getY() - event.getRawY();
-                } else if (event.getAction() == MotionEvent.ACTION_MOVE) {
-                    v.setX(event.getRawX() + dX);
-                    v.setY(event.getRawY() + dY);
-                }
-                return true;
-            }
-            return false;
+        runOnUiThread(() -> {
+            gameContainer.setVisibility(View.GONE);
+            setupContainer.setVisibility(View.VISIBLE);
         });
     }
 
     // ============================================================================
-    // ROM SELECTION (FIRST LAUNCH)
+    // ROM HANDLING & INITIALIZATION
     // ============================================================================
 
     private void openFilePicker() {
@@ -247,46 +180,54 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     private void copyAndExtractRom(Uri uri) {
         try (InputStream is = getContentResolver().openInputStream(uri)) {
-            File internalRom = new File(getFilesDir(), ROM_FILE_NAME);
+            File internalRom = new File(getFilesDir(), ROM_FILENAME);
             try (FileOutputStream os = new FileOutputStream(internalRom)) {
                 byte[] buffer = new byte[8192];
                 int read;
                 while ((read = is.read(buffer)) != -1) os.write(buffer, 0, read);
             }
 
-            // Call native extraction to verify/parse the ROM
             String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
-
             if ("Success".equals(result)) {
-                bootEngine(internalRom.getAbsolutePath());
+                initializeGameSession(internalRom.getAbsolutePath());
             } else {
-                showToast("Invalid ROM: " + result);
-                if (internalRom.exists()) internalRom.delete();
+                showToast("Extraction Failed: " + result);
             }
         } catch (Exception e) {
-            showToast("Failed to copy ROM: " + e.getMessage());
+            showToast("Load Failed: " + e.getMessage());
         }
     }
 
+    private void initializeGameSession(String romPath) {
+        runOnUiThread(() -> {
+            setupContainer.setVisibility(View.GONE);
+            gameContainer.setVisibility(View.VISIBLE);
+            setupTouchControls();
+            
+            nativeInitEngine(getFilesDir().getAbsolutePath());
+            isEngineRunning = true;
+            
+            if (isSurfaceReady) {
+                Choreographer.getInstance().postFrameCallback(this);
+            }
+        });
+    }
+
     // ============================================================================
-    // RENDER LOOP
+    // RENDERING, INPUT & UTILS
     // ============================================================================
 
     @Override
     public void doFrame(long frameTimeNanos) {
         if (!isEngineRunning || !isSurfaceReady) return;
-
         nativeUpdateSurface(screenBitmap);
-
         Canvas canvas = gameSurface.getHolder().lockCanvas();
         if (canvas != null) {
             try {
                 canvas.drawColor(0xFF000000);
                 float scale = Math.min((float)gameSurface.getWidth() / 256f, (float)gameSurface.getHeight() / 240f);
-                int sw = (int) (256 * scale);
-                int sh = (int) (240 * scale);
-                int left = (gameSurface.getWidth() - sw) / 2;
-                int top = (gameSurface.getHeight() - sh) / 2;
+                int sw = (int) (256 * scale), sh = (int) (240 * scale);
+                int left = (gameSurface.getWidth() - sw) / 2, top = (gameSurface.getHeight() - sh) / 2;
                 destRect.set(left, top, left + sw, top + sh);
                 canvas.drawBitmap(screenBitmap, null, destRect, bitmapPaint);
             } finally {
@@ -296,60 +237,74 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         Choreographer.getInstance().postFrameCallback(this);
     }
 
-    // ============================================================================
-    // SYSTEM OVERRIDES
-    // ============================================================================
+    private float dX, dY;
+    @SuppressLint("ClickableViewAccessibility")
+    private void bindButton(int resId, int mask) {
+        View button = findViewById(resId);
+        if (button == null) return;
+        button.setOnTouchListener((v, event) -> {
+            if (isEditMode) {
+                if (event.getAction() == MotionEvent.ACTION_DOWN) {
+                    dX = v.getX() - event.getRawX(); dY = v.getY() - event.getRawY();
+                } else if (event.getAction() == MotionEvent.ACTION_MOVE) {
+                    v.setX(event.getRawX() + dX); v.setY(event.getRawY() + dY);
+                }
+                return true;
+            } else {
+                if (event.getAction() == MotionEvent.ACTION_DOWN) {
+                    performHapticFeedback(); injectInput(mask, true); v.setPressed(true);
+                } else if (event.getAction() == MotionEvent.ACTION_UP || event.getAction() == MotionEvent.ACTION_CANCEL) {
+                    injectInput(mask, false); v.setPressed(false);
+                }
+                return true;
+            }
+        });
+    }
 
-    @Override public void surfaceCreated(@NonNull SurfaceHolder h) { 
-        isSurfaceReady = true; 
-        if (isEngineRunning) Choreographer.getInstance().postFrameCallback(this);
+    private void setupTouchControls() {
+        int[][] btns = {{R.id.btn_up, 0x08}, {R.id.btn_down, 0x04}, {R.id.btn_left, 0x02}, {R.id.btn_right, 0x01},
+                        {R.id.btn_a, 0x80}, {R.id.btn_b, 0x40}, {R.id.btn_start, 0x10}, {R.id.btn_select, 0x20}};
+        for (int[] b : btns) bindButton(b[0], b[1]);
+        
+        View dpad = findViewById(R.id.dpad_container);
+        if (dpad != null) dpad.setOnTouchListener((v, event) -> {
+            if (isEditMode) {
+                if (event.getAction() == MotionEvent.ACTION_DOWN) {
+                    dX = v.getX() - event.getRawX(); dY = v.getY() - event.getRawY();
+                } else if (event.getAction() == MotionEvent.ACTION_MOVE) {
+                    v.setX(event.getRawX() + dX); v.setY(event.getRawY() + dY);
+                }
+                return true;
+            }
+            return false;
+        });
     }
-    @Override public void surfaceDestroyed(@NonNull SurfaceHolder h) { 
-        isSurfaceReady = false; 
-    }
-    @Override public void surfaceChanged(@NonNull SurfaceHolder h, int f, int w, int h1) {}
-    @Override protected void onResume() { super.onResume(); hideSystemUI(); }
 
     private void hideSystemUI() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            final WindowInsetsController controller = getWindow().getInsetsController();
-            if (controller != null) {
-                controller.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
-                controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            final WindowInsetsController c = getWindow().getInsetsController();
+            if (c != null) {
+                c.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+                c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
             }
-        } else {
-            getWindow().getDecorView().setSystemUiVisibility(
-                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_FULLSCREEN | 
-                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-            );
         }
     }
 
     private void performHapticFeedback() {
         if (vibrator != null && vibrator.hasVibrator()) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                vibrator.vibrate(VibrationEffect.createOneShot(15, VibrationEffect.DEFAULT_AMPLITUDE));
-            } else {
-                vibrator.vibrate(15);
-            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) vibrator.vibrate(VibrationEffect.createOneShot(15, VibrationEffect.DEFAULT_AMPLITUDE));
+            else vibrator.vibrate(15);
         }
     }
 
-    private void toggleTurbo() {
-        isTurboEnabled = !isTurboEnabled;
-        nativeSetTurbo(isTurboEnabled);
-        showToast("Turbo: " + (isTurboEnabled ? "ON" : "OFF"));
-    }
-
-    private void toggleDebugUI() {
-        isDebugVisible = !isDebugVisible;
-        toggleDebugMenu();
-        if (debugOverlay != null) debugOverlay.setVisibility(isDebugVisible ? View.VISIBLE : View.GONE);
-    }
-
+    private void toggleTurbo() { isTurboEnabled = !isTurboEnabled; nativeSetTurbo(isTurboEnabled); showToast("Turbo: " + (isTurboEnabled ? "ON" : "OFF")); }
+    private void toggleDebugUI() { isDebugVisible = !isDebugVisible; toggleDebugMenu(); if (debugOverlay != null) debugOverlay.setVisibility(isDebugVisible ? View.VISIBLE : View.GONE); }
+    @Override public void surfaceCreated(@NonNull SurfaceHolder h) { isSurfaceReady = true; if (isEngineRunning) Choreographer.getInstance().postFrameCallback(this); }
+    @Override public void surfaceDestroyed(@NonNull SurfaceHolder h) { isSurfaceReady = false; }
+    @Override public void surfaceChanged(@NonNull SurfaceHolder h, int f, int w, int h1) {}
+    @Override protected void onResume() { super.onResume(); hideSystemUI(); }
     public void showToast(String msg) { runOnUiThread(() -> Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()); }
 
-    // JNI
     public native String nativeExtractRom(String romPath, String outDir);
     public native void nativeInitEngine(String filesDir);
     public native void nativeUpdateSurface(Bitmap bitmap);
