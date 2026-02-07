@@ -19,10 +19,12 @@ import android.view.SurfaceView;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.widget.FrameLayout;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 
 import java.io.File;
@@ -49,6 +51,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     private boolean isSurfaceReady = false;
     private boolean isDebugVisible = false;
     private boolean isTurboEnabled = false;
+    private boolean isEditMode = false; // For moving controls
 
     private Vibrator vibrator;
 
@@ -59,28 +62,109 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
         vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
 
-        // Bind Views
         setupContainer = findViewById(R.id.setup_layout);
         gameContainer = findViewById(R.id.game_layout);
         gameSurface = findViewById(R.id.game_surface);
         debugOverlay = findViewById(R.id.debug_overlay_bg);
 
-        // Prepare Rendering
         screenBitmap = Bitmap.createBitmap(256, 240, Bitmap.Config.ARGB_8888);
         if (gameSurface != null) {
             gameSurface.getHolder().addCallback(this);
         }
 
-        // Setup Listeners
         findViewById(R.id.btn_select_rom).setOnClickListener(v -> openFilePicker());
         findViewById(R.id.btn_debug).setOnClickListener(v -> toggleDebugUI());
-        
+
         View turboBtn = findViewById(R.id.btn_turbo);
         if (turboBtn != null) turboBtn.setOnClickListener(v -> toggleTurbo());
     }
 
     // ============================================================================
-    // ROM SELECTION & TRANSITION (THE FIX)
+    // THE BACK MENU (EXIT & OPTIONS)
+    // ============================================================================
+
+    @Override
+    public void onBackPressed() {
+        if (gameContainer.getVisibility() == View.VISIBLE) {
+            showGameMenu();
+        } else {
+            super.onBackPressed();
+        }
+    }
+
+    private void showGameMenu() {
+        String[] options = {
+            isEditMode ? "Lock Controller Layout" : "Move Controller Layout",
+            "Reset Game",
+            "Exit to Menu",
+            "Close App"
+        };
+
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Dragon Warrior Native")
+            .setItems(options, (dialog, which) -> {
+                switch (which) {
+                    case 0: isEditMode = !isEditMode; break;
+                    case 1: nativeInitEngine(getFilesDir().getAbsolutePath()); break; 
+                    case 2: returnToSetup(); break;
+                    case 3: finish(); break;
+                }
+            })
+            .setNegativeButton("Resume", null)
+            .show();
+    }
+
+    private void returnToSetup() {
+        isEngineRunning = false;
+        Choreographer.getInstance().removeFrameCallback(this);
+        gameContainer.setVisibility(View.GONE);
+        setupContainer.setVisibility(View.VISIBLE);
+    }
+
+    // ============================================================================
+    // MOVABLE CONTROLS LOGIC
+    // ============================================================================
+
+    private float dX, dY;
+    @SuppressLint("ClickableViewAccessibility")
+    private void bindButton(int resId, int mask) {
+        View button = findViewById(resId);
+        if (button == null) return;
+
+        button.setOnTouchListener((v, event) -> {
+            if (isEditMode) {
+                // Drag Logic
+                switch (event.getAction()) {
+                    case MotionEvent.ACTION_DOWN:
+                        dX = v.getX() - event.getRawX();
+                        dY = v.getY() - event.getRawY();
+                        break;
+                    case MotionEvent.ACTION_MOVE:
+                        v.animate().x(event.getRawX() + dX).y(event.getRawY() + dY).setDuration(0).start();
+                        break;
+                }
+                return true;
+            } else {
+                // Normal Gameplay Logic
+                switch (event.getAction()) {
+                    case MotionEvent.ACTION_DOWN:
+                        performHapticFeedback();
+                        injectInput(mask, true);
+                        v.setPressed(true);
+                        break;
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL:
+                        injectInput(mask, false);
+                        v.setPressed(false);
+                        break;
+                }
+                return true;
+            }
+        });
+    }
+
+    // ============================================================================
+    // ROM & ENGINE INITIALIZATION
     // ============================================================================
 
     private void openFilePicker() {
@@ -95,9 +179,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == PICK_ROM_REQUEST && resultCode == RESULT_OK && data != null) {
             Uri uri = data.getData();
-            if (uri != null) {
-                copyAndExtractRom(uri);
-            }
+            if (uri != null) copyAndExtractRom(uri);
         }
     }
 
@@ -110,23 +192,21 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
                 while ((read = is.read(buffer)) != -1) os.write(buffer, 0, read);
             }
 
-            // Call native extraction
             String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
-            
+
             if ("Success".equals(result)) {
                 runOnUiThread(() -> {
-                    // CRITICAL: Switch UI Layouts
                     setupContainer.setVisibility(View.GONE);
                     gameContainer.setVisibility(View.VISIBLE);
-                    
                     setupTouchControls();
                     
-                    if (!isEngineRunning) {
-                        nativeInitEngine(getFilesDir().getAbsolutePath());
-                        isEngineRunning = true;
+                    // Re-initialize engine state
+                    nativeInitEngine(getFilesDir().getAbsolutePath());
+                    isEngineRunning = true;
+                    
+                    if (isSurfaceReady) {
+                        Choreographer.getInstance().postFrameCallback(this);
                     }
-                    // Start the render loop
-                    Choreographer.getInstance().postFrameCallback(this);
                 });
             } else {
                 showToast("Extraction Failed: " + result);
@@ -136,63 +216,28 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         }
     }
 
-    // ============================================================================
-    // RENDERING & INPUT
-    // ============================================================================
-
     @Override
     public void doFrame(long frameTimeNanos) {
         if (!isEngineRunning || !isSurfaceReady) return;
 
-        // Step 1: Tell C++ to draw the frame into our Bitmap
         nativeUpdateSurface(screenBitmap);
 
-        // Step 2: Draw the Bitmap to the Android Screen
         Canvas canvas = gameSurface.getHolder().lockCanvas();
         if (canvas != null) {
             try {
-                canvas.drawColor(0xFF000000); // Black Bars
-
-                float vW = gameSurface.getWidth();
-                float vH = gameSurface.getHeight();
-                
-                // Maintain NES 4:3 Aspect Ratio
-                float scale = Math.min(vW / 256f, vH / 240f);
+                canvas.drawColor(0xFF000000);
+                float scale = Math.min((float)gameSurface.getWidth() / 256f, (float)gameSurface.getHeight() / 240f);
                 int sw = (int) (256 * scale);
                 int sh = (int) (240 * scale);
-                int left = (int) (vW - sw) / 2;
-                int top = (int) (vH - sh) / 2;
-
+                int left = (gameSurface.getWidth() - sw) / 2;
+                int top = (gameSurface.getHeight() - sh) / 2;
                 destRect.set(left, top, left + sw, top + sh);
                 canvas.drawBitmap(screenBitmap, null, destRect, bitmapPaint);
             } finally {
                 gameSurface.getHolder().unlockCanvasAndPost(canvas);
             }
         }
-        
-        // Schedule next frame
         Choreographer.getInstance().postFrameCallback(this);
-    }
-
-    @SuppressLint("ClickableViewAccessibility")
-    private void bindButton(int resId, int mask) {
-        View button = findViewById(resId);
-        if (button == null) return;
-        button.setOnTouchListener((v, event) -> {
-            switch (event.getAction()) {
-                case MotionEvent.ACTION_DOWN:
-                    performHapticFeedback();
-                    injectInput(mask, true);
-                    v.setPressed(true);
-                    break;
-                case MotionEvent.ACTION_UP:
-                case MotionEvent.ACTION_CANCEL:
-                    injectInput(mask, false);
-                    v.setPressed(false);
-                    break;
-            }
-            return true;
-        });
     }
 
     private void setupTouchControls() {
@@ -204,10 +249,25 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         bindButton(R.id.btn_b, 0x40);
         bindButton(R.id.btn_start, 0x10);
         bindButton(R.id.btn_select, 0x20);
+        // Special case: D-Pad container can also be made movable
+        View dpad = findViewById(R.id.dpad_container);
+        if (dpad != null) dpad.setOnTouchListener((v, event) -> {
+            if (isEditMode) {
+                if (event.getAction() == MotionEvent.ACTION_DOWN) {
+                    dX = v.getX() - event.getRawX();
+                    dY = v.getY() - event.getRawY();
+                } else if (event.getAction() == MotionEvent.ACTION_MOVE) {
+                    v.setX(event.getRawX() + dX);
+                    v.setY(event.getRawY() + dY);
+                }
+                return true;
+            }
+            return false;
+        });
     }
 
     // ============================================================================
-    // SYSTEM & LIFECYCLE
+    // UTILS
     // ============================================================================
 
     private void hideSystemUI() {
@@ -247,16 +307,15 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         if (debugOverlay != null) debugOverlay.setVisibility(isDebugVisible ? View.VISIBLE : View.GONE);
     }
 
-    @Override protected void onResume() { super.onResume(); hideSystemUI(); }
-    @Override public void surfaceCreated(@NonNull SurfaceHolder h) { isSurfaceReady = true; }
+    @Override public void surfaceCreated(@NonNull SurfaceHolder h) { 
+        isSurfaceReady = true; 
+        if (isEngineRunning) Choreographer.getInstance().postFrameCallback(this);
+    }
     @Override public void surfaceDestroyed(@NonNull SurfaceHolder h) { isSurfaceReady = false; }
     @Override public void surfaceChanged(@NonNull SurfaceHolder h, int f, int w, int h1) {}
-    
-    public void showToast(String msg) {
-        runOnUiThread(() -> Toast.makeText(this, msg, Toast.LENGTH_SHORT).show());
-    }
+    @Override protected void onResume() { super.onResume(); hideSystemUI(); }
+    public void showToast(String msg) { runOnUiThread(() -> Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()); }
 
-    // Native Methods
     public native String nativeExtractRom(String romPath, String outDir);
     public native void nativeInitEngine(String filesDir);
     public native void nativeUpdateSurface(Bitmap bitmap);
