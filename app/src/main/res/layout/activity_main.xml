@@ -10,14 +10,12 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:gravity="center"
-        android:orientation="vertical"
-        android:visibility="visible">
-
+        android:orientation="vertical">
         <Button
             android:id="@+id/btn_select_rom"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Select Dragon Warrior ROM" />
+            android:text="Load Dragon Warrior" />
     </LinearLayout>
 
     <androidx.constraintlayout.widget.ConstraintLayout
@@ -40,121 +38,16 @@
             android:id="@+id/debug_overlay_bg"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:background="#88000000"
+            android:background="#AA000000"
             android:visibility="gone" />
 
-        <androidx.constraintlayout.widget.ConstraintLayout
-            android:id="@+id/dpad_container"
-            android:layout_width="150dp"
-            android:layout_height="150dp"
-            android:layout_marginStart="20dp"
-            android:layout_marginBottom="20dp"
-            app:layout_constraintBottom_toBottomOf="parent"
-            app:layout_constraintStart_toStartOf="parent">
-
-            <ImageButton
-                android:id="@+id/btn_up"
-                android:layout_width="50dp"
-                android:layout_height="50dp"
-                android:src="@drawable/button_up"
-                android:background="@android:color/transparent"
-                android:scaleType="fitCenter"
-                app:layout_constraintTop_toTopOf="parent"
-                app:layout_constraintStart_toStartOf="parent"
-                app:layout_constraintEnd_toEndOf="parent" />
-
-            <ImageButton
-                android:id="@+id/btn_down"
-                android:layout_width="50dp"
-                android:layout_height="50dp"
-                android:src="@drawable/button_down"
-                android:background="@android:color/transparent"
-                android:scaleType="fitCenter"
-                app:layout_constraintBottom_toBottomOf="parent"
-                app:layout_constraintStart_toStartOf="parent"
-                app:layout_constraintEnd_toEndOf="parent" />
-
-            <ImageButton
-                android:id="@+id/btn_left"
-                android:layout_width="50dp"
-                android:layout_height="50dp"
-                android:src="@drawable/button_left"
-                android:background="@android:color/transparent"
-                android:scaleType="fitCenter"
-                app:layout_constraintStart_toStartOf="parent"
-                app:layout_constraintTop_toTopOf="parent"
-                app:layout_constraintBottom_toBottomOf="parent" />
-
-            <ImageButton
-                android:id="@+id/btn_right"
-                android:layout_width="50dp"
-                android:layout_height="50dp"
-                android:src="@drawable/button_right"
-                android:background="@android:color/transparent"
-                android:scaleType="fitCenter"
-                app:layout_constraintEnd_toEndOf="parent"
-                app:layout_constraintTop_toTopOf="parent"
-                app:layout_constraintBottom_toBottomOf="parent" />
-        </androidx.constraintlayout.widget.ConstraintLayout>
-
-        <ImageButton
-            android:id="@+id/btn_a"
-            android:layout_width="70dp"
-            android:layout_height="70dp"
-            android:layout_marginEnd="30dp"
-            android:layout_marginBottom="80dp"
-            android:src="@drawable/button_a"
-            android:background="@android:color/transparent"
-            android:scaleType="fitCenter"
-            app:layout_constraintBottom_toBottomOf="parent"
-            app:layout_constraintEnd_toEndOf="parent" />
-
-        <ImageButton
-            android:id="@+id/btn_b"
-            android:layout_width="70dp"
-            android:layout_height="70dp"
-            android:layout_marginEnd="110dp"
-            android:layout_marginBottom="40dp"
-            android:src="@drawable/button_b"
-            android:background="@android:color/transparent"
-            android:scaleType="fitCenter"
-            app:layout_constraintBottom_toBottomOf="parent"
-            app:layout_constraintEnd_toEndOf="parent" />
-
-        <LinearLayout
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginBottom="24dp"
-            app:layout_constraintBottom_toBottomOf="parent"
-            app:layout_constraintLeft_toLeftOf="parent"
-            app:layout_constraintRight_toRightOf="parent">
-            
-            <ImageButton
-                android:id="@+id/btn_select"
-                android:layout_width="60dp"
-                android:layout_height="30dp"
-                android:layout_marginEnd="10dp"
-                android:src="@drawable/button_select"
-                android:background="@android:color/transparent"
-                android:scaleType="fitCenter" />
-
-            <ImageButton
-                android:id="@+id/btn_start"
-                android:layout_width="60dp"
-                android:layout_height="30dp"
-                android:src="@drawable/button_start"
-                android:background="@android:color/transparent"
-                android:scaleType="fitCenter" />
-        </LinearLayout>
-
-        <Button
+        <include layout="@layout/dpad_layout" /> <Button
             android:id="@+id/btn_debug"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="DEBUG"
-            android:alpha="0.5"
             app:layout_constraintTop_toTopOf="parent"
             app:layout_constraintRight_toRightOf="parent" />
 
-    </androidx.constraintlayout.widget.ConstraintLayout>
+        </androidx.constraintlayout.widget.ConstraintLayout>
 </FrameLayout>
