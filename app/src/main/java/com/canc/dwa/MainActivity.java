@@ -14,7 +14,6 @@ import android.view.MotionEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
-import android.widget.Button;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
@@ -46,16 +45,23 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        // Link UI components to XML IDs
         setupContainer = findViewById(R.id.setup_layout);
         gameContainer = findViewById(R.id.game_layout);
         gameSurface = findViewById(R.id.game_surface);
-        debugOverlay = findViewById(R.id.debug_overlay_bg); // Link to the XML overlay
+        debugOverlay = findViewById(R.id.debug_overlay_bg); 
 
-        // Standard NES Resolution
+        // Standard NES Resolution Bitmap (256x240)
         screenBitmap = Bitmap.createBitmap(256, 240, Bitmap.Config.ARGB_8888);
-        gameSurface.getHolder().addCallback(this);
+        
+        if (gameSurface != null) {
+            gameSurface.getHolder().addCallback(this);
+        }
 
-        findViewById(R.id.btn_select_rom).setOnClickListener(v -> openFilePicker());
+        View selectRomBtn = findViewById(R.id.btn_select_rom);
+        if (selectRomBtn != null) {
+            selectRomBtn.setOnClickListener(v -> openFilePicker());
+        }
 
         View debugBtn = findViewById(R.id.btn_debug);
         if (debugBtn != null) {
@@ -64,17 +70,19 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     }
 
     /**
-     * Handles the back button:
-     * 1. Closes the debug menu if open.
-     * 2. Prompts or exits if in game.
+     * RESTORES THE MENU BEHAVIOR:
+     * 1. If Debug is open, close it.
+     * 2. If in-game, return to the Setup/ROM picker (the "Back Button Menu").
+     * 3. Only exits the app if already on the Setup screen.
      */
     @Override
     public void onBackPressed() {
         if (isDebugVisible) {
-            toggleDebugUI(); // Close debug first
-        } else if (isEngineRunning) {
-            // Optional: Add a "Quit Game?" dialog here
-            super.onBackPressed();
+            toggleDebugUI(); 
+        } else if (isEngineRunning && gameContainer != null && gameContainer.getVisibility() == View.VISIBLE) {
+            // Act as a "Menu" button to return to ROM selection
+            gameContainer.setVisibility(View.GONE);
+            if (setupContainer != null) setupContainer.setVisibility(View.VISIBLE);
         } else {
             super.onBackPressed();
         }
@@ -125,16 +133,17 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     }
 
     private void startNativeEngine() {
-        if (isEngineRunning) return;
-
+        // UI transition must happen on the main thread
         runOnUiThread(() -> {
-            setupContainer.setVisibility(View.GONE);
-            gameContainer.setVisibility(View.VISIBLE);
+            if (setupContainer != null) setupContainer.setVisibility(View.GONE);
+            if (gameContainer != null) gameContainer.setVisibility(View.VISIBLE);
             setupTouchControls(); 
         });
 
-        nativeInitEngine(getFilesDir().getAbsolutePath());
-        isEngineRunning = true;
+        if (!isEngineRunning) {
+            nativeInitEngine(getFilesDir().getAbsolutePath());
+            isEngineRunning = true;
+        }
 
         if (isSurfaceReady) {
             Choreographer.getInstance().postFrameCallback(this);
@@ -143,7 +152,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     @SuppressLint("ClickableViewAccessibility")
     private void setupTouchControls() {
-        // NES Controller mapping (Standard bitmask)
+        // Bind NES Controller bitmasks to UI buttons
         bindButton(R.id.btn_up, 0x08);
         bindButton(R.id.btn_down, 0x04);
         bindButton(R.id.btn_left, 0x02);
@@ -173,21 +182,23 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     @Override
     public void doFrame(long frameTimeNanos) {
-        if (!isEngineRunning || !isSurfaceReady) return;
+        if (!isEngineRunning || !isSurfaceReady || gameSurface == null) return;
 
+        // 1. Pull the native pixel buffer into the Bitmap
         nativeUpdateSurface(screenBitmap);
 
+        // 2. Lock the Surface Canvas and render the scaled Bitmap
         SurfaceHolder holder = gameSurface.getHolder();
         Canvas canvas = holder.lockCanvas();
         if (canvas != null) {
             try {
-                canvas.drawColor(0xFF000000); 
+                canvas.drawColor(0xFF000000); // Letterbox background
 
-                // Aspect Ratio Logic (4:3)
                 float viewWidth = gameSurface.getWidth();
                 float viewHeight = gameSurface.getHeight();
-                float scale = Math.min(viewWidth / 256f, viewHeight / 240f);
                 
+                // Aspect Ratio Logic (4:3 for Dragon Warrior)
+                float scale = Math.min(viewWidth / 256f, viewHeight / 240f);
                 int sw = (int) (256 * scale);
                 int sh = (int) (240 * scale);
                 int left = (int) (viewWidth - sw) / 2;
@@ -199,12 +210,14 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
                 holder.unlockCanvasAndPost(canvas);
             }
         }
+
+        // 3. Keep the loop running
         Choreographer.getInstance().postFrameCallback(this);
     }
 
     private void toggleDebugUI() {
         isDebugVisible = !isDebugVisible;
-        toggleDebugMenu(); // Call Native toggle
+        toggleDebugMenu(); // NOTIFIES C++ ENGINE
         if (debugOverlay != null) {
             debugOverlay.setVisibility(isDebugVisible ? View.VISIBLE : View.GONE);
         }
