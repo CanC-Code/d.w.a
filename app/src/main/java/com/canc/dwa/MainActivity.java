@@ -49,6 +49,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         gameContainer = findViewById(R.id.game_layout);
         gameSurface = findViewById(R.id.game_surface);
 
+        // Standard NES Resolution
         screenBitmap = Bitmap.createBitmap(256, 240, Bitmap.Config.ARGB_8888);
         gameSurface.getHolder().addCallback(this);
 
@@ -61,11 +62,10 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         }
     }
 
-    // --- Missing Method 1: File Picker Launcher ---
     private void openFilePicker() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("*/*");
+        intent.setType("*/*"); // Allow .nes files or generic streams
         startActivityForResult(intent, PICK_ROM_REQUEST);
     }
 
@@ -82,6 +82,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     private void copyAndExtractRom(Uri uri) {
         try {
+            // Copy selected URI to internal app storage for C++ access
             InputStream is = getContentResolver().openInputStream(uri);
             File internalRom = new File(getFilesDir(), "base.nes");
             FileOutputStream os = new FileOutputStream(internalRom);
@@ -94,6 +95,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             os.close();
             is.close();
 
+            // Notify JNI to load the bytes into the Mapper
             String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
             if ("Success".equals(result)) {
                 startNativeEngine();
@@ -108,23 +110,27 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     private void startNativeEngine() {
         if (isEngineRunning) return;
-        
+
+        // UI transition must happen on Main Thread
         runOnUiThread(() -> {
             if (setupContainer != null) setupContainer.setVisibility(View.GONE);
             if (gameContainer != null) gameContainer.setVisibility(View.VISIBLE);
-            setupTouchControls(); // Restore call to input binding
+            setupTouchControls(); 
         });
 
+        // This triggers the detached C++ thread in native-lib
         nativeInitEngine(getFilesDir().getAbsolutePath());
         isEngineRunning = true;
+
+        // Begin the rendering loop if surface is already up
         if (isSurfaceReady) {
             Choreographer.getInstance().postFrameCallback(this);
         }
     }
 
-    // --- Missing Method 2: Touch Control Binding ---
     @SuppressLint("ClickableViewAccessibility")
     private void setupTouchControls() {
+        // NES Controller mapping (Standard bitmask)
         bindButton(R.id.btn_up, 0x08);
         bindButton(R.id.btn_down, 0x04);
         bindButton(R.id.btn_left, 0x02);
@@ -156,48 +162,62 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     public void doFrame(long frameTimeNanos) {
         if (!isEngineRunning || !isSurfaceReady) return;
 
+        // 1. Pull the native buffer into our Bitmap
         nativeUpdateSurface(screenBitmap);
 
+        // 2. Draw the Bitmap to the SurfaceView with Scaling
         SurfaceHolder holder = gameSurface.getHolder();
         Canvas canvas = holder.lockCanvas();
         if (canvas != null) {
             try {
-                canvas.drawColor(0xFF000000);
+                canvas.drawColor(0xFF000000); // Black background (letterboxing)
+                
+                // Keep Aspect Ratio (4:3 for NES)
                 float scale = Math.min((float) gameSurface.getWidth() / 256f, (float) gameSurface.getHeight() / 240f);
                 int sw = (int) (256 * scale);
                 int sh = (int) (240 * scale);
                 int left = (gameSurface.getWidth() - sw) / 2;
                 int top = (gameSurface.getHeight() - sh) / 2;
+                
                 destRect.set(left, top, left + sw, top + sh);
                 canvas.drawBitmap(screenBitmap, null, destRect, null);
             } finally {
                 holder.unlockCanvasAndPost(canvas);
             }
         }
+
+        // 3. Schedule next frame
         Choreographer.getInstance().postFrameCallback(this);
     }
 
-    // --- SurfaceHolder Callbacks ---
     @Override
     public void surfaceCreated(@NonNull SurfaceHolder holder) {
         isSurfaceReady = true;
-        if (isEngineRunning) Choreographer.getInstance().postFrameCallback(this);
+        if (isEngineRunning) {
+            Choreographer.getInstance().postFrameCallback(this);
+        }
     }
 
     @Override
-    public void surfaceChanged(@NonNull SurfaceHolder holder, int format, int width, int height) {}
+    public void surfaceChanged(@NonNull SurfaceHolder holder, int format, int width, int height) {
+        // Surface resized; destRect will be recalculated in next doFrame
+    }
 
-    // --- Missing Method 3: surfaceDestroyed ---
     @Override
     public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
         isSurfaceReady = false;
+        // Stop the frame callbacks to prevent locking a null canvas
+        Choreographer.getInstance().removeFrameCallback(this);
     }
 
+    /**
+     * Called by Native C++ code to show messages on UI thread
+     */
     public void showToast(final String message) {
         runOnUiThread(() -> Toast.makeText(MainActivity.this, message, Toast.LENGTH_SHORT).show());
     }
 
-    // Native Interface
+    // --- Native JNI Interface ---
     public native String nativeExtractRom(String romPath, String outDir);
     public native void nativeInitEngine(String filesDir);
     public native void nativeUpdateSurface(Bitmap bitmap);
