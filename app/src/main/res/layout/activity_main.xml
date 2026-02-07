@@ -42,6 +42,16 @@
             android:background="#AA000000"
             android:visibility="gone" />
 
+        <Button
+            android:id="@+id/btn_turbo"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_margin="16dp"
+            android:text="TURBO"
+            android:alpha="0.6"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="parent" />
+
         <androidx.constraintlayout.widget.ConstraintLayout
             android:id="@+id/dpad_container"
             android:layout_width="150dp"
