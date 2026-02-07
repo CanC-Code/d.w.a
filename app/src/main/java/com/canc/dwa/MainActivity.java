@@ -18,7 +18,6 @@ import android.widget.Button;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
-import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 
 import java.io.File;
@@ -56,24 +55,30 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         Button selectRomBtn = findViewById(R.id.btn_select_rom);
         selectRomBtn.setOnClickListener(v -> openFilePicker());
 
-        // New: Hook up a long press or a specific button for the Native Debug Menu
         Button debugBtn = findViewById(R.id.btn_debug);
         if (debugBtn != null) {
             debugBtn.setOnClickListener(v -> toggleDebugMenu());
         }
     }
 
-    /**
-     * CRITICAL: Called by Native C++ via JNI.
-     * This allows the background engine thread to send messages to the user.
-     */
-    public void showToast(final String message) {
-        runOnUiThread(() -> {
-            Toast.makeText(MainActivity.this, message, Toast.LENGTH_SHORT).show();
-        });
+    // --- Missing Method 1: File Picker Launcher ---
+    private void openFilePicker() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        startActivityForResult(intent, PICK_ROM_REQUEST);
     }
 
-    // ... [openFilePicker and onActivityResult remain the same] ...
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == PICK_ROM_REQUEST && resultCode == Activity.RESULT_OK && data != null) {
+            Uri uri = data.getData();
+            if (uri != null) {
+                copyAndExtractRom(uri);
+            }
+        }
+    }
 
     private void copyAndExtractRom(Uri uri) {
         try {
@@ -89,11 +94,8 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             os.close();
             is.close();
 
-            // This calls the native-lib.cpp version we just updated
             String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
-            
             if ("Success".equals(result)) {
-                // The native side now also triggers a Toast, but we'll keep this as a backup
                 startNativeEngine();
             } else {
                 showToast("Error: " + result);
@@ -110,7 +112,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         runOnUiThread(() -> {
             if (setupContainer != null) setupContainer.setVisibility(View.GONE);
             if (gameContainer != null) gameContainer.setVisibility(View.VISIBLE);
-            setupTouchControls();
+            setupTouchControls(); // Restore call to input binding
         });
 
         nativeInitEngine(getFilesDir().getAbsolutePath());
@@ -120,28 +122,53 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         }
     }
 
+    // --- Missing Method 2: Touch Control Binding ---
+    @SuppressLint("ClickableViewAccessibility")
+    private void setupTouchControls() {
+        bindButton(R.id.btn_up, 0x08);
+        bindButton(R.id.btn_down, 0x04);
+        bindButton(R.id.btn_left, 0x02);
+        bindButton(R.id.btn_right, 0x01);
+        bindButton(R.id.btn_a, 0x80);
+        bindButton(R.id.btn_b, 0x40);
+        bindButton(R.id.btn_start, 0x10);
+        bindButton(R.id.btn_select, 0x20);
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private void bindButton(int resId, int mask) {
+        View button = findViewById(resId);
+        if (button == null) return;
+        button.setOnTouchListener((v, event) -> {
+            if (event.getAction() == MotionEvent.ACTION_DOWN) {
+                injectInput(mask, true);
+                v.setPressed(true);
+            } else if (event.getAction() == MotionEvent.ACTION_UP ||
+                       event.getAction() == MotionEvent.ACTION_CANCEL) {
+                injectInput(mask, false);
+                v.setPressed(false);
+            }
+            return true;
+        });
+    }
+
     @Override
     public void doFrame(long frameTimeNanos) {
         if (!isEngineRunning || !isSurfaceReady) return;
 
-        // Pull current NES frame buffer from C++
         nativeUpdateSurface(screenBitmap);
 
         SurfaceHolder holder = gameSurface.getHolder();
         Canvas canvas = holder.lockCanvas();
         if (canvas != null) {
             try {
-                // Fit 256x240 to screen while maintaining aspect ratio
-                float scale = Math.min((float) gameSurface.getWidth() / 256f, 
-                                       (float) gameSurface.getHeight() / 240f);
-                
+                canvas.drawColor(0xFF000000);
+                float scale = Math.min((float) gameSurface.getWidth() / 256f, (float) gameSurface.getHeight() / 240f);
                 int sw = (int) (256 * scale);
                 int sh = (int) (240 * scale);
                 int left = (gameSurface.getWidth() - sw) / 2;
                 int top = (gameSurface.getHeight() - sh) / 2;
-
                 destRect.set(left, top, left + sw, top + sh);
-                canvas.drawColor(0xFF000000); // Black bars
                 canvas.drawBitmap(screenBitmap, null, destRect, null);
             } finally {
                 holder.unlockCanvasAndPost(canvas);
@@ -150,14 +177,30 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         Choreographer.getInstance().postFrameCallback(this);
     }
 
-    // ... [Surface callbacks and bindButton remain the same] ...
+    // --- SurfaceHolder Callbacks ---
+    @Override
+    public void surfaceCreated(@NonNull SurfaceHolder holder) {
+        isSurfaceReady = true;
+        if (isEngineRunning) Choreographer.getInstance().postFrameCallback(this);
+    }
 
-    // Native methods
+    @Override
+    public void surfaceChanged(@NonNull SurfaceHolder holder, int format, int width, int height) {}
+
+    // --- Missing Method 3: surfaceDestroyed ---
+    @Override
+    public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
+        isSurfaceReady = false;
+    }
+
+    public void showToast(final String message) {
+        runOnUiThread(() -> Toast.makeText(MainActivity.this, message, Toast.LENGTH_SHORT).show());
+    }
+
+    // Native Interface
     public native String nativeExtractRom(String romPath, String outDir);
     public native void nativeInitEngine(String filesDir);
     public native void nativeUpdateSurface(Bitmap bitmap);
     public native void injectInput(int buttonBit, boolean isPressed);
-    public native void nativePauseEngine();
-    public native void nativeResumeEngine();
-    public native void toggleDebugMenu(); // Matches the new C++ export
+    public native void toggleDebugMenu();
 }
