@@ -13,6 +13,7 @@ android {
         versionCode 1
         versionName "1.0"
 
+        // Keep these to ensure compatibility with all devices/emulators
         ndk {
             abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
         }
@@ -22,6 +23,14 @@ android {
                 cppFlags '-std=c++17 -O3 -flto'
                 arguments '-DANDROID_STL=c++_shared'
             }
+        }
+    }
+
+    // ADD THIS BLOCK: This prevents the generation of 6 separate APKs
+    splits {
+        abi {
+            enable false
+            universalApk false
         }
     }
 
@@ -38,6 +47,8 @@ android {
         debug {
             minifyEnabled false
             debuggable true
+            // Ensure debug builds also produce a single fat APK
+            jniDebuggable true
         }
     }
 
