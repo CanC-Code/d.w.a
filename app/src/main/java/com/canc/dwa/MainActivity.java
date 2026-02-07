@@ -19,7 +19,6 @@ import android.view.SurfaceView;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
-import android.widget.FrameLayout;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
@@ -38,6 +37,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     }
 
     private static final int PICK_ROM_REQUEST = 1;
+    private static final String ROM_FILE_NAME = "base.nes";
 
     // UI Components
     private View setupContainer, gameContainer, debugOverlay;
@@ -51,7 +51,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     private boolean isSurfaceReady = false;
     private boolean isDebugVisible = false;
     private boolean isTurboEnabled = false;
-    private boolean isEditMode = false; // For moving controls
+    private boolean isEditMode = false;
 
     private Vibrator vibrator;
 
@@ -77,6 +77,38 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
         View turboBtn = findViewById(R.id.btn_turbo);
         if (turboBtn != null) turboBtn.setOnClickListener(v -> toggleTurbo());
+
+        // FIRST LAUNCH CHECK: Does the ROM already exist locally?
+        checkLocalRomAndBoot();
+    }
+
+    private void checkLocalRomAndBoot() {
+        File internalRom = new File(getFilesDir(), ROM_FILE_NAME);
+        if (internalRom.exists()) {
+            // Boot immediately
+            bootEngine(internalRom.getAbsolutePath());
+        } else {
+            // Show setup UI
+            setupContainer.setVisibility(View.VISIBLE);
+            gameContainer.setVisibility(View.GONE);
+        }
+    }
+
+    private void bootEngine(String romPath) {
+        runOnUiThread(() -> {
+            setupContainer.setVisibility(View.GONE);
+            gameContainer.setVisibility(View.VISIBLE);
+            setupTouchControls();
+            
+            // Initialize the native engine (Recompiled banks + PPU)
+            nativeInitEngine(getFilesDir().getAbsolutePath());
+            isEngineRunning = true;
+            
+            // If the surface is already created (e.g. on orientation change), start drawing
+            if (isSurfaceReady) {
+                Choreographer.getInstance().postFrameCallback(this);
+            }
+        });
     }
 
     // ============================================================================
@@ -96,7 +128,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         String[] options = {
             isEditMode ? "Lock Controller Layout" : "Move Controller Layout",
             "Reset Game",
-            "Exit to Menu",
+            "Exit to Menu (Wipe ROM)",
             "Close App"
         };
 
@@ -117,6 +149,11 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     private void returnToSetup() {
         isEngineRunning = false;
         Choreographer.getInstance().removeFrameCallback(this);
+        
+        // Wipe local ROM to allow user to provide a different one
+        File internalRom = new File(getFilesDir(), ROM_FILE_NAME);
+        if (internalRom.exists()) internalRom.delete();
+
         gameContainer.setVisibility(View.GONE);
         setupContainer.setVisibility(View.VISIBLE);
     }
@@ -133,19 +170,18 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
         button.setOnTouchListener((v, event) -> {
             if (isEditMode) {
-                // Drag Logic
                 switch (event.getAction()) {
                     case MotionEvent.ACTION_DOWN:
                         dX = v.getX() - event.getRawX();
                         dY = v.getY() - event.getRawY();
                         break;
                     case MotionEvent.ACTION_MOVE:
-                        v.animate().x(event.getRawX() + dX).y(event.getRawY() + dY).setDuration(0).start();
+                        v.setX(event.getRawX() + dX);
+                        v.setY(event.getRawY() + dY);
                         break;
                 }
                 return true;
             } else {
-                // Normal Gameplay Logic
                 switch (event.getAction()) {
                     case MotionEvent.ACTION_DOWN:
                         performHapticFeedback();
@@ -163,8 +199,34 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         });
     }
 
+    private void setupTouchControls() {
+        bindButton(R.id.btn_up, 0x08);
+        bindButton(R.id.btn_down, 0x04);
+        bindButton(R.id.btn_left, 0x02);
+        bindButton(R.id.btn_right, 0x01);
+        bindButton(R.id.btn_a, 0x80);
+        bindButton(R.id.btn_b, 0x40);
+        bindButton(R.id.btn_start, 0x10);
+        bindButton(R.id.btn_select, 0x20);
+
+        View dpad = findViewById(R.id.dpad_container);
+        if (dpad != null) dpad.setOnTouchListener((v, event) -> {
+            if (isEditMode) {
+                if (event.getAction() == MotionEvent.ACTION_DOWN) {
+                    dX = v.getX() - event.getRawX();
+                    dY = v.getY() - event.getRawY();
+                } else if (event.getAction() == MotionEvent.ACTION_MOVE) {
+                    v.setX(event.getRawX() + dX);
+                    v.setY(event.getRawY() + dY);
+                }
+                return true;
+            }
+            return false;
+        });
+    }
+
     // ============================================================================
-    // ROM & ENGINE INITIALIZATION
+    // ROM SELECTION (FIRST LAUNCH)
     // ============================================================================
 
     private void openFilePicker() {
@@ -185,36 +247,30 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     private void copyAndExtractRom(Uri uri) {
         try (InputStream is = getContentResolver().openInputStream(uri)) {
-            File internalRom = new File(getFilesDir(), "base.nes");
+            File internalRom = new File(getFilesDir(), ROM_FILE_NAME);
             try (FileOutputStream os = new FileOutputStream(internalRom)) {
                 byte[] buffer = new byte[8192];
                 int read;
                 while ((read = is.read(buffer)) != -1) os.write(buffer, 0, read);
             }
 
+            // Call native extraction to verify/parse the ROM
             String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
 
             if ("Success".equals(result)) {
-                runOnUiThread(() -> {
-                    setupContainer.setVisibility(View.GONE);
-                    gameContainer.setVisibility(View.VISIBLE);
-                    setupTouchControls();
-                    
-                    // Re-initialize engine state
-                    nativeInitEngine(getFilesDir().getAbsolutePath());
-                    isEngineRunning = true;
-                    
-                    if (isSurfaceReady) {
-                        Choreographer.getInstance().postFrameCallback(this);
-                    }
-                });
+                bootEngine(internalRom.getAbsolutePath());
             } else {
-                showToast("Extraction Failed: " + result);
+                showToast("Invalid ROM: " + result);
+                if (internalRom.exists()) internalRom.delete();
             }
         } catch (Exception e) {
-            showToast("Load Failed: " + e.getMessage());
+            showToast("Failed to copy ROM: " + e.getMessage());
         }
     }
+
+    // ============================================================================
+    // RENDER LOOP
+    // ============================================================================
 
     @Override
     public void doFrame(long frameTimeNanos) {
@@ -240,35 +296,19 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         Choreographer.getInstance().postFrameCallback(this);
     }
 
-    private void setupTouchControls() {
-        bindButton(R.id.btn_up, 0x08);
-        bindButton(R.id.btn_down, 0x04);
-        bindButton(R.id.btn_left, 0x02);
-        bindButton(R.id.btn_right, 0x01);
-        bindButton(R.id.btn_a, 0x80);
-        bindButton(R.id.btn_b, 0x40);
-        bindButton(R.id.btn_start, 0x10);
-        bindButton(R.id.btn_select, 0x20);
-        // Special case: D-Pad container can also be made movable
-        View dpad = findViewById(R.id.dpad_container);
-        if (dpad != null) dpad.setOnTouchListener((v, event) -> {
-            if (isEditMode) {
-                if (event.getAction() == MotionEvent.ACTION_DOWN) {
-                    dX = v.getX() - event.getRawX();
-                    dY = v.getY() - event.getRawY();
-                } else if (event.getAction() == MotionEvent.ACTION_MOVE) {
-                    v.setX(event.getRawX() + dX);
-                    v.setY(event.getRawY() + dY);
-                }
-                return true;
-            }
-            return false;
-        });
-    }
+    // ============================================================================
+    // SYSTEM OVERRIDES
+    // ============================================================================
 
-    // ============================================================================
-    // UTILS
-    // ============================================================================
+    @Override public void surfaceCreated(@NonNull SurfaceHolder h) { 
+        isSurfaceReady = true; 
+        if (isEngineRunning) Choreographer.getInstance().postFrameCallback(this);
+    }
+    @Override public void surfaceDestroyed(@NonNull SurfaceHolder h) { 
+        isSurfaceReady = false; 
+    }
+    @Override public void surfaceChanged(@NonNull SurfaceHolder h, int f, int w, int h1) {}
+    @Override protected void onResume() { super.onResume(); hideSystemUI(); }
 
     private void hideSystemUI() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -307,15 +347,9 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         if (debugOverlay != null) debugOverlay.setVisibility(isDebugVisible ? View.VISIBLE : View.GONE);
     }
 
-    @Override public void surfaceCreated(@NonNull SurfaceHolder h) { 
-        isSurfaceReady = true; 
-        if (isEngineRunning) Choreographer.getInstance().postFrameCallback(this);
-    }
-    @Override public void surfaceDestroyed(@NonNull SurfaceHolder h) { isSurfaceReady = false; }
-    @Override public void surfaceChanged(@NonNull SurfaceHolder h, int f, int w, int h1) {}
-    @Override protected void onResume() { super.onResume(); hideSystemUI(); }
     public void showToast(String msg) { runOnUiThread(() -> Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()); }
 
+    // JNI
     public native String nativeExtractRom(String romPath, String outDir);
     public native void nativeInitEngine(String filesDir);
     public native void nativeUpdateSurface(Bitmap bitmap);
