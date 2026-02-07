@@ -10,9 +10,12 @@
 class MapperMMC1 {
 public:
     // --- Memory Storage ---
-    // Dragon Warrior 1 uses 4 banks of 16KB PRG and 4 banks of 4KB CHR.
+    // Dragon Warrior 1: 4 banks of 16KB PRG (64KB total)
     uint8_t prg_rom[4][16384];  
+    // Dragon Warrior 1: 4 banks of 4KB CHR (16KB total)
+    // Using 4KB banks matches the MMC1 switching granularity.
     uint8_t chr_rom[4][4096];   
+    // 8KB of Work RAM (Save data)
     uint8_t prg_ram[8192];      
 
     // --- Internal MMC1 State ---
@@ -35,6 +38,7 @@ public:
 
     /**
      * Handles writes to the mapper registers via the shift register.
+     * Serial bus logic: 5 writes per register update.
      */
     void write(uint16_t addr, uint8_t val);
 
@@ -50,7 +54,7 @@ public:
 
     /**
      * Handles PPU writes to the CHR address space ($0000-$1FFF).
-     * Necessary for games using CHR-RAM or for mapper-controlled CHR access.
+     * Vital for preventing crashes during PPU clear operations.
      */
     void write_chr(uint16_t addr, uint8_t val);
 
