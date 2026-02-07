@@ -5,6 +5,10 @@
 #include <vector>
 #include "MapperMMC1.h"
 
+/**
+ * NES PPU (Picture Processing Unit)
+ * Handles Nametables, Palettes, OAM (Sprites), and Rendering.
+ */
 class PPU {
 public:
     // --- Memory Layout ---
@@ -13,21 +17,21 @@ public:
     uint8_t oam_ram[256];              // Object Attribute Memory (Sprites)
     uint32_t screen_buffer[256 * 240]; // Final RGBA pixels (Output for JNI)
 
-    // --- Standard PPU Registers ---
-    uint8_t ctrl;     // $2000: Control
-    uint8_t mask;     // $2001: Mask
-    uint8_t status;   // $2002: Status
+    // --- Standard PPU Registers ($2000-$2007) ---
+    uint8_t ctrl;     // $2000: Control (NMI, Sprite Size, PT base)
+    uint8_t mask;     // $2001: Mask (Color effects, show/hide layers)
+    uint8_t status;   // $2002: Status (VBlank, Sprite 0 Hit)
     uint8_t oam_addr; // $2003: OAM Address
 
     // --- Internal State (Scrolling & VRAM) ---
-    uint16_t addr_reg;    // Current VRAM address
+    uint16_t addr_reg;    // Current VRAM address (Looped via $2006)
     uint8_t addr_latch;   // Toggle for high/low byte writes
     uint8_t data_buffer;  // Delayed read buffer for PPUDATA
-    
-    // Scroll tracking (Needed for Dragon Warrior)
+
+    // Scroll tracking (Essential for Dragon Warrior map movement)
     uint8_t scroll_x;     
     uint8_t scroll_y;
-    
+
     // Interrupt handling
     bool nmi_pending;
 
@@ -35,17 +39,29 @@ public:
     void reset();
 
     // --- CPU Interface ---
+    // These methods handle $2000-$2007 bus traffic from the CPU
     uint8_t cpu_read(uint16_t addr, MapperMMC1& mapper);
     void cpu_write(uint16_t addr, uint8_t val, MapperMMC1& mapper);
 
     // --- Frame Generation ---
+    // Renders the full 256x240 frame using current VRAM and Mapper banks
     void render_frame(MapperMMC1& mapper, const uint32_t* nes_palette);
-    
-    // Method to be called by JNI
-    void trigger_nmi() { nmi_pending = true; status |= 0x80; }
+
+    /**
+     * Helper to signal VBlank and prepare for NMI.
+     * Called at the end of the emulation cycle.
+     */
+    void trigger_vblank() { 
+        status |= 0x80; 
+        if (ctrl & 0x80) nmi_pending = true; 
+    }
 
 private:
+    /**
+     * Handles MMC1-controlled Mirroring (Horizontal, Vertical, One-Screen).
+     * Maps addresses $2000-$2FFF to the 2KB internal VRAM.
+     */
     uint16_t get_mirrored_addr(uint16_t addr, uint8_t mirror_mode);
 };
 
-#endif
+#endif // PPU_H
