@@ -89,7 +89,7 @@ extern "C" {
     uint8_t bus_read(uint16_t addr) {
         // 1. Internal RAM (0x0000 - 0x1FFF including mirrors)
         if (addr < 0x2000) return cpu_ram[addr & 0x07FF];
-        
+
         // 2. PPU Registers (0x2000 - 0x3FFF mirrors)
         if (addr >= 0x2000 && addr < 0x4000) {
             uint16_t ppu_reg = addr & 0x2007;
@@ -108,11 +108,14 @@ extern "C" {
             return ret | 0x40; // 0x40 provides "open bus" signature
         }
 
-        // 4. Cartridge PRG-ROM (Dragon Warrior starts code here)
+        // 4. Cartridge PRG-ROM (Dragon Warrior code)
         if (addr >= 0x8000) return mapper.read_prg(addr);
 
-        // 5. Cartridge PRG-RAM / SRAM (Saves)
-        if (addr >= 0x6000) return mapper.read_ram(addr);
+        // 5. Cartridge PRG-RAM / SRAM (Saves/Extra Work RAM)
+        // Accessing the mapper's prg_ram buffer directly fixes the build error
+        if (addr >= 0x6000 && addr < 0x8000) {
+            return mapper.prg_ram[addr - 0x6000];
+        }
 
         return 0;
     }
@@ -125,9 +128,12 @@ extern "C" {
             if (ppu_reg == 0x2000) ppu_ctrl = val;
             if (ppu_reg == 0x2001) ppu_mask = val;
         } else if (addr == 0x4016) {
-            // NES Controller Strobe: Writing 1-then-0 latches button states
             if ((val & 0x01) == 0) latched_controller = controller_state;
-        } else if (addr >= 0x6000) {
+        } else if (addr >= 0x6000 && addr < 0x8000) {
+            // Write to Save RAM (SRAM)
+            mapper.prg_ram[addr - 0x6000] = val;
+        } else if (addr >= 0x8000) {
+            // MMC1 Register Writes
             mapper.write(addr, val);
         }
     }
@@ -194,10 +200,10 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstri
     if (!file.is_open()) return env->NewStringUTF("Fail: File Not Found");
 
     file.seekg(16, std::ios::beg); // Skip iNES header
-    
+
     for(int i=0; i<4; i++) {
         file.read((char*)mapper.prg_rom[i], 16384);
-        // Ensure proper mirroring for 64KB ROMs
+        // Ensure proper mirroring for 64KB ROMs (typical for Dragon Warrior)
         if (file.gcount() < 16384 && i >= 2) {
             memcpy(mapper.prg_rom[i], mapper.prg_rom[i-2], 16384);
         }
