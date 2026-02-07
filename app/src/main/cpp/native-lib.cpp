@@ -23,6 +23,7 @@ uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
 uint8_t cpu_ram[0x0800] = {0};
 bool is_running = false;
 bool is_paused = false;
+bool rom_loaded = false; // Guard to prevent execution before loading
 
 // Controller State
 uint8_t controller_state = 0;
@@ -69,6 +70,7 @@ void update_flags_cmp(uint8_t reg, uint8_t val) {
 void cpu_adc(uint8_t val) {
     uint16_t carry = (reg_P & FLAG_C) ? 1 : 0;
     uint16_t sum = reg_A + val + carry;
+    // Overflow flag logic
     if (~(reg_A ^ val) & (reg_A ^ (uint8_t)sum) & 0x80) reg_P |= FLAG_V; else reg_P &= ~FLAG_V;
     if (sum > 0xFF) reg_P |= FLAG_C; else reg_P &= ~FLAG_C;
     reg_A = (uint8_t)sum;
@@ -80,7 +82,7 @@ void cpu_sbc(uint8_t val) { cpu_adc(~val); }
 void cpu_bit(uint8_t val) {
     reg_P &= ~(FLAG_Z | FLAG_V | FLAG_N);
     if ((val & reg_A) == 0) reg_P |= FLAG_Z;
-    reg_P |= (val & 0xC0);
+    reg_P |= (val & 0xC0); // Bits 7 and 6 of value are copied to N and V flags
 }
 
 uint8_t cpu_asl(uint8_t val) {
@@ -113,7 +115,7 @@ uint8_t cpu_ror(uint8_t val) {
     return res;
 }
 
-// --- Memory Bus ---
+// --- Memory Bus Implementation ---
 
 uint8_t bus_read(uint16_t addr) {
     if (addr < 0x2000) return cpu_ram[addr % 0x0800];
@@ -140,8 +142,7 @@ void bus_write(uint16_t addr, uint8_t val) {
     else if (addr >= 0x6000) mapper.write(addr, val);
 }
 
-// --- Helpers Required by cpu_shared.h ---
-
+// Helpers for recompiled logic
 uint16_t read_pointer(uint16_t addr) { return bus_read(addr) | (bus_read(addr + 1) << 8); }
 uint16_t read_pointer_indexed_x(uint16_t zp) { return bus_read((uint8_t)(zp + reg_X)) | (bus_read((uint8_t)(zp + reg_X + 1)) << 8); }
 uint16_t read_pointer_indexed_y(uint16_t zp) { return (bus_read(zp) | (bus_read((uint8_t)(zp + 1)) << 8)) + reg_Y; }
@@ -151,7 +152,7 @@ void clear_screen_to_black() { std::lock_guard<std::mutex> lock(buffer_mutex); s
 
 } // extern "C"
 
-// --- Emulator Logic ---
+// --- Emulator Cycle ---
 
 void power_on_reset() {
     mapper.reset();
@@ -160,32 +161,38 @@ void power_on_reset() {
     uint8_t hi = bus_read(0xFFFD);
     reg_PC = (hi << 8) | lo;
     reg_S = 0xFD; reg_P = 0x24; reg_A = 0; reg_X = 0; reg_Y = 0;
+    LOGI("CPU Reset. Entry Point: $%04X", reg_PC);
 }
 
-void trigger_nmi() {
+void nmi_handler() {
     push_stack(reg_PC >> 8);
     push_stack(reg_PC & 0xFF);
     push_stack(reg_P);
     reg_PC = bus_read(0xFFFA) | (bus_read(0xFFFB) << 8);
-    ppu.status |= 0x80;
 }
 
 void engine_loop() {
+    while(!rom_loaded) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    
     power_on_reset();
     is_running = true;
+    
     while (is_running) {
         if (is_paused) { std::this_thread::sleep_for(std::chrono::milliseconds(16)); continue; }
-        
+
         auto start = std::chrono::steady_clock::now();
-        // Execute ~1 frame worth of cycles (approx 29780)
+        
+        // Execute frame cycles
         for (int i = 0; i < 29780; i++) {
             execute_instruction();
+            // In a real NES, NMI is triggered by PPU at start of VBlank
+            // Check if PPU wants an NMI (VBlank bit and NMI enabled bit)
+            if ((ppu.status & 0x80) && (ppu.ctrl & 0x80)) {
+                ppu.status &= ~0x80; // Clear flag to prevent loop
+                nmi_handler();
+            }
         }
 
-        // Handle VBlank and NMI
-        trigger_nmi();
-        
-        // Render to internal buffer
         {
             std::lock_guard<std::mutex> lock(buffer_mutex);
             ppu.render_frame(mapper, nes_palette);
@@ -195,22 +202,28 @@ void engine_loop() {
     }
 }
 
-// --- JNI Interface (Fixed Method Names) ---
+// --- JNI Bridge ---
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstring romPath, jstring outDir) {
     const char *path = env->GetStringUTFChars(romPath, nullptr);
     std::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) { env->ReleaseStringUTFChars(romPath, path); return env->NewStringUTF("Error: File open"); }
+    if (!file.is_open()) { 
+        env->ReleaseStringUTFChars(romPath, path); 
+        return env->NewStringUTF("Error: Could not open ROM file"); 
+    }
 
-    uint8_t header[16];
-    file.read((char*)header, 16);
-    // Dragon Warrior 1 iNES: 4x16KB PRG, 2x8KB CHR (standard for MMC1 variant)
-    for (int i = 0; i < 4; i++) file.read((char*)mapper.prg_rom[i], 16384);
-    for (int i = 0; i < 2; i++) file.read((char*)mapper.chr_rom[i], 4096);
+    // Skip iNES Header
+    file.seekg(16, std::ios::beg);
     
+    // Dragon Warrior 1: 4x16KB PRG Banks
+    for (int i = 0; i < 4; i++) file.read((char*)mapper.prg_rom[i], 16384);
+    // 2x8KB CHR Banks (represented as 4x4KB in our header)
+    for (int i = 0; i < 4; i++) file.read((char*)mapper.chr_rom[i], 4096);
+
     file.close();
     env->ReleaseStringUTFChars(romPath, path);
+    rom_loaded = true;
     return env->NewStringUTF("Success");
 }
 
@@ -227,12 +240,12 @@ Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv *env, jobject thiz, jo
     void* pixels;
     if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) return;
     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
-    
+
     {
         std::lock_guard<std::mutex> lock(buffer_mutex);
         std::memcpy(pixels, ppu.screen_buffer, 256 * 240 * 4);
     }
-    
+
     AndroidBitmap_unlockPixels(env, bitmap);
 }
 
