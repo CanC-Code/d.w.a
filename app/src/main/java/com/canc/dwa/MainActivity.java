@@ -33,11 +33,12 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     private static final String TAG = "DWA_MainActivity";
     private static final int PICK_ROM_REQUEST = 1;
 
-    private View setupContainer, gameContainer;
+    private View setupContainer, gameContainer, debugOverlay;
     private SurfaceView gameSurface;
     private Bitmap screenBitmap;
     private boolean isEngineRunning = false;
     private boolean isSurfaceReady = false;
+    private boolean isDebugVisible = false;
     private final Rect destRect = new Rect();
 
     @Override
@@ -48,24 +49,41 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         setupContainer = findViewById(R.id.setup_layout);
         gameContainer = findViewById(R.id.game_layout);
         gameSurface = findViewById(R.id.game_surface);
+        debugOverlay = findViewById(R.id.debug_overlay_bg); // Link to the XML overlay
 
         // Standard NES Resolution
         screenBitmap = Bitmap.createBitmap(256, 240, Bitmap.Config.ARGB_8888);
         gameSurface.getHolder().addCallback(this);
 
-        Button selectRomBtn = findViewById(R.id.btn_select_rom);
-        selectRomBtn.setOnClickListener(v -> openFilePicker());
+        findViewById(R.id.btn_select_rom).setOnClickListener(v -> openFilePicker());
 
-        Button debugBtn = findViewById(R.id.btn_debug);
+        View debugBtn = findViewById(R.id.btn_debug);
         if (debugBtn != null) {
-            debugBtn.setOnClickListener(v -> toggleDebugMenu());
+            debugBtn.setOnClickListener(v -> toggleDebugUI());
+        }
+    }
+
+    /**
+     * Handles the back button:
+     * 1. Closes the debug menu if open.
+     * 2. Prompts or exits if in game.
+     */
+    @Override
+    public void onBackPressed() {
+        if (isDebugVisible) {
+            toggleDebugUI(); // Close debug first
+        } else if (isEngineRunning) {
+            // Optional: Add a "Quit Game?" dialog here
+            super.onBackPressed();
+        } else {
+            super.onBackPressed();
         }
     }
 
     private void openFilePicker() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("*/*"); // Allow .nes files or generic streams
+        intent.setType("*/*"); 
         startActivityForResult(intent, PICK_ROM_REQUEST);
     }
 
@@ -82,7 +100,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     private void copyAndExtractRom(Uri uri) {
         try {
-            // Copy selected URI to internal app storage for C++ access
             InputStream is = getContentResolver().openInputStream(uri);
             File internalRom = new File(getFilesDir(), "base.nes");
             FileOutputStream os = new FileOutputStream(internalRom);
@@ -95,7 +112,6 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             os.close();
             is.close();
 
-            // Notify JNI to load the bytes into the Mapper
             String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
             if ("Success".equals(result)) {
                 startNativeEngine();
@@ -111,18 +127,15 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     private void startNativeEngine() {
         if (isEngineRunning) return;
 
-        // UI transition must happen on Main Thread
         runOnUiThread(() -> {
-            if (setupContainer != null) setupContainer.setVisibility(View.GONE);
-            if (gameContainer != null) gameContainer.setVisibility(View.VISIBLE);
+            setupContainer.setVisibility(View.GONE);
+            gameContainer.setVisibility(View.VISIBLE);
             setupTouchControls(); 
         });
 
-        // This triggers the detached C++ thread in native-lib
         nativeInitEngine(getFilesDir().getAbsolutePath());
         isEngineRunning = true;
 
-        // Begin the rendering loop if surface is already up
         if (isSurfaceReady) {
             Choreographer.getInstance().postFrameCallback(this);
         }
@@ -162,32 +175,39 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     public void doFrame(long frameTimeNanos) {
         if (!isEngineRunning || !isSurfaceReady) return;
 
-        // 1. Pull the native buffer into our Bitmap
         nativeUpdateSurface(screenBitmap);
 
-        // 2. Draw the Bitmap to the SurfaceView with Scaling
         SurfaceHolder holder = gameSurface.getHolder();
         Canvas canvas = holder.lockCanvas();
         if (canvas != null) {
             try {
-                canvas.drawColor(0xFF000000); // Black background (letterboxing)
+                canvas.drawColor(0xFF000000); 
+
+                // Aspect Ratio Logic (4:3)
+                float viewWidth = gameSurface.getWidth();
+                float viewHeight = gameSurface.getHeight();
+                float scale = Math.min(viewWidth / 256f, viewHeight / 240f);
                 
-                // Keep Aspect Ratio (4:3 for NES)
-                float scale = Math.min((float) gameSurface.getWidth() / 256f, (float) gameSurface.getHeight() / 240f);
                 int sw = (int) (256 * scale);
                 int sh = (int) (240 * scale);
-                int left = (gameSurface.getWidth() - sw) / 2;
-                int top = (gameSurface.getHeight() - sh) / 2;
-                
+                int left = (int) (viewWidth - sw) / 2;
+                int top = (int) (viewHeight - sh) / 2;
+
                 destRect.set(left, top, left + sw, top + sh);
                 canvas.drawBitmap(screenBitmap, null, destRect, null);
             } finally {
                 holder.unlockCanvasAndPost(canvas);
             }
         }
-
-        // 3. Schedule next frame
         Choreographer.getInstance().postFrameCallback(this);
+    }
+
+    private void toggleDebugUI() {
+        isDebugVisible = !isDebugVisible;
+        toggleDebugMenu(); // Call Native toggle
+        if (debugOverlay != null) {
+            debugOverlay.setVisibility(isDebugVisible ? View.VISIBLE : View.GONE);
+        }
     }
 
     @Override
@@ -199,20 +219,14 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     }
 
     @Override
-    public void surfaceChanged(@NonNull SurfaceHolder holder, int format, int width, int height) {
-        // Surface resized; destRect will be recalculated in next doFrame
-    }
+    public void surfaceChanged(@NonNull SurfaceHolder holder, int format, int width, int height) {}
 
     @Override
     public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
         isSurfaceReady = false;
-        // Stop the frame callbacks to prevent locking a null canvas
         Choreographer.getInstance().removeFrameCallback(this);
     }
 
-    /**
-     * Called by Native C++ code to show messages on UI thread
-     */
     public void showToast(final String message) {
         runOnUiThread(() -> Toast.makeText(MainActivity.this, message, Toast.LENGTH_SHORT).show());
     }
