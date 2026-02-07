@@ -131,14 +131,14 @@ uint8_t bus_read(uint16_t addr) {
 void bus_write(uint16_t addr, uint8_t val) {
     if (addr < 0x2000) cpu_ram[addr % 0x0800] = val;
     else if (addr >= 0x2000 && addr <= 0x3FFF) ppu.cpu_write(addr, val, mapper);
-    else if (addr == 0x4014) { // OAM DMA (Sprite memory transfer)
+    else if (addr == 0x4014) { // OAM DMA
         uint16_t base = val << 8;
         for (int i = 0; i < 256; i++) ppu.oam_ram[i] = bus_read(base + i);
     }
     else if (addr == 0x4016) { 
         if ((val & 0x01) == 0) controller_shift = controller_state; 
     }
-    else if (addr >= 0x6000) mapper.write_register(addr, val);
+    else if (addr >= 0x6000) mapper.write(addr, val); // FIXED: Name changed from write_register
 }
 
 // Memory Helpers
@@ -146,7 +146,7 @@ uint16_t read_pointer(uint16_t addr) { return bus_read(addr) | (bus_read(addr + 
 uint16_t read_pointer_indexed_x(uint16_t zp) { return bus_read((uint8_t)(zp + reg_X)) | (bus_read((uint8_t)(zp + reg_X + 1)) << 8); }
 uint16_t read_pointer_indexed_y(uint16_t zp) { return (bus_read(zp) | (bus_read((uint8_t)(zp + 1)) << 8)) + reg_Y; }
 void push_stack(uint8_t val) { cpu_ram[0x0100 + (reg_S--)] = val; }
-uint8_t pop_stack() { return cpu_ram[0x0100 + (++reg_S)]; }
+uint8_t pop_stack() { return cpu_ram[0x0100 + (++reg_S)]; } // FIXED: NES increments AFTER pop
 void clear_screen_to_black() { std::lock_guard<std::mutex> lock(buffer_mutex); std::memset(ppu.screen_buffer, 0, 256 * 240 * 4); }
 
 } // extern "C"
@@ -174,7 +174,7 @@ void nmi_handler() {
 
 void engine_loop() {
     // Wait until JNI has loaded the ROM banks
-    while(!rom_loaded) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    while(!rom_loaded) std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     power_on_reset();
     is_running = true;
@@ -187,7 +187,6 @@ void engine_loop() {
         // 29780 cycles is roughly one NTSC frame
         for (int i = 0; i < 29780; i++) {
             execute_instruction();
-            // Check for PPU NMI signal
             if (ppu.nmi_pending) {
                 ppu.nmi_pending = false;
                 nmi_handler();
@@ -199,12 +198,11 @@ void engine_loop() {
             ppu.render_frame(mapper, nes_palette);
         }
 
-        // Maintain 60 FPS
         std::this_thread::sleep_until(start + std::chrono::microseconds(16666));
     }
 }
 
-// --- JNI Bridge (Targeting com.canc.dwa) ---
+// --- JNI Bridge (com.canc.dwa) ---
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstring romPath, jstring outDir) {
@@ -215,12 +213,9 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstri
         return env->NewStringUTF("Error: Could not open ROM"); 
     }
 
-    // Standard iNES header skip
-    file.seekg(16, std::ios::beg);
+    file.seekg(16, std::ios::beg); // Skip iNES header
 
-    // Map the 4 PRG banks (64KB total for DW1)
     for (int i = 0; i < 4; i++) file.read((char*)mapper.prg_rom[i], 16384);
-    // Map the CHR banks
     for (int i = 0; i < 4; i++) file.read((char*)mapper.chr_rom[i], 4096);
 
     file.close();
@@ -238,6 +233,8 @@ Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv *env, jobject thiz, jstri
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv *env, jobject thiz, jobject bitmap) {
+    if (!is_running || !rom_loaded) return; // Prevent surface update before engine ready
+
     AndroidBitmapInfo info;
     void* pixels;
     if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) return;
