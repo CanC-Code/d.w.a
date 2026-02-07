@@ -12,18 +12,16 @@
 #include "recompiled/cpu_shared.h"
 
 #define LOG_TAG "DWA_NATIVE"
-// Fix for the macro redefinition warning
-#ifndef LOG_CPU
-#define LOG_CPU(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#endif
 
-// --- Recompiled Bank Dispatcher ---
-namespace Dispatcher {
-    void execute();
-}
-
-// --- Global Hardware State ---
+// --- Global Hardware State Definitions ---
+// These are declared as 'extern' in cpu_shared.h; they must be defined here.
+uint16_t reg_PC = 0;
+uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
 uint8_t cpu_ram[0x0800] = {0};
+bool is_running = false;
+bool is_paused = false;
+
+// Internal Emulator State
 uint8_t ppu_vram[2048] = {0};
 uint8_t palette_ram[32] = {0};
 uint8_t oam_ram[256] = {0};
@@ -31,9 +29,15 @@ uint32_t screen_buffer[256 * 240] = {0};
 uint8_t controller_state = 0;
 uint8_t controller_shift = 0;
 uint8_t ppu_data_buffer = 0;
+uint8_t ppu_status = 0, ppu_ctrl = 0, ppu_mask = 0, ppu_addr_latch = 0, oam_addr = 0;
+uint16_t ppu_addr_reg = 0;
 std::mutex buffer_mutex;
 MapperMMC1 mapper;
 
+// Recompiled Dispatcher Namespace
+namespace Dispatcher { void execute(); }
+
+// 
 uint32_t nes_palette[64] = {
     0xFF666666, 0xFF002A88, 0xFF1412A7, 0xFF3B00A4, 0xFF5C007E, 0xFF6E0040, 0xFF6C0600, 0xFF561D00,
     0xFF333500, 0xFF0B4800, 0xFF005200, 0xFF004F08, 0xFF00404D, 0xFF000000, 0xFF000000, 0xFF000000,
@@ -44,16 +48,15 @@ uint32_t nes_palette[64] = {
 };
 
 // --- Shared 6502 CPU Implementation ---
+// These functions match the 'extern "C"' declarations in cpu_shared.h
 extern "C" {
-    uint16_t reg_PC = 0;
-    uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
 
     void execute_instruction() {
         Dispatcher::execute();
     }
 
     void update_nz(uint8_t val) {
-        reg_P &= ~(FLAG_N | FLAG_Z);
+        reg_P &= ~(FLAG_Z | FLAG_N);
         if (val == 0) reg_P |= FLAG_Z;
         if (val & 0x80) reg_P |= FLAG_N;
     }
@@ -66,9 +69,10 @@ extern "C" {
     }
 
     void cpu_adc(uint8_t val) {
-        uint16_t carry = (reg_P & FLAG_C);
+        uint16_t carry = (reg_P & FLAG_C) ? 1 : 0;
         uint16_t sum = reg_A + val + carry;
-        if (~(reg_A ^ val) & (reg_A ^ sum) & 0x80) reg_P |= FLAG_V; else reg_P &= ~FLAG_V;
+        // Overflow flag logic: (A^result) & (M^result) & 0x80
+        if (~(reg_A ^ val) & (reg_A ^ (uint8_t)sum) & 0x80) reg_P |= FLAG_V; else reg_P &= ~FLAG_V;
         if (sum > 0xFF) reg_P |= FLAG_C; else reg_P &= ~FLAG_C;
         reg_A = (uint8_t)sum;
         update_nz(reg_A);
@@ -79,35 +83,35 @@ extern "C" {
     void cpu_bit(uint8_t val) {
         reg_P &= ~(FLAG_Z | FLAG_V | FLAG_N);
         if ((val & reg_A) == 0) reg_P |= FLAG_Z;
-        reg_P |= (val & 0xC0);
+        reg_P |= (val & 0xC0); // Bits 7 and 6 of value go to N and V
     }
 
     uint8_t cpu_asl(uint8_t val) {
-        reg_P = (reg_P & ~FLAG_C) | ((val >> 7) & 0x01);
+        (val & 0x80) ? reg_P |= FLAG_C : reg_P &= ~FLAG_C;
         uint8_t res = val << 1;
         update_nz(res);
         return res;
     }
 
     uint8_t cpu_lsr(uint8_t val) {
-        reg_P = (reg_P & ~FLAG_C) | (val & 0x01);
+        (val & 0x01) ? reg_P |= FLAG_C : reg_P &= ~FLAG_C;
         uint8_t res = val >> 1;
         update_nz(res);
         return res;
     }
 
     uint8_t cpu_rol(uint8_t val) {
-        uint8_t old_c = (reg_P & FLAG_C);
-        reg_P = (reg_P & ~FLAG_C) | ((val >> 7) & 0x01);
+        uint8_t old_c = (reg_P & FLAG_C) ? 1 : 0;
+        (val & 0x80) ? reg_P |= FLAG_C : reg_P &= ~FLAG_C;
         uint8_t res = (val << 1) | old_c;
         update_nz(res);
         return res;
     }
 
     uint8_t cpu_ror(uint8_t val) {
-        uint8_t old_c = (reg_P & FLAG_C);
-        reg_P = (reg_P & ~FLAG_C) | (val & 0x01);
-        uint8_t res = (val >> 1) | (old_c << 7);
+        uint8_t old_c = (reg_P & FLAG_C) ? 0x80 : 0;
+        (val & 0x01) ? reg_P |= FLAG_C : reg_P &= ~FLAG_C;
+        uint8_t res = (val >> 1) | old_c;
         update_nz(res);
         return res;
     }
@@ -116,107 +120,111 @@ extern "C" {
         return bus_read(addr) | (bus_read(addr + 1) << 8);
     }
 
-    // FIX: Missing addressing mode helper for ($NN, X)
     uint16_t read_pointer_indexed_x(uint16_t zp_addr) {
-        uint8_t target = (uint8_t)(zp_addr + reg_X);
-        uint16_t lo = bus_read(target);
-        uint16_t hi = bus_read((uint8_t)(target + 1));
+        uint8_t ptr = (uint8_t)(zp_addr + reg_X);
+        uint16_t lo = bus_read(ptr);
+        uint16_t hi = bus_read((uint8_t)(ptr + 1));
         return lo | (hi << 8);
     }
 
     uint16_t read_pointer_indexed_y(uint16_t zp_addr) {
         uint16_t lo = bus_read(zp_addr);
-        uint16_t hi = bus_read((zp_addr + 1) & 0xFF);
+        uint16_t hi = bus_read((uint8_t)(zp_addr + 1));
         return (lo | (hi << 8)) + reg_Y;
     }
 
-    void push_stack(uint8_t val) { cpu_ram[0x0100 | (reg_S & 0xFF)] = val; reg_S--; }
-    uint8_t pop_stack() { reg_S++; return cpu_ram[0x0100 | (reg_S & 0xFF)]; }
-}
-
-// --- PPU & Bus Logic ---
-uint8_t ppu_status = 0, ppu_ctrl = 0, ppu_mask = 0, ppu_addr_latch = 0, oam_addr = 0;
-uint16_t ppu_addr_reg = 0;
-bool is_running = false;
-bool is_paused = false;
-
-uint16_t ntable_mirror(uint16_t addr) {
-    addr = (addr - 0x2000) % 0x1000;
-    return addr % 0x0800;
-}
-
-uint8_t read_palette(uint16_t addr) {
-    uint8_t p_idx = addr & 0x1F;
-    if (p_idx >= 0x10 && (p_idx % 4 == 0)) p_idx -= 0x10;
-    return palette_ram[p_idx];
-}
-
-extern "C" uint8_t bus_read(uint16_t addr) {
-    if (addr < 0x2000) return cpu_ram[addr % 0x0800];
-    if (addr >= 0x2000 && addr <= 0x3FFF) {
-        uint16_t reg = addr % 8;
-        if (reg == 2) {
-            uint8_t s = ppu_status;
-            ppu_status &= ~0x80;
-            ppu_addr_latch = 0;
-            return s;
-        }
-        if (reg == 7) {
-            uint8_t data = ppu_data_buffer;
-            uint16_t p_addr = ppu_addr_reg & 0x3FFF;
-            if (p_addr < 0x2000) ppu_data_buffer = mapper.read_chr(p_addr);
-            else if (p_addr < 0x3F00) ppu_data_buffer = ppu_vram[ntable_mirror(p_addr)];
-            else data = read_palette(p_addr);
-            ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
-            return data;
-        }
+    void push_stack(uint8_t val) { 
+        cpu_ram[0x0100 | reg_S] = val; 
+        reg_S--; 
     }
-    if (addr >= 0x6000) return mapper.read_prg(addr);
-    if (addr == 0x4016) {
-        uint8_t ret = (controller_shift & 0x80) >> 7;
-        controller_shift <<= 1;
-        return ret;
+    
+    uint8_t pop_stack() { 
+        reg_S++; 
+        return cpu_ram[0x0100 | reg_S]; 
     }
-    return 0;
-}
 
-extern "C" void bus_write(uint16_t addr, uint8_t val) {
-    if (addr < 0x2000) cpu_ram[addr % 0x0800] = val;
-    else if (addr >= 0x2000 && addr <= 0x3FFF) {
-        uint16_t reg = addr % 8;
-        if (reg == 0) ppu_ctrl = val;
-        else if (reg == 1) ppu_mask = val;
-        else if (reg == 3) oam_addr = val;
-        else if (reg == 4) oam_ram[oam_addr++] = val;
-        else if (reg == 6) {
-            if (ppu_addr_latch == 0) { ppu_addr_reg = (ppu_addr_reg & 0x00FF) | (val << 8); ppu_addr_latch = 1; }
-            else { ppu_addr_reg = (ppu_addr_reg & 0xFF00) | val; ppu_addr_latch = 0; }
-        }
-        else if (reg == 7) {
-            uint16_t p_addr = ppu_addr_reg & 0x3FFF;
-            if (p_addr >= 0x2000 && p_addr < 0x3F00) ppu_vram[ntable_mirror(p_addr)] = val;
-            else if (p_addr >= 0x3F00) {
-                uint8_t p_idx = p_addr & 0x1F;
-                if (p_idx >= 0x10 && (p_idx % 4 == 0)) p_idx -= 0x10;
-                palette_ram[p_idx] = val;
+    // --- Bus Read Implementation ---
+    uint8_t bus_read(uint16_t addr) {
+        if (addr < 0x2000) return cpu_ram[addr % 0x0800];
+        if (addr >= 0x2000 && addr <= 0x3FFF) {
+            uint16_t reg = addr % 8;
+            if (reg == 2) { // PPUSTATUS
+                uint8_t s = ppu_status;
+                ppu_status &= ~0x80; // Clear V-Blank flag on read
+                ppu_addr_latch = 0;
+                return s;
             }
-            ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
+            if (reg == 7) { // PPUDATA
+                uint8_t data = ppu_data_buffer;
+                uint16_t p_addr = ppu_addr_reg & 0x3FFF;
+                if (p_addr < 0x2000) ppu_data_buffer = mapper.read_chr(p_addr);
+                else if (p_addr < 0x3F00) ppu_data_buffer = ppu_vram[ntable_mirror(p_addr)];
+                else data = read_palette(p_addr);
+                ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
+                return data;
+            }
         }
+        if (addr >= 0x6000) return mapper.read_prg(addr);
+        if (addr == 0x4016) {
+            uint8_t ret = (controller_shift & 0x80) >> 7;
+            controller_shift <<= 1;
+            return ret;
+        }
+        return 0;
     }
-    else if (addr == 0x4014) {
-        uint16_t base = val << 8;
-        for (int i = 0; i < 256; i++) oam_ram[i] = bus_read(base + i);
-    }
-    else if (addr == 0x4016) { 
-        if ((val & 0x01) == 0) controller_shift = controller_state; 
-    }
-    else if (addr >= 0x6000) mapper.write(addr, val);
-}
 
-void clear_screen_to_black() {
-    std::lock_guard<std::mutex> lock(buffer_mutex);
-    for (int i = 0; i < 256 * 240; i++) screen_buffer[i] = 0xFF000000;
-}
+    // --- Bus Write Implementation ---
+    void bus_write(uint16_t addr, uint8_t val) {
+        if (addr < 0x2000) cpu_ram[addr % 0x0800] = val;
+        else if (addr >= 0x2000 && addr <= 0x3FFF) {
+            uint16_t reg = addr % 8;
+            if (reg == 0) ppu_ctrl = val;
+            else if (reg == 1) ppu_mask = val;
+            else if (reg == 3) oam_addr = val;
+            else if (reg == 4) oam_ram[oam_addr++] = val;
+            else if (reg == 6) { // PPUADDR
+                if (ppu_addr_latch == 0) { ppu_addr_reg = (ppu_addr_reg & 0x00FF) | (val << 8); ppu_addr_latch = 1; }
+                else { ppu_addr_reg = (ppu_addr_reg & 0xFF00) | val; ppu_addr_latch = 0; }
+            }
+            else if (reg == 7) { // PPUDATA
+                uint16_t p_addr = ppu_addr_reg & 0x3FFF;
+                if (p_addr >= 0x2000 && p_addr < 0x3F00) ppu_vram[ntable_mirror(p_addr)] = val;
+                else if (p_addr >= 0x3F00) {
+                    uint8_t p_idx = p_addr & 0x1F;
+                    if (p_idx >= 0x10 && (p_idx % 4 == 0)) p_idx -= 0x10;
+                    palette_ram[p_idx] = val;
+                }
+                ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
+            }
+        }
+        else if (addr == 0x4014) { // OAMDMA
+            uint16_t base = val << 8;
+            for (int i = 0; i < 256; i++) oam_ram[i] = bus_read(base + i);
+        }
+        else if (addr == 0x4016) { 
+            if ((val & 0x01) == 0) controller_shift = controller_state; 
+        }
+        else if (addr >= 0x6000) mapper.write(addr, val);
+    }
+
+    void clear_screen_to_black() {
+        std::lock_guard<std::mutex> lock(buffer_mutex);
+        for (int i = 0; i < 256 * 240; i++) screen_buffer[i] = 0xFF000000;
+    }
+
+    uint16_t ntable_mirror(uint16_t addr) {
+        addr = (addr - 0x2000) % 0x1000;
+        return addr % 0x0800; // Simplified Horizontal/Vertical mirroring
+    }
+
+    uint8_t read_palette(uint16_t addr) {
+        uint8_t p_idx = addr & 0x1F;
+        if (p_idx >= 0x10 && (p_idx % 4 == 0)) p_idx -= 0x10;
+        return palette_ram[p_idx];
+    }
+} // End of extern "C"
+
+// --- Helper Functions ---
 
 void draw_frame() {
     if ((ppu_mask & 0x18) == 0) return;
@@ -271,7 +279,7 @@ void engine_loop() {
     while (is_running) {
         if (is_paused) { std::this_thread::sleep_for(std::chrono::milliseconds(16)); continue; }
         auto start = std::chrono::steady_clock::now();
-        for (int i = 0; i < 20000; i++) {
+        for (int i = 0; i < 29780; i++) { // ~1 frame of cycles
             execute_instruction();
             if (!is_running) break;
         }
@@ -328,10 +336,7 @@ Java_com_canc_dwa_MainActivity_nativePauseEngine(JNIEnv *env, jobject thiz) { is
 extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_nativeResumeEngine(JNIEnv *env, jobject thiz) { is_paused = false; }
 
-extern "C" JNIEXPORT jstring JNICALL
-Java_com_canc_dwa_MainActivity_nativeGetDebugInfo(JNIEnv *env, jobject thiz) {
-    char info[1024];
-    snprintf(info, sizeof(info), "PC: $%04X A: $%02X X: $%02X Y: $%02X P: $%02X S: $%02X Bank: %d", 
-             reg_PC, reg_A, reg_X, reg_Y, reg_P, reg_S, mapper.prg_bank);
-    return env->NewStringUTF(info);
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_nativeTriggerNMI(JNIEnv *env, jobject thiz) {
+    nmi_handler();
 }
