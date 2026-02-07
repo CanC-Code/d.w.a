@@ -4,7 +4,6 @@
     android:layout_height="match_parent"
     android:background="#000000">
 
-    <!-- Setup Screen -->
     <LinearLayout
         android:id="@+id/setup_layout"
         android:layout_width="match_parent"
@@ -22,14 +21,6 @@
             android:textSize="32sp"
             android:textStyle="bold"
             android:layout_marginBottom="16dp"/>
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="Android Port"
-            android:textColor="#CCCCCC"
-            android:textSize="18sp"
-            android:layout_marginBottom="48dp"/>
 
         <Button
             android:id="@+id/btn_select_rom"
@@ -49,71 +40,62 @@
             android:gravity="center"/>
     </LinearLayout>
 
-    <!-- Game Screen -->
     <RelativeLayout
         android:id="@+id/game_layout"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:visibility="gone">
 
-        <!-- Game Surface -->
         <SurfaceView
             android:id="@+id/game_surface"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
-            android:layout_centerInParent="true"/>
+            android:layout_centerInParent="true" />
 
-        <!-- D-Pad -->
         <RelativeLayout
             android:id="@+id/dpad_layout"
-            android:layout_width="150dp"
-            android:layout_height="150dp"
+            android:layout_width="160dp"
+            android:layout_height="160dp"
             android:layout_alignParentLeft="true"
             android:layout_alignParentBottom="true"
-            android:layout_margin="16dp">
-
-            <Button
+            android:layout_margin="16dp"
+            android:background="#22FFFFFF"> <Button
                 android:id="@+id/btn_up"
-                android:layout_width="50dp"
-                android:layout_height="50dp"
+                android:layout_width="54dp"
+                android:layout_height="54dp"
                 android:layout_centerHorizontal="true"
                 android:layout_alignParentTop="true"
-                android:text="△"
-                android:textSize="20sp"
-                android:alpha="0.7"/>
+                android:text="UP"
+                android:alpha="0.6"/>
 
             <Button
                 android:id="@+id/btn_down"
-                android:layout_width="50dp"
-                android:layout_height="50dp"
+                android:layout_width="54dp"
+                android:layout_height="54dp"
                 android:layout_centerHorizontal="true"
                 android:layout_alignParentBottom="true"
-                android:text="▽"
-                android:textSize="20sp"
-                android:alpha="0.7"/>
+                android:text="DN"
+                android:alpha="0.6"/>
 
             <Button
                 android:id="@+id/btn_left"
-                android:layout_width="50dp"
-                android:layout_height="50dp"
+                android:layout_width="54dp"
+                android:layout_height="54dp"
                 android:layout_centerVertical="true"
                 android:layout_alignParentLeft="true"
-                android:text="◁"
-                android:textSize="20sp"
-                android:alpha="0.7"/>
+                android:text="LF"
+                android:alpha="0.6"/>
 
             <Button
                 android:id="@+id/btn_right"
-                android:layout_width="50dp"
-                android:layout_height="50dp"
+                android:layout_width="54dp"
+                android:layout_height="54dp"
                 android:layout_centerVertical="true"
                 android:layout_alignParentRight="true"
-                android:text="▷"
-                android:textSize="20sp"
-                android:alpha="0.7"/>
+                android:text="RT"
+                android:alpha="0.6"/>
         </RelativeLayout>
 
-        <!-- Action Buttons -->
         <LinearLayout
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
@@ -129,58 +111,57 @@
 
                 <Button
                     android:id="@+id/btn_b"
-                    android:layout_width="70dp"
-                    android:layout_height="70dp"
+                    android:layout_width="75dp"
+                    android:layout_height="75dp"
                     android:text="B"
-                    android:textSize="24sp"
-                    android:layout_marginRight="8dp"
-                    android:alpha="0.7"/>
+                    android:layout_marginRight="12dp"
+                    android:alpha="0.8"/>
 
                 <Button
                     android:id="@+id/btn_a"
-                    android:layout_width="70dp"
-                    android:layout_height="70dp"
+                    android:layout_width="75dp"
+                    android:layout_height="75dp"
                     android:text="A"
-                    android:textSize="24sp"
-                    android:alpha="0.7"/>
+                    android:alpha="0.8"/>
             </LinearLayout>
 
             <LinearLayout
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:orientation="horizontal"
-                android:layout_marginTop="8dp"
+                android:layout_marginTop="12dp"
                 android:gravity="center">
 
                 <Button
                     android:id="@+id/btn_select"
-                    android:layout_width="60dp"
-                    android:layout_height="40dp"
-                    android:text="SEL"
-                    android:textSize="12sp"
+                    android:layout_width="70dp"
+                    android:layout_height="45dp"
+                    android:text="SELECT"
+                    android:textSize="10sp"
                     android:layout_marginRight="8dp"
-                    android:alpha="0.7"/>
+                    android:alpha="0.6"/>
 
                 <Button
                     android:id="@+id/btn_start"
-                    android:layout_width="60dp"
-                    android:layout_height="40dp"
+                    android:layout_width="70dp"
+                    android:layout_height="45dp"
                     android:text="START"
-                    android:textSize="12sp"
-                    android:alpha="0.7"/>
+                    android:textSize="10sp"
+                    android:alpha="0.6"/>
             </LinearLayout>
         </LinearLayout>
 
-        <!-- Debug Button -->
         <Button
             android:id="@+id/btn_debug"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_alignParentTop="true"
             android:layout_alignParentRight="true"
-            android:layout_margin="8dp"
-            android:text="Debug"
-            android:textSize="12sp"
-            android:alpha="0.5"/>
+            android:layout_margin="12dp"
+            android:text="DEBUG MENU"
+            android:textSize="10sp"
+            android:alpha="0.4"
+            android:backgroundTint="#FF0000"/>
+            
     </RelativeLayout>
 </FrameLayout>
