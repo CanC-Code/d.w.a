@@ -1,130 +1,334 @@
-#include "MapperMMC1.h"
-#include <cstring>
+#include <jni.h>
+#include <string>
+#include <vector>
+#include <fstream>
 #include <android/log.h>
+#include <android/bitmap.h>
+#include <thread>
+#include <chrono>
+#include <mutex>
+#include <cstring>
+#include "MapperMMC1.h"
+#include "recompiled/cpu_shared.h"
 
-#define LOG_TAG "DWA_MAPPER"
-#define LOG_M(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#define LOG_TAG "DWA_NATIVE"
+#ifndef LOG_CPU
+#define LOG_CPU(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#endif
 
-MapperMMC1::MapperMMC1() {
-    // Zero out memory to prevent reading garbage if ROM isn't fully loaded
-    std::memset(prg_rom, 0, sizeof(prg_rom));
-    std::memset(chr_rom, 0, sizeof(chr_rom));
-    std::memset(prg_ram, 0, sizeof(prg_ram));
-    reset();
+// --- Recompiled Bank Dispatcher ---
+namespace Dispatcher {
+    void execute();
 }
 
-void MapperMMC1::reset() {
-    // MMC1 shift register is initialized with bit 4 set as a sentinel
-    shift_register = 0x10;
-    write_count = 0;
-    
-    // Control: $1C = PRG Mode 3 (fixed last bank), Vertical Mirroring
-    control = 0x1C; 
-    mirroring = 0x02; 
-    
-    prg_bank = 0;
-    chr_bank_0 = 0;
-    chr_bank_1 = 0;
+// --- Global Hardware State ---
+uint8_t cpu_ram[0x0800] = {0};
+uint8_t ppu_vram[2048] = {0};
+uint8_t palette_ram[32] = {0};
+uint8_t oam_ram[256] = {0};
+uint32_t screen_buffer[256 * 240] = {0};
+uint8_t controller_state = 0;
+uint8_t controller_shift = 0;
+uint8_t ppu_data_buffer = 0;
+std::mutex buffer_mutex;
+MapperMMC1 mapper;
+bool is_rom_loaded = false; // Safety flag
+
+uint32_t nes_palette[64] = {
+    0xFF666666, 0xFF002A88, 0xFF1412A7, 0xFF3B00A4, 0xFF5C007E, 0xFF6E0040, 0xFF6C0600, 0xFF561D00,
+    0xFF333500, 0xFF0B4800, 0xFF005200, 0xFF004F08, 0xFF00404D, 0xFF000000, 0xFF000000, 0xFF000000,
+    0xFFADADAD, 0xFF155FD9, 0xFF4240FF, 0xFF7527FE, 0xFFA01ACC, 0xFFB71E7B, 0xFFB53120, 0xFF994E00,
+    0xFF6B6D00, 0xFF388700, 0xFF0C9300, 0xFF008F32, 0xFF007C8D, 0xFF000000, 0xFF000000, 0xFF000000,
+    0xFFFFFFFF, 0xFF64B0FF, 0xFF9290FF, 0xFFC676FF, 0xFFF36AFF, 0xFFFE6ECC, 0xFFFE8170, 0xFFEA9E22,
+    0xFFBCBE00, 0xFF88D100, 0xFF5CE430, 0xFF45E082, 0xFF48CDDE, 0xFF4F4F4F, 0xFF000000, 0xFF000000
+};
+
+// --- Shared 6502 CPU Implementation ---
+extern "C" {
+    uint16_t reg_PC = 0;
+    uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
+
+    void execute_instruction() {
+        Dispatcher::execute();
+    }
+
+    void update_nz(uint8_t val) {
+        reg_P &= ~(FLAG_N | FLAG_Z);
+        if (val == 0) reg_P |= FLAG_Z;
+        if (val & 0x80) reg_P |= FLAG_N;
+    }
+
+    void update_flags_cmp(uint8_t reg, uint8_t val) {
+        reg_P &= ~(FLAG_N | FLAG_Z | FLAG_C);
+        if (reg >= val) reg_P |= FLAG_C;
+        if (reg == val) reg_P |= FLAG_Z;
+        if ((uint8_t)(reg - val) & 0x80) reg_P |= FLAG_N;
+    }
+
+    void cpu_adc(uint8_t val) {
+        uint16_t carry = (reg_P & FLAG_C);
+        uint16_t sum = reg_A + val + carry;
+        if (~(reg_A ^ val) & (reg_A ^ sum) & 0x80) reg_P |= FLAG_V; else reg_P &= ~FLAG_V;
+        if (sum > 0xFF) reg_P |= FLAG_C; else reg_P &= ~FLAG_C;
+        reg_A = (uint8_t)sum;
+        update_nz(reg_A);
+    }
+
+    void cpu_sbc(uint8_t val) { cpu_adc(~val); }
+
+    void cpu_bit(uint8_t val) {
+        reg_P &= ~(FLAG_Z | FLAG_V | FLAG_N);
+        if ((val & reg_A) == 0) reg_P |= FLAG_Z;
+        reg_P |= (val & 0xC0);
+    }
+
+    uint8_t cpu_asl(uint8_t val) {
+        reg_P = (reg_P & ~FLAG_C) | ((val >> 7) & 0x01);
+        uint8_t res = val << 1;
+        update_nz(res);
+        return res;
+    }
+
+    uint8_t cpu_lsr(uint8_t val) {
+        reg_P = (reg_P & ~FLAG_C) | (val & 0x01);
+        uint8_t res = val >> 1;
+        update_nz(res);
+        return res;
+    }
+
+    uint8_t cpu_rol(uint8_t val) {
+        uint8_t old_c = (reg_P & FLAG_C);
+        reg_P = (reg_P & ~FLAG_C) | ((val >> 7) & 0x01);
+        uint8_t res = (val << 1) | old_c;
+        update_nz(res);
+        return res;
+    }
+
+    uint8_t cpu_ror(uint8_t val) {
+        uint8_t old_c = (reg_P & FLAG_C);
+        reg_P = (reg_P & ~FLAG_C) | (val & 0x01);
+        uint8_t res = (val >> 1) | (old_c << 7);
+        update_nz(res);
+        return res;
+    }
+
+    uint16_t read_pointer(uint16_t addr) {
+        return bus_read(addr) | (bus_read(addr + 1) << 8);
+    }
+
+    // Fixed: Missing addressing mode helper for ($NN, X)
+    uint16_t read_pointer_indexed_x(uint16_t zp_addr) {
+        uint8_t target = (uint8_t)(zp_addr + reg_X);
+        uint16_t lo = bus_read(target);
+        uint16_t hi = bus_read((uint8_t)(target + 1));
+        return lo | (hi << 8);
+    }
+
+    uint16_t read_pointer_indexed_y(uint16_t zp_addr) {
+        uint16_t lo = bus_read(zp_addr);
+        uint16_t hi = bus_read((zp_addr + 1) & 0xFF);
+        return (lo | (hi << 8)) + reg_Y;
+    }
+
+    void push_stack(uint8_t val) { cpu_ram[0x0100 | (reg_S & 0xFF)] = val; reg_S--; }
+    uint8_t pop_stack() { reg_S++; return cpu_ram[0x0100 | (reg_S & 0xFF)]; }
 }
 
-void MapperMMC1::write(uint16_t addr, uint8_t val) {
-    if (val & 0x80) {
-        // Reset Signal (any write with bit 7 set resets the shift register)
-        shift_register = 0x10;
-        write_count = 0;
-        control |= 0x0C; // Lock to PRG mode 3 for safety
-    } else {
-        // Shift bit 0 of 'val' into our 5-bit shift register
-        bool bit = val & 0x01;
-        
-        // Logical MMC1 shift: data moves into bit 4, everything shifts right
-        // We use the sentinel bit method: when bit 0 of the register becomes 1, we've had 5 writes.
-        bool complete = (shift_register & 0x01);
-        shift_register >>= 1;
-        shift_register |= (bit << 4);
-        
-        if (complete) {
-            uint8_t data = shift_register & 0x1F;
-            
-            // Register selection based on bits 13 and 14 of the address
-            uint8_t reg_select = (addr >> 13) & 0x03;
+// --- PPU & Bus Logic ---
+uint8_t ppu_status = 0, ppu_ctrl = 0, ppu_mask = 0, ppu_addr_latch = 0, oam_addr = 0;
+uint16_t ppu_addr_reg = 0;
+bool is_running = false;
+bool is_paused = false;
 
-            switch (reg_select) {
-                case 0: // $8000 - $9FFF: Control
-                    control = data;
-                    mirroring = control & 0x03;
-                    break;
-                case 1: // $A000 - $BFFF: CHR Bank 0
-                    chr_bank_0 = data;
-                    break;
-                case 2: // $C000 - $DFFF: CHR Bank 1
-                    chr_bank_1 = data;
-                    break;
-                case 3: // $E000 - $FFFF: PRG Bank
-                    prg_bank = data & 0x0F;
-                    break;
+uint16_t ntable_mirror(uint16_t addr) {
+    addr = (addr - 0x2000) % 0x1000;
+    // MMC1 Mirroring logic
+    if (mapper.mirroring == 0) return addr % 0x0400;      // OneScreen Low
+    if (mapper.mirroring == 1) return 0x0400 + (addr % 0x0400); // OneScreen High
+    if (mapper.mirroring == 2) return addr % 0x0800;      // Vertical
+    return (addr < 0x0800) ? (addr % 0x0400) : (0x0400 + (addr % 0x0400)); // Horizontal
+}
+
+uint8_t read_palette(uint16_t addr) {
+    uint8_t p_idx = addr & 0x1F;
+    if (p_idx >= 0x10 && (p_idx % 4 == 0)) p_idx -= 0x10;
+    return palette_ram[p_idx];
+}
+
+extern "C" uint8_t bus_read(uint16_t addr) {
+    if (addr < 0x2000) return cpu_ram[addr % 0x0800];
+    if (addr >= 0x2000 && addr <= 0x3FFF) {
+        uint16_t reg = addr % 8;
+        if (reg == 2) {
+            uint8_t s = ppu_status;
+            ppu_status &= ~0x80;
+            ppu_addr_latch = 0;
+            return s;
+        }
+        if (reg == 7) {
+            uint8_t data = ppu_data_buffer;
+            uint16_t p_addr = ppu_addr_reg & 0x3FFF;
+            if (p_addr < 0x2000) ppu_data_buffer = mapper.read_chr(p_addr);
+            else if (p_addr < 0x3F00) ppu_data_buffer = ppu_vram[ntable_mirror(p_addr)];
+            else data = read_palette(p_addr);
+            ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
+            return data;
+        }
+    }
+    if (addr >= 0x6000) return mapper.read_prg(addr);
+    if (addr == 0x4016) {
+        uint8_t ret = (controller_shift & 0x80) >> 7;
+        controller_shift <<= 1;
+        return ret;
+    }
+    return 0;
+}
+
+extern "C" void bus_write(uint16_t addr, uint8_t val) {
+    if (addr < 0x2000) cpu_ram[addr % 0x0800] = val;
+    else if (addr >= 0x2000 && addr <= 0x3FFF) {
+        uint16_t reg = addr % 8;
+        if (reg == 0) ppu_ctrl = val;
+        else if (reg == 1) ppu_mask = val;
+        else if (reg == 3) oam_addr = val;
+        else if (reg == 4) oam_ram[oam_addr++] = val;
+        else if (reg == 6) {
+            if (ppu_addr_latch == 0) { ppu_addr_reg = (ppu_addr_reg & 0x00FF) | (val << 8); ppu_addr_latch = 1; }
+            else { ppu_addr_reg = (ppu_addr_reg & 0xFF00) | val; ppu_addr_latch = 0; }
+        }
+        else if (reg == 7) {
+            uint16_t p_addr = ppu_addr_reg & 0x3FFF;
+            if (p_addr >= 0x2000 && p_addr < 0x3F00) ppu_vram[ntable_mirror(p_addr)] = val;
+            else if (p_addr >= 0x3F00) {
+                uint8_t p_idx = p_addr & 0x1F;
+                if (p_idx >= 0x10 && (p_idx % 4 == 0)) p_idx -= 0x10;
+                palette_ram[p_idx] = val;
             }
+            ppu_addr_reg += (ppu_ctrl & 0x04) ? 32 : 1;
+        }
+    }
+    else if (addr == 0x4014) {
+        uint16_t base = val << 8;
+        for (int i = 0; i < 256; i++) oam_ram[i] = bus_read(base + i);
+    }
+    else if (addr == 0x4016) { 
+        if ((val & 0x01) == 0) controller_shift = controller_state; 
+    }
+    else if (addr >= 0x6000) mapper.write(addr, val);
+}
 
-            // Reset register for next 5-bit command
-            shift_register = 0x10;
+void clear_screen_to_black() {
+    std::lock_guard<std::mutex> lock(buffer_mutex);
+    for (int i = 0; i < 256 * 240; i++) screen_buffer[i] = 0xFF000000;
+}
+
+void draw_frame() {
+    if ((ppu_mask & 0x18) == 0) return;
+    std::lock_guard<std::mutex> lock(buffer_mutex);
+    uint16_t nt_base = (ppu_ctrl & 0x03) * 1024;
+    uint16_t bg_pat_base = (ppu_ctrl & 0x10) ? 0x1000 : 0x0000;
+    for (int ty = 0; ty < 30; ty++) {
+        for (int tx = 0; tx < 32; tx++) {
+            uint8_t tile = ppu_vram[ntable_mirror(0x2000 + nt_base + ty * 32 + tx)];
+            for (int y = 0; y < 8; y++) {
+                uint8_t p1 = mapper.read_chr(bg_pat_base + tile * 16 + y);
+                uint8_t p2 = mapper.read_chr(bg_pat_base + tile * 16 + y + 8);
+                for (int x = 0; x < 8; x++) {
+                    uint8_t pix = ((p1 >> (7 - x)) & 0x01) | (((p2 >> (7 - x)) & 0x01) << 1);
+                    if (pix == 0) continue;
+                    uint8_t palette_val = read_palette(0x3F00 + pix);
+                    screen_buffer[(ty * 8 + y) * 256 + (tx * 8 + x)] = nes_palette[palette_val & 0x3F];
+                }
+            }
         }
     }
 }
 
-uint8_t MapperMMC1::read_prg(uint16_t addr) {
-    // Save RAM Access ($6000-$7FFF)
-    if (addr >= 0x6000 && addr <= 0x7FFF) {
-        return prg_ram[addr - 0x6000];
-    }
+extern "C" void power_on_reset() {
+    mapper.reset();
+    uint8_t lo = bus_read(0xFFFC);
+    uint8_t hi = bus_read(0xFFFD);
+    reg_PC = (hi << 8) | lo;
+    reg_S = 0xFD; reg_P = 0x24; reg_A = 0; reg_X = 0; reg_Y = 0;
+}
 
-    uint16_t offset = addr & 0x3FFF;
-    uint8_t mode = get_prg_mode();
+extern "C" void nmi_handler() {
+    push_stack(reg_PC >> 8);
+    push_stack(reg_PC & 0xFF);
+    push_stack(reg_P);
+    reg_PC = (bus_read(0xFFFB) << 8) | bus_read(0xFFFA);
+    ppu_status |= 0x80;
+}
 
-    // Dragon Warrior I specific: 4 banks total. 
-    // Modulo 4 (% 4) is critical here to prevent Segmentation Faults.
-    switch (mode) {
-        case 0: 
-        case 1: // 32KB Mode
-        {
-            uint8_t bank = (prg_bank & 0x0E) % 4; 
-            if (addr < 0xC000) return prg_rom[bank][offset];
-            return prg_rom[(bank + 1) % 4][offset];
+void engine_loop() {
+    while (!is_rom_loaded) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    power_on_reset();
+    is_running = true;
+    while (is_running) {
+        if (is_paused) { std::this_thread::sleep_for(std::chrono::milliseconds(16)); continue; }
+        auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < 20000; i++) {
+            execute_instruction();
+            if (!is_running) break;
         }
-        case 2: // Fix first bank at $8000, switch second at $C000
-            if (addr < 0xC000) return prg_rom[0][offset];
-            return prg_rom[prg_bank % 4][offset];
-        case 3: // Switch first at $8000, fix last bank at $C000 (standard DW1)
-        default:
-            if (addr < 0xC000) return prg_rom[prg_bank % 4][offset];
-            return prg_rom[3][offset]; 
+        nmi_handler();
+        draw_frame();
+        std::this_thread::sleep_until(start + std::chrono::microseconds(16666));
     }
 }
 
-uint8_t MapperMMC1::read_chr(uint16_t addr) {
-    uint16_t offset = addr & 0x0FFF;
+// --- JNI Methods ---
 
-    if (get_chr_mode()) { 
-        // 4KB Mode
-        if (addr < 0x1000) return chr_rom[chr_bank_0 % 4][offset];
-        return chr_rom[chr_bank_1 % 4][offset];
-    } else { 
-        // 8KB Mode
-        uint8_t bank = (chr_bank_0 & 0x1E) % 4;
-        if (addr < 0x1000) return chr_rom[bank][offset];
-        return chr_rom[(bank + 1) % 4][offset];
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstring romPath) {
+    const char *path = env->GetStringUTFChars(romPath, nullptr);
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) { env->ReleaseStringUTFChars(romPath, path); return env->NewStringUTF("Error: File open"); }
+
+    uint8_t header[16];
+    file.read((char*)header, 16);
+    if (std::memcmp(header, "NES\x1A", 4) != 0) { 
+        file.close(); env->ReleaseStringUTFChars(romPath, path); return env->NewStringUTF("Error: Invalid NES"); 
     }
+
+    // Safer extraction with bounds checking
+    int prg_count = header[4];
+    for (int i = 0; i < prg_count && i < 4; i++) file.read((char*)mapper.prg_rom[i], 16384);
+    
+    int chr_count = header[5];
+    int chr_read = (chr_count == 0) ? 2 : chr_count * 2; // Handle CHR-RAM vs ROM
+    for (int i = 0; i < chr_read && i < 4; i++) file.read((char*)mapper.chr_rom[i], 4096);
+    
+    is_rom_loaded = true;
+    file.close();
+    env->ReleaseStringUTFChars(romPath, path);
+    return env->NewStringUTF("Success");
 }
 
-void MapperMMC1::write_chr(uint16_t addr, uint8_t val) {
-    uint16_t offset = addr & 0x0FFF;
-    // Dragon Warrior uses CHR-ROM, writes are technically ignored, 
-    // but implemented for safety and potential CHR-RAM hacks.
-    if (get_chr_mode()) {
-        if (addr < 0x1000) chr_rom[chr_bank_0 % 4][offset] = val;
-        else chr_rom[chr_bank_1 % 4][offset] = val;
-    } else {
-        uint8_t bank = (chr_bank_0 & 0x1E) % 4;
-        if (addr < 0x1000) chr_rom[bank][offset] = val;
-        else chr_rom[(bank + 1) % 4][offset] = val;
-    }
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv *env, jobject thiz, jstring filesDir) {
+    if (!is_running) { clear_screen_to_black(); std::thread(engine_loop).detach(); }
 }
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv *env, jobject thiz, jobject bitmap) {
+    if (bitmap == nullptr) return; // Critical null check
+    AndroidBitmapInfo info;
+    void* pixels;
+    if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) return;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
+    { std::lock_guard<std::mutex> lock(buffer_mutex); memcpy(pixels, screen_buffer, 256 * 240 * 4); }
+    AndroidBitmap_unlockPixels(env, bitmap);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_injectInput(JNIEnv *env, jobject thiz, jint buttonBit, jboolean isPressed) {
+    if (isPressed) controller_state |= (uint8_t)buttonBit;
+    else controller_state &= ~((uint8_t)buttonBit);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_nativePauseEngine(JNIEnv *env, jobject thiz) { is_paused = true; }
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_nativeResumeEngine(JNIEnv *env, jobject thiz) { is_paused = false; }
