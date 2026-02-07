@@ -6,11 +6,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Source files
-# Added MapperMMC1.cpp and PPU.cpp to resolve undefined symbol errors
 set(DWA_SOURCES
     native-lib.cpp
-    MapperMMC1.cpp
-    PPU.cpp
     recompiled/Dispatcher.cpp
     recompiled/Bank00.cpp
     recompiled/Bank01.cpp
