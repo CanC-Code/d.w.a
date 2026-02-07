@@ -33,23 +33,39 @@ public:
     uint8_t scroll_y;
 
     // Interrupt handling
+    // Updated: nmi_pending is used by the CPU loop to trigger the NMI routine
     bool nmi_pending;
 
     PPU();
+    
+    /**
+     * Resets PPU state to power-on defaults.
+     */
     void reset();
 
     // --- CPU Interface ---
-    // These methods handle $2000-$2007 bus traffic from the CPU
+    /**
+     * Handles CPU reads from PPU registers $2000-$2007.
+     * Note: PPUSTATUS ($2002) and PPUDATA ($2007) have side effects.
+     */
     uint8_t cpu_read(uint16_t addr, MapperMMC1& mapper);
+
+    /**
+     * Handles CPU writes to PPU registers $2000-$2007.
+     */
     void cpu_write(uint16_t addr, uint8_t val, MapperMMC1& mapper);
 
     // --- Frame Generation ---
-    // Renders the full 256x240 frame using current VRAM and Mapper banks
+    /**
+     * Renders a full 256x240 frame into the screen_buffer.
+     * Uses the Mapper to fetch CHR data for background and sprites.
+     */
     void render_frame(MapperMMC1& mapper, const uint32_t* nes_palette);
 
     /**
      * Helper to signal VBlank and prepare for NMI.
-     * Called at the end of the emulation cycle.
+     * In Dragon Warrior, this is usually called at the end of the frame
+     * to trigger the music and input polling routines.
      */
     void trigger_vblank() { 
         status |= 0x80; 
@@ -59,7 +75,7 @@ public:
 private:
     /**
      * Handles MMC1-controlled Mirroring (Horizontal, Vertical, One-Screen).
-     * Maps addresses $2000-$2FFF to the 2KB internal VRAM.
+     * Maps addresses $2000-$3EFF to the 2KB internal VRAM.
      */
     uint16_t get_mirrored_addr(uint16_t addr, uint8_t mirror_mode);
 };
