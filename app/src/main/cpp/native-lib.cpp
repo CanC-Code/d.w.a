@@ -12,6 +12,7 @@
 
 #define LOG_TAG "DWA_NATIVE"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // ============================================================================
 // GLOBAL HARDWARE & UI STATE
@@ -34,7 +35,6 @@ int frame_count = 0;
 jobject main_activity_instance = nullptr;
 JavaVM* java_vm = nullptr;
 
-// External reference to the recompiled dispatcher
 namespace Dispatcher { void execute(); }
 
 // ============================================================================
@@ -43,7 +43,9 @@ namespace Dispatcher { void execute(); }
 void make_toast(const char* message) {
     if (!java_vm || !main_activity_instance) return;
     JNIEnv* env;
-    java_vm->AttachCurrentThread(&env, nullptr);
+    jint res = java_vm->GetEnv((void**)&env, JNI_VERSION_1_6);
+    if (res == JNI_EDETACHED) java_vm->AttachCurrentThread(&env, nullptr);
+
     jclass clazz = env->GetObjectClass(main_activity_instance);
     jmethodID methodId = env->GetMethodID(clazz, "showToast", "(Ljava/lang/String;)V");
     if (methodId) {
@@ -52,7 +54,7 @@ void make_toast(const char* message) {
 }
 
 // ============================================================================
-// CPU BUS (Extern "C" for Linker)
+// CPU BUS & INTERRUPTS
 // ============================================================================
 extern "C" {
     uint16_t reg_PC = 0;
@@ -83,15 +85,38 @@ extern "C" {
         }
         else if (addr >= 0x6000) mapper.write(addr, val);
     }
-    
-    // The core instruction loop is now handled by the recompiled banks
+
+    void power_on_reset() {
+        // Reset vector is at $FFFC-$FFFD
+        uint8_t lo = bus_read(0xFFFC);
+        uint8_t hi = bus_read(0xFFFD);
+        reg_PC = (hi << 8) | lo;
+        
+        reg_A = reg_X = reg_Y = 0;
+        reg_S = 0xFD;
+        reg_P = 0x24;
+        LOGI("Reset Vector: $%04X", reg_PC);
+    }
+
+    void nmi_handler() {
+        push_stack((reg_PC >> 8) & 0xFF);
+        push_stack(reg_PC & 0xFF);
+        push_stack(reg_P);
+        uint8_t lo = bus_read(0xFFFA);
+        uint8_t hi = bus_read(0xFFFB);
+        reg_PC = (hi << 8) | lo;
+        reg_P |= FLAG_I;
+    }
 }
 
 // ============================================================================
 // ENGINE LOGIC
 // ============================================================================
+
+
 void engine_loop() {
-    while(!rom_loaded) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // Wait for ROM data to be fully loaded into mapper
+    while(!rom_loaded) std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     power_on_reset();
     make_toast("Dragon Warrior Initialized");
@@ -100,13 +125,13 @@ void engine_loop() {
     while(is_running) {
         auto frame_start = std::chrono::steady_clock::now();
 
-        // 1. Run the Recompiled Dispatcher for the visible scanlines
+        // 1. Visible scanlines
         ppu_status &= ~0x80; 
-        for(int i=0; i<300; i++) { // Run blocks of instructions
+        for(int i = 0; i < 500; i++) {
             Dispatcher::execute();
         }
 
-        // 2. Enter VBlank Period
+        // 2. Vertical Blank
         ppu_status |= 0x80; 
         if (ppu_ctrl & 0x80) nmi_handler();
 
@@ -130,14 +155,26 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv *env, jobject thiz, jstri
 
     const char *path = env->GetStringUTFChars(romPath, nullptr);
     std::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) return env->NewStringUTF("ROM Load Failed");
+    if (!file.is_open()) {
+        env->ReleaseStringUTFChars(romPath, path);
+        return env->NewStringUTF("ROM Load Failed");
+    }
 
-    file.seekg(16, std::ios::beg);
+    file.seekg(16, std::ios::beg); // Skip iNES header
     for(int i=0; i<4; i++) file.read((char*)mapper.prg_rom[i], 16384);
     file.close();
 
+    env->ReleaseStringUTFChars(romPath, path);
     rom_loaded = true;
     return env->NewStringUTF("Success");
+}
+
+// This should be called by Java after nativeExtractRom returns Success
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv *env, jobject thiz) {
+    if (is_running) return;
+    std::thread engine_thread(engine_loop);
+    engine_thread.detach(); 
 }
 
 extern "C" JNIEXPORT void JNICALL
