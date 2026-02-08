@@ -2,13 +2,12 @@
 import os
 import re
 
-# Configuration - Absolute Path Resolution for CI/CD
+# Configuration - Absolute Path Resolution
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-# These paths now point correctly regardless of where the script is called from
 SOURCE_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "source_files"))
 OUTPUT_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "app", "src", "main", "cpp", "recompiled"))
 
-# 6502 Cycle Table (Required for timing-accurate yielding)
+# 6502 Cycle Table
 CYCLE_TABLE = {
     'adc': 2, 'and': 2, 'asl': 2, 'bcc': 2, 'bcs': 2, 'beq': 2, 'bit': 3, 'bmi': 2, 'bne': 2, 'bpl': 2,
     'brk': 7, 'bvc': 2, 'bvs': 2, 'clc': 2, 'cld': 2, 'cli': 2, 'clv': 2, 'cmp': 2, 'cpx': 2, 'cpy': 2,
@@ -38,7 +37,6 @@ class Recompiler:
         self.anonymous_labels = []
 
     def first_pass(self, lines, start_pc):
-        """Pass 1: Map all labels and +/- targets to memory addresses."""
         current_pc = start_pc
         self.symbols = {}
         self.anonymous_labels = []
@@ -80,7 +78,6 @@ class Recompiler:
         target = self.resolve(raw_symbol, pc)
         prefix = f"cycles_to_run -= {cycles}; "
 
-        # Complex Addressing (X, Y, Indirect)
         is_imm = operand.startswith('#')
         is_ind_y = "),Y" in operand.upper()
         is_ind_x = ",X)" in operand.upper()
@@ -92,13 +89,21 @@ class Recompiler:
         elif is_abs_x: target = f"addr_abs_x({target}, nullptr)"
         elif is_abs_y: target = f"addr_abs_y({target}, nullptr)"
 
-        # Branching (with Logic for Yielding)
+        # Branching (Fixed: Added BVC/BVS)
         if opcode in ['beq', 'bne', 'bcs', 'bcc', 'bmi', 'bpl', 'bvs', 'bvc']:
-            conds = {'beq':'reg_P & FLAG_Z','bne':'!(reg_P & FLAG_Z)','bcs':'reg_P & FLAG_C','bcc':'!(reg_P & FLAG_C)','bmi':'reg_P & FLAG_N','bpl':'!(reg_P & FLAG_N)'}
+            conds = {
+                'beq': 'reg_P & FLAG_Z',
+                'bne': '!(reg_P & FLAG_Z)',
+                'bcs': 'reg_P & FLAG_C',
+                'bcc': '!(reg_P & FLAG_C)',
+                'bmi': 'reg_P & FLAG_N',
+                'bpl': '!(reg_P & FLAG_N)',
+                'bvs': 'reg_P & FLAG_V',
+                'bvc': '!(reg_P & FLAG_V)'
+            }
             y = "if (cycles_to_run <= 0) return; " if int(target, 16) < pc else ""
             return f"{prefix}{y}if ({conds[opcode]}) {{ reg_PC = {target}; return; }}", size
 
-        # Core Instruction Set
         ops = {
             'lda': f"reg_A = {'(uint8_t)'+target if is_imm else 'bus_read('+target+')'}; update_nz(reg_A);",
             'ldx': f"reg_X = {'(uint8_t)'+target if is_imm else 'bus_read('+target+')'}; update_nz(reg_X);",
