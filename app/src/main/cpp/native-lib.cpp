@@ -7,7 +7,6 @@
 #include <chrono>
 #include <mutex>
 #include <cstring>
-#include <atomic>
 #include "MapperMMC1.h"
 #include "PPU.h"
 #include "recompiled/cpu_shared.h"
@@ -28,17 +27,18 @@ extern "C" {
     uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
     int64_t total_cycles = 0;
     int32_t cycles_to_run = 0;
-    std::atomic<bool> is_running{false};
-    bool is_paused = false;
-    uint8_t joypad_state = 0;
+    bool is_running = false; 
+    bool nmi_pending = false;
+    bool irq_pending = false;
+    uint8_t joypad_state = 0; // Current real-time state from Java
 }
 
-// Hardware Memory
+// Hardware Components
 uint8_t cpu_ram[0x0800] = {0};
 MapperMMC1 mapper;
 PPU ppu;
+uint8_t controller_latch = 0; // Shift register for serial reading
 
-// Standard NES Palette (Simplified for Android 32-bit RGBA)
 const uint32_t nes_palette[64] = {
     0xFF757575, 0xFF8F1B27, 0xFFAB0000, 0xFF9F0047, 0xFF77008F, 0xFF1300AB, 0xFF0000A7, 0xFF000B7F,
     0xFF002F43, 0xFF004700, 0xFF004700, 0xFF003B0B, 0xFF472F00, 0xFF000000, 0xFF000000, 0xFF000000,
@@ -52,6 +52,7 @@ const uint32_t nes_palette[64] = {
 
 std::mutex buffer_mutex;
 std::mutex engine_mutex;
+bool is_paused = false;
 
 // ============================================================================
 // CORE CPU & BUS IMPLEMENTATION
@@ -94,10 +95,10 @@ extern "C" {
         if (a < 0x2000) return cpu_ram[a & 0x07FF];
         if (a >= 0x2000 && a < 0x4000) return ppu.cpu_read(a, mapper);
         if (a == 0x4016) { 
-            static uint8_t latched_input = 0;
-            uint8_t r = (latched_input & 0x80) >> 7;
-            latched_input <<= 1;
-            return r | 0x40;
+            // Serial Controller Read
+            uint8_t r = (controller_latch & 0x01);
+            controller_latch >>= 1;
+            return r | 0x40; // 0x40 is often expected by NES open bus
         }
         return (a >= 0x6000) ? mapper.read_prg(a) : 0;
     }
@@ -105,17 +106,15 @@ extern "C" {
     void bus_write(uint16_t a, uint8_t v) {
         if (a < 0x2000) cpu_ram[a & 0x07FF] = v;
         else if (a >= 0x2000 && a < 0x4000) ppu.cpu_write(a, v, mapper);
-        else if (a == 0x4014) { // OAM DMA
+        else if (a == 0x4014) { 
             ppu.do_dma(&cpu_ram[v << 8]);
             add_cycles(513);
         }
         else if (a == 0x4016) {
-            // Software latching logic for joypad
-            static uint8_t last_v = 0;
-            if ((last_v & 1) && !(v & 1)) { /* Latch on 1 -> 0 transition */ }
-            // Simulating simple latch for recompiled speed:
-            extern uint8_t joypad_state;
-            // Note: Use internal shift logic if the game polls multi-times
+            // Controller Strobe: When bit 0 transitions from 1 to 0, state is locked
+            if (!(v & 0x01)) {
+                controller_latch = joypad_state;
+            }
         }
         else if (a >= 0x6000) mapper.write(a, v);
     }
@@ -124,6 +123,13 @@ extern "C" {
         cpu_push(reg_PC >> 8); cpu_push(reg_PC & 0xFF); cpu_push(reg_P);
         reg_P |= FLAG_I;
         reg_PC = cpu_read_pointer(0xFFFA);
+        add_cycles(7);
+    }
+
+    void irq_handler() {
+        cpu_push(reg_PC >> 8); cpu_push(reg_PC & 0xFF); cpu_push(reg_P);
+        reg_P |= FLAG_I;
+        reg_PC = cpu_read_pointer(0xFFFE);
         add_cycles(7);
     }
 
@@ -141,31 +147,31 @@ void engine_loop() {
     std::lock_guard<std::mutex> lock(engine_mutex);
     ppu.reset();
     mapper.reset();
-    reg_PC = cpu_read_pointer(0xFFFC); // RESET Vector
+    
+    reg_PC = cpu_read_pointer(0xFFFC); 
 
     while (is_running) {
         if (is_paused) { std::this_thread::sleep_for(std::chrono::milliseconds(16)); continue; }
 
         auto frame_start = std::chrono::steady_clock::now();
-        cycles_to_run += 29780;
+        cycles_to_run += 29780; 
 
         while (cycles_to_run > 0 && is_running) {
             execute_instruction();
         }
 
-        // --- Render Frame & Sync ---
         {
             std::lock_guard<std::mutex> lock(buffer_mutex);
             ppu.render_frame(mapper, nes_palette);
         }
-        
-        // PPU VBlank start
-        ppu.status |= 0x80;
+
+        ppu.status |= 0x80; 
         if (ppu.ctrl & 0x80) ppu.nmi_pending = true;
 
         std::this_thread::sleep_until(frame_start + std::chrono::microseconds(16666));
-        ppu.clear_status(); // End of VBlank
+        ppu.clear_status(); 
     }
+    LOGI("Engine: Thread Terminated");
 }
 
 // ============================================================================
@@ -180,12 +186,10 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstri
 
     uint8_t header[16]; 
     file.read((char*)header, 16);
-    // Dragon Warrior 1 is Mapper 1 (MMC1)
-    // Load PRG banks (16KB each)
+    
     for (int i=0; i < header[4] && i < 4; i++) {
         file.read((char*)mapper.prg_rom[i], 16384);
     }
-    // Load CHR (8KB)
     file.read((char*)mapper.chr_rom, 8192);
 
     file.close();
