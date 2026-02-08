@@ -1,105 +1,189 @@
 #include "cpu_shared.h"
 
-extern "C" {
+// CPU Registers (defined in native-lib.cpp, declared extern here)
+extern uint8_t reg_A;
+extern uint8_t reg_X;
+extern uint8_t reg_Y;
+extern uint8_t reg_P;
+extern uint8_t reg_SP;
+extern uint16_t reg_PC;
+extern int cycles_to_run;
 
-    // These must be inside extern "C" so the Linker finds them
-    void update_nz(uint8_t v) {
-        reg_P &= ~(FLAG_N | FLAG_Z);
-        if (v == 0) reg_P |= FLAG_Z;
-        if (v & 0x80) reg_P |= FLAG_N;
-    }
+// Memory access (defined in native-lib.cpp)
+extern uint8_t bus_read(uint16_t addr);
+extern void bus_write(uint16_t addr, uint8_t value);
 
-    void update_flags_cmp(uint8_t reg, uint8_t val) {
-        reg_P &= ~(FLAG_C | FLAG_Z | FLAG_N);
-        if (reg >= val) reg_P |= FLAG_C;
-        if (reg == val) reg_P |= FLAG_Z;
-        if ((uint8_t)(reg - val) & 0x80) reg_P |= FLAG_N;
-    }
+// Update N and Z flags
+void update_nz(uint8_t value) {
+    if (value == 0)
+        reg_P |= FLAG_Z;
+    else
+        reg_P &= ~FLAG_Z;
+    
+    if (value & 0x80)
+        reg_P |= FLAG_N;
+    else
+        reg_P &= ~FLAG_N;
+}
 
-    void cpu_adc(uint8_t v) {
-        uint16_t temp = (uint16_t)reg_A + (uint16_t)v + (uint16_t)(reg_P & FLAG_C);
-        reg_P &= ~(FLAG_C | FLAG_V | FLAG_Z | FLAG_N);
-        if (temp > 255) reg_P |= FLAG_C;
-        if (~(reg_A ^ v) & (reg_A ^ temp) & 0x80) reg_P |= FLAG_V;
-        reg_A = (uint8_t)temp;
-        update_nz(reg_A);
-    }
+// Compare instruction (CMP, CPX, CPY)
+void update_flags_cmp(uint8_t reg, uint8_t value) {
+    uint16_t result = reg - value;
+    
+    if (reg >= value)
+        reg_P |= FLAG_C;
+    else
+        reg_P &= ~FLAG_C;
+    
+    update_nz(result & 0xFF);
+}
 
-    void cpu_sbc(uint8_t v) {
-        cpu_adc(~v);
-    }
+// ADC (Add with Carry)
+void cpu_adc(uint8_t value) {
+    uint16_t result = reg_A + value + (reg_P & FLAG_C ? 1 : 0);
+    
+    // Overflow: (A^result) & (value^result) & 0x80
+    if (((reg_A ^ result) & (value ^ result) & 0x80) != 0)
+        reg_P |= FLAG_V;
+    else
+        reg_P &= ~FLAG_V;
+    
+    if (result > 0xFF)
+        reg_P |= FLAG_C;
+    else
+        reg_P &= ~FLAG_C;
+    
+    reg_A = result & 0xFF;
+    update_nz(reg_A);
+}
 
-    void cpu_bit(uint8_t v) {
-        reg_P &= ~(FLAG_Z | FLAG_V | FLAG_N);
-        if (!(reg_A & v)) reg_P |= FLAG_Z;
-        reg_P |= (v & 0xC0);
-    }
+// SBC (Subtract with Carry)
+void cpu_sbc(uint8_t value) {
+    value = ~value;  // SBC is ADC with inverted operand
+    cpu_adc(value);
+}
 
-    void cpu_asl_impl(uint16_t addr, bool is_reg) {
-        uint8_t v = is_reg ? reg_A : bus_read(addr);
-        if (v & 0x80) reg_P |= FLAG_C; else reg_P &= ~FLAG_C;
-        v <<= 1;
-        update_nz(v);
-        if (is_reg) reg_A = v; else bus_write(addr, v);
-    }
+// BIT test
+void cpu_bit(uint8_t value) {
+    if ((reg_A & value) == 0)
+        reg_P |= FLAG_Z;
+    else
+        reg_P &= ~FLAG_Z;
+    
+    if (value & 0x80)
+        reg_P |= FLAG_N;
+    else
+        reg_P &= ~FLAG_N;
+    
+    if (value & 0x40)
+        reg_P |= FLAG_V;
+    else
+        reg_P &= ~FLAG_V;
+}
 
-    void cpu_lsr_impl(uint16_t addr, bool is_reg) {
-        uint8_t v = is_reg ? reg_A : bus_read(addr);
-        if (v & 0x01) reg_P |= FLAG_C; else reg_P &= ~FLAG_C;
-        v >>= 1;
-        update_nz(v);
-        if (is_reg) reg_A = v; else bus_write(addr, v);
-    }
+// ASL (Arithmetic Shift Left)
+uint8_t cpu_asl(uint8_t value) {
+    if (value & 0x80)
+        reg_P |= FLAG_C;
+    else
+        reg_P &= ~FLAG_C;
+    
+    value <<= 1;
+    update_nz(value);
+    return value;
+}
 
-    void cpu_rol_impl(uint16_t addr, bool is_reg) {
-        uint8_t v = is_reg ? reg_A : bus_read(addr);
-        uint8_t old_c = (reg_P & FLAG_C);
-        if (v & 0x80) reg_P |= FLAG_C; else reg_P &= ~FLAG_C;
-        v = (v << 1) | old_c;
-        update_nz(v);
-        if (is_reg) reg_A = v; else bus_write(addr, v);
-    }
+// LSR (Logical Shift Right)
+uint8_t cpu_lsr(uint8_t value) {
+    if (value & 0x01)
+        reg_P |= FLAG_C;
+    else
+        reg_P &= ~FLAG_C;
+    
+    value >>= 1;
+    update_nz(value);
+    return value;
+}
 
-    void cpu_ror_impl(uint16_t addr, bool is_reg) {
-        uint8_t v = is_reg ? reg_A : bus_read(addr);
-        uint8_t old_c = (reg_P & FLAG_C) ? 0x80 : 0x00;
-        if (v & 0x01) reg_P |= FLAG_C; else reg_P &= ~FLAG_C;
-        v = (v >> 1) | old_c;
-        update_nz(v);
-        if (is_reg) reg_A = v; else bus_write(addr, v);
-    }
+// ROL (Rotate Left)
+uint8_t cpu_rol(uint8_t value) {
+    uint8_t old_carry = (reg_P & FLAG_C) ? 1 : 0;
+    
+    if (value & 0x80)
+        reg_P |= FLAG_C;
+    else
+        reg_P &= ~FLAG_C;
+    
+    value = (value << 1) | old_carry;
+    update_nz(value);
+    return value;
+}
 
-    uint16_t cpu_read_pointer(uint16_t addr) {
-        return bus_read(addr) | (bus_read(addr + 1) << 8);
-    }
+// ROR (Rotate Right)
+uint8_t cpu_ror(uint8_t value) {
+    uint8_t old_carry = (reg_P & FLAG_C) ? 0x80 : 0;
+    
+    if (value & 0x01)
+        reg_P |= FLAG_C;
+    else
+        reg_P &= ~FLAG_C;
+    
+    value = (value >> 1) | old_carry;
+    update_nz(value);
+    return value;
+}
 
-    uint16_t cpu_read_jmp_indirect(uint16_t addr) {
-        uint16_t low = bus_read(addr);
-        uint16_t high = bus_read((addr & 0xFF00) | ((addr + 1) & 0x00FF));
-        return low | (high << 8);
-    }
+// Stack operations
+void cpu_push(uint8_t value) {
+    bus_write(0x100 | reg_SP, value);
+    reg_SP--;
+}
 
-    uint16_t read_pointer_indexed_x(uint16_t zp_addr) {
-        uint8_t ptr = (uint8_t)(bus_read(zp_addr) + reg_X);
-        return bus_read(ptr) | (bus_read((uint8_t)(ptr + 1)) << 8);
-    }
+uint8_t cpu_pop() {
+    reg_SP++;
+    return bus_read(0x100 | reg_SP);
+}
 
-    uint16_t read_pointer_indexed_y(uint16_t zp_addr, bool* page_crossed) {
-        uint16_t base = bus_read(zp_addr) | (bus_read((uint8_t)(zp_addr + 1)) << 8);
-        uint16_t final = base + reg_Y;
-        if (page_crossed && (final & 0xFF00) != (base & 0xFF00)) *page_crossed = true;
-        return final;
-    }
+// Read 16-bit pointer
+uint16_t cpu_read_pointer(uint16_t addr) {
+    uint8_t lo = bus_read(addr);
+    uint8_t hi = bus_read(addr + 1);
+    return lo | (hi << 8);
+}
 
-    uint16_t addr_abs_x(uint16_t base, bool* page_crossed) {
-        uint16_t final = base + reg_X;
-        if (page_crossed && (final & 0xFF00) != (base & 0xFF00)) *page_crossed = true;
-        return final;
+// Addressing modes with page crossing detection
+uint16_t addr_abs_x(uint16_t addr, bool* page_crossed) {
+    uint16_t result = addr + reg_X;
+    if (page_crossed) {
+        *page_crossed = ((addr & 0xFF00) != (result & 0xFF00));
     }
+    return result;
+}
 
-    uint16_t addr_abs_y(uint16_t base, bool* page_crossed) {
-        uint16_t final = base + reg_Y;
-        if (page_crossed && (final & 0xFF00) != (base & 0xFF00)) *page_crossed = true;
-        return final;
+uint16_t addr_abs_y(uint16_t addr, bool* page_crossed) {
+    uint16_t result = addr + reg_Y;
+    if (page_crossed) {
+        *page_crossed = ((addr & 0xFF00) != (result & 0xFF00));
     }
+    return result;
+}
+
+// Indexed indirect (X)
+uint16_t read_pointer_indexed_x(uint16_t zp_addr) {
+    uint8_t addr = (zp_addr + reg_X) & 0xFF;
+    uint8_t lo = bus_read(addr);
+    uint8_t hi = bus_read((addr + 1) & 0xFF);
+    return lo | (hi << 8);
+}
+
+// Indirect indexed (Y)
+uint16_t read_pointer_indexed_y(uint16_t zp_addr, bool* page_crossed) {
+    uint8_t lo = bus_read(zp_addr & 0xFF);
+    uint8_t hi = bus_read((zp_addr + 1) & 0xFF);
+    uint16_t base = lo | (hi << 8);
+    uint16_t result = base + reg_Y;
+    if (page_crossed) {
+        *page_crossed = ((base & 0xFF00) != (result & 0xFF00));
+    }
+    return result;
 }
