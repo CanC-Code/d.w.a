@@ -30,14 +30,14 @@ extern "C" {
     bool is_running = false; 
     bool nmi_pending = false;
     bool irq_pending = false;
-    uint8_t joypad_state = 0; // Current real-time state from Java
+    uint8_t joypad_state = 0; 
 }
 
 // Hardware Components
 uint8_t cpu_ram[0x0800] = {0};
 MapperMMC1 mapper;
 PPU ppu;
-uint8_t controller_latch = 0; // Shift register for serial reading
+uint8_t controller_latch = 0; 
 
 const uint32_t nes_palette[64] = {
     0xFF757575, 0xFF8F1B27, 0xFFAB0000, 0xFF9F0047, 0xFF77008F, 0xFF1300AB, 0xFF0000A7, 0xFF000B7F,
@@ -55,50 +55,22 @@ std::mutex engine_mutex;
 bool is_paused = false;
 
 // ============================================================================
-// CORE CPU & BUS IMPLEMENTATION
+// CORE BUS IMPLEMENTATION
 // ============================================================================
 
 extern "C" {
-    void update_nz(uint8_t v) {
-        reg_P &= ~(FLAG_N | FLAG_Z);
-        if (v == 0) reg_P |= FLAG_Z;
-        if (v & 0x80) reg_P |= FLAG_N;
-    }
-
-    void update_flags_cmp(uint8_t reg, uint8_t val) {
-        reg_P &= ~(FLAG_C | FLAG_Z | FLAG_N);
-        if (reg >= val) reg_P |= FLAG_C;
-        if (reg == val) reg_P |= FLAG_Z;
-        if ((uint8_t)(reg - val) & 0x80) reg_P |= FLAG_N;
-    }
+    // Note: NZ updates, CMP flags, and addressing helpers moved to cpu_shared.cpp
 
     void cpu_push(uint8_t v) { cpu_ram[0x0100 | (reg_S--)] = v; }
     uint8_t cpu_pop() { return cpu_ram[0x0100 | (++reg_S)]; }
-
-    uint16_t addr_abs_x(uint16_t base, bool* page_crossed) {
-        uint16_t addr = base + reg_X;
-        if (page_crossed && (addr & 0xFF00) != (base & 0xFF00)) { *page_crossed = true; add_cycles(1); }
-        return addr;
-    }
-
-    uint16_t addr_abs_y(uint16_t base, bool* page_crossed) {
-        uint16_t addr = base + reg_Y;
-        if (page_crossed && (addr & 0xFF00) != (base & 0xFF00)) { *page_crossed = true; add_cycles(1); }
-        return addr;
-    }
-
-    uint16_t cpu_read_pointer(uint16_t addr) {
-        return bus_read(addr) | (bus_read(addr + 1) << 8);
-    }
 
     uint8_t bus_read(uint16_t a) {
         if (a < 0x2000) return cpu_ram[a & 0x07FF];
         if (a >= 0x2000 && a < 0x4000) return ppu.cpu_read(a, mapper);
         if (a == 0x4016) { 
-            // Serial Controller Read
             uint8_t r = (controller_latch & 0x01);
             controller_latch >>= 1;
-            return r | 0x40; // 0x40 is often expected by NES open bus
+            return r | 0x40; 
         }
         return (a >= 0x6000) ? mapper.read_prg(a) : 0;
     }
@@ -111,7 +83,6 @@ extern "C" {
             add_cycles(513);
         }
         else if (a == 0x4016) {
-            // Controller Strobe: When bit 0 transitions from 1 to 0, state is locked
             if (!(v & 0x01)) {
                 controller_latch = joypad_state;
             }
@@ -120,21 +91,33 @@ extern "C" {
     }
 
     void nmi_handler() {
-        cpu_push(reg_PC >> 8); cpu_push(reg_PC & 0xFF); cpu_push(reg_P);
+        cpu_push(reg_PC >> 8); 
+        cpu_push(reg_PC & 0xFF); 
+        cpu_push(reg_P);
         reg_P |= FLAG_I;
         reg_PC = cpu_read_pointer(0xFFFA);
         add_cycles(7);
     }
 
     void irq_handler() {
-        cpu_push(reg_PC >> 8); cpu_push(reg_PC & 0xFF); cpu_push(reg_P);
-        reg_P |= FLAG_I;
-        reg_PC = cpu_read_pointer(0xFFFE);
-        add_cycles(7);
+        if (!(reg_P & FLAG_I)) {
+            cpu_push(reg_PC >> 8); 
+            cpu_push(reg_PC & 0xFF); 
+            cpu_push(reg_P);
+            reg_P |= FLAG_I;
+            reg_PC = cpu_read_pointer(0xFFFE);
+            add_cycles(7);
+        }
     }
 
     void execute_instruction() {
-        if (ppu.check_nmi()) { nmi_handler(); }
+        // Priority: NMI > IRQ
+        if (ppu.check_nmi()) { 
+            nmi_handler(); 
+        } else if (irq_pending) {
+            irq_handler();
+            irq_pending = false;
+        }
         Dispatcher::execute();
     }
 }
@@ -147,11 +130,14 @@ void engine_loop() {
     std::lock_guard<std::mutex> lock(engine_mutex);
     ppu.reset();
     mapper.reset();
-    
+
     reg_PC = cpu_read_pointer(0xFFFC); 
 
     while (is_running) {
-        if (is_paused) { std::this_thread::sleep_for(std::chrono::milliseconds(16)); continue; }
+        if (is_paused) { 
+            std::this_thread::sleep_for(std::chrono::milliseconds(16)); 
+            continue; 
+        }
 
         auto frame_start = std::chrono::steady_clock::now();
         cycles_to_run += 29780; 
@@ -171,7 +157,6 @@ void engine_loop() {
         std::this_thread::sleep_until(frame_start + std::chrono::microseconds(16666));
         ppu.clear_status(); 
     }
-    LOGI("Engine: Thread Terminated");
 }
 
 // ============================================================================
@@ -186,7 +171,8 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstri
 
     uint8_t header[16]; 
     file.read((char*)header, 16);
-    
+
+    // Basic iNES extraction
     for (int i=0; i < header[4] && i < 4; i++) {
         file.read((char*)mapper.prg_rom[i], 16384);
     }
