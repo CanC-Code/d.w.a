@@ -28,6 +28,16 @@ void PPU::reset() {
 }
 
 /**
+ * OAM DMA (Object Attribute Memory Direct Memory Access)
+ * Fixes: undefined symbol: PPU::do_dma(unsigned char*)
+ */
+void PPU::do_dma(uint8_t* data) {
+    // NES OAM is always 256 bytes, representing 64 sprites (4 bytes each).
+    // This is called via CPU address 0x4014.
+    std::memcpy(oam_ram, data, 256);
+}
+
+/**
  * Register Communication (CPU Bus <-> PPU)
  */
 uint8_t PPU::cpu_read(uint16_t addr, MapperMMC1& mapper) {
@@ -44,7 +54,7 @@ uint8_t PPU::cpu_read(uint16_t addr, MapperMMC1& mapper) {
         case 0x2007: // PPU Data
             res = ppu_data_buffer;
             ppu_data_buffer = vram_read(ppu_addr, mapper);
-            // Palette reads are not buffered
+            // Palette reads are not buffered on the real NES
             if (ppu_addr >= 0x3F00) res = ppu_data_buffer; 
             ppu_addr += (ctrl & 0x04) ? 32 : 1;
             ppu_addr &= 0x3FFF;
@@ -83,8 +93,7 @@ uint8_t PPU::vram_read(uint16_t addr, MapperMMC1& mapper) {
     addr &= 0x3FFF;
     if (addr < 0x2000) return mapper.read_chr(addr);
     if (addr < 0x3F00) return vram[get_mirrored_addr(addr, mapper.get_mirroring())];
-    
-    // Palette Mirroring: 0x3F10, 0x3F14, 0x3F18, 0x3F1C are mirrors of 0x3F00, 0x3F04, etc.
+
     uint16_t p_addr = addr & 0x1F;
     if (p_addr >= 0x10 && (p_addr & 0x03) == 0) p_addr -= 0x10;
     return palette_ram[p_addr];
@@ -103,27 +112,31 @@ void PPU::vram_write(uint16_t addr, uint8_t val, MapperMMC1& mapper) {
     }
 }
 
-
-
+/**
+ * Mirroring Implementation
+ * Crucial for Dragon Warrior scrolling through the overworld and towns.
+ */
 uint16_t PPU::get_mirrored_addr(uint16_t addr, Mirroring mirroring) {
-    addr &= 0x0FFF; // Offset from 0x2000
+    addr &= 0x0FFF; 
     switch (mirroring) {
         case Mirroring::ONE_SCREEN_LOW:  return addr & 0x03FF;
         case Mirroring::ONE_SCREEN_HIGH: return (addr & 0x03FF) + 0x0400;
         case Mirroring::HORIZONTAL:
-            // (0,1) maps to 0, (2,3) maps to 1
-            return ((addr / 2) & 0x0400) + (addr % 0x0400);
+            // $2000,$2400 share Page 0. $2800,$2C00 share Page 1.
+            return ((addr / 2) & 0x400) + (addr % 0x400);
         case Mirroring::VERTICAL:
+            // $2000,$2800 share Page 0. $2400,$2C00 share Page 1.
             return addr & 0x07FF;
         default: return addr & 0x07FF;
     }
 }
 
+
+
 /**
  * Main Rendering Entry Point
  */
 void PPU::render_frame(MapperMMC1& mapper, const uint32_t* nes_palette) {
-    // If rendering is disabled, fill with backdrop color and exit
     if (!(mask & 0x18)) {
         uint32_t backdrop = nes_palette[palette_ram[0] & 0x3F];
         std::fill(screen_buffer, screen_buffer + (256 * 240), backdrop);
@@ -143,8 +156,7 @@ void PPU::render_frame(MapperMMC1& mapper, const uint32_t* nes_palette) {
             for (int x = 0; x < 256; x++) {
                 int abs_x = x + scroll_x;
                 int abs_y = y + scroll_y;
-                
-                // Nametable selection based on scroll
+
                 int nt_x = (abs_x / 256) % 2;
                 int nt_y = (abs_y / 240) % 2;
                 uint16_t current_nt_base = 0x2000 + ((base_nt_idx ^ nt_x ^ (nt_y << 1)) * 0x0400);
@@ -161,7 +173,7 @@ void PPU::render_frame(MapperMMC1& mapper, const uint32_t* nes_palette) {
 
                 uint8_t p_low = mapper.read_chr(bg_pt_base + (tile_idx * 16) + (abs_y % 8));
                 uint8_t p_high = mapper.read_chr(bg_pt_base + (tile_idx * 16) + (abs_y % 8) + 8);
-                
+
                 int bit_pos = 7 - (abs_x % 8);
                 uint8_t pixel = ((p_low >> bit_pos) & 0x01) | (((p_high >> bit_pos) & 0x01) << 1);
 
@@ -182,12 +194,12 @@ void PPU::render_frame(MapperMMC1& mapper, const uint32_t* nes_palette) {
             uint8_t sx = oam_ram[i * 4 + 3];
 
             if (sy >= 239) continue;
-            sy++; // NES Sprites are delayed by one scanline
+            sy++; // Sprite rendering is offset by 1 scanline on NES hardware
 
             for (int py = 0; py < 8; py++) {
                 int target_y = sy + py;
                 if (target_y >= 240) continue;
-                
+
                 int line = (attr & 0x80) ? (7 - py) : py;
                 uint8_t low = mapper.read_chr(sp_pt_base + (tile * 16) + line);
                 uint8_t high = mapper.read_chr(sp_pt_base + (tile * 16) + line + 8);
@@ -195,18 +207,18 @@ void PPU::render_frame(MapperMMC1& mapper, const uint32_t* nes_palette) {
                 for (int px = 0; px < 8; px++) {
                     int target_x = sx + px;
                     if (target_x >= 256) continue;
-                    
+
                     int bit = (attr & 0x40) ? px : (7 - px);
                     uint8_t pixel = ((low >> bit) & 0x01) | (((high >> bit) & 0x01) << 1);
 
                     if (pixel == 0) continue; 
 
-                    // Sprite 0 Hit Logic
+                    // Sprite 0 Hit Logic (used for status bars)
                     if (i == 0 && bg_pixel_map[target_y * 256 + target_x] != 0) {
                         status |= 0x40; 
                     }
 
-                    // Priority Logic
+                    // Priority Logic (Foreground vs Background)
                     if ((attr & 0x20) && bg_pixel_map[target_y * 256 + target_x] != 0) continue;
 
                     uint8_t p_idx = (attr & 0x03) + 4;
