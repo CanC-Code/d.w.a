@@ -1,153 +1,154 @@
 <?xml version="1.0" encoding="utf-8"?>
-<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<androidx.constraintlayout.widget.ConstraintLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#000000">
 
+    <!-- Game Screen -->
+    <ImageView
+        android:id="@+id/screenView"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:scaleType="fitCenter"
+        android:background="#000000"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toTopOf="@id/controllerArea"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintDimensionRatio="H,256:240" />
+
+    <!-- Controller Area -->
     <LinearLayout
-        android:id="@+id/setup_layout"
+        android:id="@+id/controllerArea"
         android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:gravity="center"
-        android:orientation="vertical"
-        android:visibility="visible">
-        <Button
-            android:id="@+id/btn_select_rom"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="Load Dragon Warrior" />
-    </LinearLayout>
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:padding="16dp"
+        android:background="#20000000"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent">
 
-    <androidx.constraintlayout.widget.ConstraintLayout
-        android:id="@+id/game_layout"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:visibility="gone">
-
-        <SurfaceView
-            android:id="@+id/game_surface"
+        <!-- D-Pad -->
+        <RelativeLayout
             android:layout_width="0dp"
-            android:layout_height="0dp"
-            app:layout_constraintDimensionRatio="4:3"
-            app:layout_constraintTop_toTopOf="parent"
-            app:layout_constraintBottom_toBottomOf="parent"
-            app:layout_constraintLeft_toLeftOf="parent"
-            app:layout_constraintRight_toRightOf="parent" />
+            android:layout_height="120dp"
+            android:layout_weight="1">
 
-        <View
-            android:id="@+id/debug_overlay_bg"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:background="#AA000000"
-            android:visibility="gone" />
-
-        <Button
-            android:id="@+id/btn_turbo"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_margin="16dp"
-            android:text="TURBO"
-            android:alpha="0.6"
-            app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toTopOf="parent" />
-
-        <androidx.constraintlayout.widget.ConstraintLayout
-            android:id="@+id/dpad_container"
-            android:layout_width="150dp"
-            android:layout_height="150dp"
-            android:layout_marginStart="20dp"
-            android:layout_marginBottom="20dp"
-            app:layout_constraintBottom_toBottomOf="parent"
-            app:layout_constraintStart_toStartOf="parent">
-
-            <ImageButton
-                android:id="@+id/btn_up"
-                android:layout_width="50dp"
-                android:layout_height="50dp"
+            <ImageView
+                android:id="@+id/btnUp"
+                android:layout_width="60dp"
+                android:layout_height="60dp"
+                android:layout_centerHorizontal="true"
+                android:layout_alignParentTop="true"
                 android:src="@drawable/button_up"
-                android:background="@android:color/transparent"
-                android:scaleType="fitCenter"
-                app:layout_constraintTop_toTopOf="parent"
-                app:layout_constraintStart_toStartOf="parent"
-                app:layout_constraintEnd_toEndOf="parent" />
+                android:contentDescription="Up"
+                android:clickable="true"
+                android:focusable="true" />
 
-            <ImageButton
-                android:id="@+id/btn_down"
-                android:layout_width="50dp"
-                android:layout_height="50dp"
+            <ImageView
+                android:id="@+id/btnDown"
+                android:layout_width="60dp"
+                android:layout_height="60dp"
+                android:layout_centerHorizontal="true"
+                android:layout_alignParentBottom="true"
                 android:src="@drawable/button_down"
-                android:background="@android:color/transparent"
-                android:scaleType="fitCenter"
-                app:layout_constraintBottom_toBottomOf="parent"
-                app:layout_constraintStart_toStartOf="parent"
-                app:layout_constraintEnd_toEndOf="parent" />
+                android:contentDescription="Down"
+                android:clickable="true"
+                android:focusable="true" />
 
-            <ImageButton
-                android:id="@+id/btn_left"
-                android:layout_width="50dp"
-                android:layout_height="50dp"
+            <ImageView
+                android:id="@+id/btnLeft"
+                android:layout_width="60dp"
+                android:layout_height="60dp"
+                android:layout_alignParentLeft="true"
+                android:layout_centerVertical="true"
                 android:src="@drawable/button_left"
-                android:background="@android:color/transparent"
-                android:scaleType="fitCenter"
-                app:layout_constraintStart_toStartOf="parent"
-                app:layout_constraintTop_toTopOf="parent"
-                app:layout_constraintBottom_toBottomOf="parent" />
+                android:contentDescription="Left"
+                android:clickable="true"
+                android:focusable="true" />
 
-            <ImageButton
-                android:id="@+id/btn_right"
-                android:layout_width="50dp"
-                android:layout_height="50dp"
+            <ImageView
+                android:id="@+id/btnRight"
+                android:layout_width="60dp"
+                android:layout_height="60dp"
+                android:layout_alignParentRight="true"
+                android:layout_centerVertical="true"
                 android:src="@drawable/button_right"
-                android:background="@android:color/transparent"
-                android:scaleType="fitCenter"
-                app:layout_constraintEnd_toEndOf="parent"
-                app:layout_constraintTop_toTopOf="parent"
-                app:layout_constraintBottom_toBottomOf="parent" />
-        </androidx.constraintlayout.widget.ConstraintLayout>
+                android:contentDescription="Right"
+                android:clickable="true"
+                android:focusable="true" />
+        </RelativeLayout>
 
-        <ImageButton
-            android:id="@+id/btn_a"
-            android:layout_width="70dp"
-            android:layout_height="70dp"
-            android:layout_marginEnd="30dp"
-            android:layout_marginBottom="80dp"
-            android:src="@drawable/button_a"
-            android:background="@android:color/transparent"
-            android:scaleType="fitCenter"
-            app:layout_constraintBottom_toBottomOf="parent"
-            app:layout_constraintEnd_toEndOf="parent" />
-
-        <ImageButton
-            android:id="@+id/btn_b"
-            android:layout_width="70dp"
-            android:layout_height="70dp"
-            android:layout_marginEnd="110dp"
-            android:layout_marginBottom="40dp"
-            android:src="@drawable/button_b"
-            android:background="@android:color/transparent"
-            android:scaleType="fitCenter"
-            app:layout_constraintBottom_toBottomOf="parent"
-            app:layout_constraintEnd_toEndOf="parent" />
-
+        <!-- Center Buttons -->
         <LinearLayout
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginBottom="24dp"
-            app:layout_constraintBottom_toBottomOf="parent"
-            app:layout_constraintLeft_toLeftOf="parent"
-            app:layout_constraintRight_toRightOf="parent">
-            <ImageButton android:id="@+id/btn_select" android:layout_width="60dp" android:layout_height="30dp" android:src="@drawable/button_select" android:background="@android:color/transparent" android:scaleType="fitCenter" android:layout_marginEnd="10dp"/>
-            <ImageButton android:id="@+id/btn_start" android:layout_width="60dp" android:layout_height="30dp" android:src="@drawable/button_start" android:background="@android:color/transparent" android:scaleType="fitCenter" />
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:gravity="center">
+
+            <ImageView
+                android:id="@+id/btnStart"
+                android:layout_width="80dp"
+                android:layout_height="30dp"
+                android:layout_marginBottom="8dp"
+                android:src="@drawable/button_start"
+                android:contentDescription="Start"
+                android:clickable="true"
+                android:focusable="true" />
+
+            <ImageView
+                android:id="@+id/btnSelect"
+                android:layout_width="80dp"
+                android:layout_height="30dp"
+                android:src="@drawable/button_select"
+                android:contentDescription="Select"
+                android:clickable="true"
+                android:focusable="true" />
+
+            <Button
+                android:id="@+id/btnLoadRom"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Load ROM"
+                android:textSize="10sp"
+                android:padding="4dp" />
         </LinearLayout>
 
-        <Button
-            android:id="@+id/btn_debug"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="DEBUG"
-            app:layout_constraintTop_toTopOf="parent"
-            app:layout_constraintRight_toRightOf="parent" />
+        <!-- Action Buttons -->
+        <RelativeLayout
+            android:layout_width="0dp"
+            android:layout_height="120dp"
+            android:layout_weight="1">
 
-    </androidx.constraintlayout.widget.ConstraintLayout>
-</FrameLayout>
+            <ImageView
+                android:id="@+id/btnB"
+                android:layout_width="70dp"
+                android:layout_height="70dp"
+                android:layout_centerVertical="true"
+                android:layout_alignParentLeft="true"
+                android:layout_marginLeft="10dp"
+                android:src="@drawable/button_b"
+                android:contentDescription="B"
+                android:clickable="true"
+                android:focusable="true" />
+
+            <ImageView
+                android:id="@+id/btnA"
+                android:layout_width="70dp"
+                android:layout_height="70dp"
+                android:layout_centerVertical="true"
+                android:layout_alignParentRight="true"
+                android:src="@drawable/button_a"
+                android:contentDescription="A"
+                android:clickable="true"
+                android:focusable="true" />
+        </RelativeLayout>
+
+    </LinearLayout>
+
+</androidx.constraintlayout.widget.ConstraintLayout>
