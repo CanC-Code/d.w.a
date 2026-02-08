@@ -2,11 +2,13 @@
 import os
 import re
 
-# Configuration
-SOURCE_DIR = "../source_files"
-OUTPUT_DIR = "../app/src/main/cpp/recompiled"
+# Configuration - Absolute Path Resolution for CI/CD
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# These paths now point correctly regardless of where the script is called from
+SOURCE_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "source_files"))
+OUTPUT_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "app", "src", "main", "cpp", "recompiled"))
 
-# 6502 Cycle Table (Base cycles per opcode)
+# 6502 Cycle Table (Required for timing-accurate yielding)
 CYCLE_TABLE = {
     'adc': 2, 'and': 2, 'asl': 2, 'bcc': 2, 'bcs': 2, 'beq': 2, 'bit': 3, 'bmi': 2, 'bne': 2, 'bpl': 2,
     'brk': 7, 'bvc': 2, 'bvs': 2, 'clc': 2, 'cld': 2, 'cli': 2, 'clv': 2, 'cmp': 2, 'cpx': 2, 'cpy': 2,
@@ -36,6 +38,7 @@ class Recompiler:
         self.anonymous_labels = []
 
     def first_pass(self, lines, start_pc):
+        """Pass 1: Map all labels and +/- targets to memory addresses."""
         current_pc = start_pc
         self.symbols = {}
         self.anonymous_labels = []
@@ -77,20 +80,25 @@ class Recompiler:
         target = self.resolve(raw_symbol, pc)
         prefix = f"cycles_to_run -= {cycles}; "
 
-        # Helper for addressing modes
+        # Complex Addressing (X, Y, Indirect)
         is_imm = operand.startswith('#')
-        is_zpx = ",X" in operand.upper() and size == 2
-        is_absx = ",X" in operand.upper() and size == 3
-        is_absy = ",Y" in operand.upper()
+        is_ind_y = "),Y" in operand.upper()
+        is_ind_x = ",X)" in operand.upper()
+        is_abs_x = ",X" in operand.upper() and not is_ind_x
+        is_abs_y = ",Y" in operand.upper() and not is_ind_y
 
-        # Branching
+        if is_ind_y: target = f"read_pointer_indexed_y({target}, nullptr)"
+        elif is_ind_x: target = f"read_pointer_indexed_x({target})"
+        elif is_abs_x: target = f"addr_abs_x({target}, nullptr)"
+        elif is_abs_y: target = f"addr_abs_y({target}, nullptr)"
+
+        # Branching (with Logic for Yielding)
         if opcode in ['beq', 'bne', 'bcs', 'bcc', 'bmi', 'bpl', 'bvs', 'bvc']:
-            conds = {'beq':'FLAG_Z','bne':'!(reg_P & FLAG_Z)','bcs':'FLAG_C','bcc':'!(reg_P & FLAG_C)','bmi':'FLAG_N','bpl':'!(reg_P & FLAG_N)'}
-            c = f"reg_P & {conds[opcode]}" if '!' not in conds[opcode] else conds[opcode]
+            conds = {'beq':'reg_P & FLAG_Z','bne':'!(reg_P & FLAG_Z)','bcs':'reg_P & FLAG_C','bcc':'!(reg_P & FLAG_C)','bmi':'reg_P & FLAG_N','bpl':'!(reg_P & FLAG_N)'}
             y = "if (cycles_to_run <= 0) return; " if int(target, 16) < pc else ""
-            return f"{prefix}{y}if ({c}) {{ reg_PC = {target}; return; }}", size
+            return f"{prefix}{y}if ({conds[opcode]}) {{ reg_PC = {target}; return; }}", size
 
-        # Expanded Opcode Dictionary
+        # Core Instruction Set
         ops = {
             'lda': f"reg_A = {'(uint8_t)'+target if is_imm else 'bus_read('+target+')'}; update_nz(reg_A);",
             'ldx': f"reg_X = {'(uint8_t)'+target if is_imm else 'bus_read('+target+')'}; update_nz(reg_X);",
@@ -101,22 +109,29 @@ class Recompiler:
             'cmp': f"update_flags_cmp(reg_A, {'(uint8_t)'+target if is_imm else 'bus_read('+target+')'});",
             'cpx': f"update_flags_cmp(reg_X, {'(uint8_t)'+target if is_imm else 'bus_read('+target+')'});",
             'cpy': f"update_flags_cmp(reg_Y, {'(uint8_t)'+target if is_imm else 'bus_read('+target+')'});",
+            'adc': f"cpu_adc({'(uint8_t)'+target if is_imm else 'bus_read('+target+')'});",
+            'sbc': f"cpu_sbc({'(uint8_t)'+target if is_imm else 'bus_read('+target+')'});",
             'bit': f"cpu_bit(bus_read({target}));",
             'inc': f"{{ uint16_t a = {target}; uint8_t v = bus_read(a)+1; bus_write(a,v); update_nz(v); }}",
             'dec': f"{{ uint16_t a = {target}; uint8_t v = bus_read(a)-1; bus_write(a,v); update_nz(v); }}",
+            'asl': f"reg_A = cpu_asl(reg_A);" if not operand or operand.upper()=='A' else f"{{ uint16_t a = {target}; bus_write(a, cpu_asl(bus_read(a))); }}",
+            'lsr': f"reg_A = cpu_lsr(reg_A);" if not operand or operand.upper()=='A' else f"{{ uint16_t a = {target}; bus_write(a, cpu_lsr(bus_read(a))); }}",
+            'rol': f"reg_A = cpu_rol(reg_A);" if not operand or operand.upper()=='A' else f"{{ uint16_t a = {target}; bus_write(a, cpu_rol(bus_read(a))); }}",
+            'ror': f"reg_A = cpu_ror(reg_A);" if not operand or operand.upper()=='A' else f"{{ uint16_t a = {target}; bus_write(a, cpu_ror(bus_read(a))); }}",
             'jsr': f"{{ uint16_t ret = reg_PC + 2; cpu_push(ret >> 8); cpu_push(ret & 0xFF); reg_PC = {target}; return; }}",
             'jmp': f"reg_PC = {target}; return;",
             'rts': f"reg_PC = (cpu_pop() | (cpu_pop() << 8)) + 1; return;",
-            'sei': "reg_P |= FLAG_I;", 'cli': "reg_P &= ~FLAG_I;",
-            'sec': "reg_P |= FLAG_C;", 'clc': "reg_P &= ~FLAG_C;",
+            'rti': f"reg_P = cpu_pop(); reg_PC = (cpu_pop() | (cpu_pop() << 8)); return;",
             'tax': "reg_X = reg_A; update_nz(reg_X);", 'txa': "reg_A = reg_X; update_nz(reg_A);",
             'tay': "reg_Y = reg_A; update_nz(reg_Y);", 'tya': "reg_A = reg_Y; update_nz(reg_A);",
-            'pha': "cpu_push(reg_A);", 'pla': "reg_A = cpu_pop(); update_nz(reg_A);"
+            'pha': "cpu_push(reg_A);", 'pla': "reg_A = cpu_pop(); update_nz(reg_A);",
+            'ora': f"reg_A |= {'(uint8_t)'+target if is_imm else 'bus_read('+target+')'}; update_nz(reg_A);",
+            'and': f"reg_A &= {'(uint8_t)'+target if is_imm else 'bus_read('+target+')'}; update_nz(reg_A);",
+            'eor': f"reg_A ^= {'(uint8_t)'+target if is_imm else 'bus_read('+target+')'}; update_nz(reg_A);",
+            'sei': "reg_P |= FLAG_I;", 'cli': "reg_P &= ~FLAG_I;",
+            'sec': "reg_P |= FLAG_C;", 'clc': "reg_P &= ~FLAG_C;",
+            'nop': "// NOP"
         }
-        
-        # Handle indexed addressing modifiers in target
-        if is_absx: target = f"addr_abs_x({target}, nullptr)"
-        if is_absy: target = f"addr_abs_y({target}, nullptr)"
 
         res = ops.get(opcode, f"// Unsupported {opcode}")
         return f"{prefix}{res}", size
@@ -125,7 +140,6 @@ class Recompiler:
         bank_name = os.path.splitext(filename)[0].replace("-", "_")
         start_pc = 0xC000 if "Bank03" in bank_name else 0x8000
         path = os.path.join(SOURCE_DIR, filename)
-        if not os.path.exists(path): return
         
         with open(path, 'r', errors='ignore') as f: lines = f.readlines()
         self.first_pass(lines, start_pc)
@@ -139,14 +153,17 @@ class Recompiler:
                 if not clean: continue
                 org_match = re.match(r'^\.org\s+\$?([0-9A-Fa-f]+)', clean)
                 if org_match: current_pc = int(org_match.group(1), 16); continue
+                
                 match = re.match(r'^(?:(\+|-|[\w\d_]+):)?\s*(\.?\w+)?\s*(.*)$', clean)
                 label, opcode, operand = match.groups()
+                
                 if opcode and opcode.lower() in CYCLE_TABLE:
                     code, size = self.translate(opcode, operand, current_pc)
                     out.write(f'        case 0x{current_pc:04X}: {code}')
                     if 'return' not in code: out.write(f' reg_PC += {size}; return;')
                     out.write(f' // {clean}\n')
                     current_pc += size
+            
             if "Bank03" in bank_name:
                 out.write("        case 0xFFFA: reg_PC = cpu_read_pointer(0xFFFA); return;\n")
                 out.write("        case 0xFFFC: reg_PC = cpu_read_pointer(0xFFFC); return;\n")
@@ -154,9 +171,12 @@ class Recompiler:
             out.write('        default: reg_PC++; return;\n    }\n}\n}\n')
 
 if __name__ == "__main__":
+    if not os.path.exists(SOURCE_DIR):
+        print(f"Error: Source directory {SOURCE_DIR} not found.")
+        exit(1)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     rec = Recompiler()
     for f in os.listdir(SOURCE_DIR):
         if f.endswith(".asm") and "Defines" not in f:
-            print(f"Converting {f}...")
+            print(f"Recompiling {f}...")
             rec.convert(f)
