@@ -33,7 +33,6 @@ extern "C" {
     uint8_t joypad_state = 0; 
 }
 
-// Hardware Components
 uint8_t cpu_ram[0x0800] = {0};
 MapperMMC1 mapper;
 PPU ppu;
@@ -59,8 +58,6 @@ bool is_paused = false;
 // ============================================================================
 
 extern "C" {
-    // Note: NZ updates, CMP flags, and addressing helpers moved to cpu_shared.cpp
-
     void cpu_push(uint8_t v) { cpu_ram[0x0100 | (reg_S--)] = v; }
     uint8_t cpu_pop() { return cpu_ram[0x0100 | (++reg_S)]; }
 
@@ -83,9 +80,7 @@ extern "C" {
             add_cycles(513);
         }
         else if (a == 0x4016) {
-            if (!(v & 0x01)) {
-                controller_latch = joypad_state;
-            }
+            if (v & 0x01) controller_latch = joypad_state;
         }
         else if (a >= 0x6000) mapper.write(a, v);
     }
@@ -93,31 +88,18 @@ extern "C" {
     void nmi_handler() {
         cpu_push(reg_PC >> 8); 
         cpu_push(reg_PC & 0xFF); 
-        cpu_push(reg_P);
+        cpu_push(reg_P & ~0x10); // Clear Break flag on push
         reg_P |= FLAG_I;
         reg_PC = cpu_read_pointer(0xFFFA);
         add_cycles(7);
     }
 
-    void irq_handler() {
-        if (!(reg_P & FLAG_I)) {
-            cpu_push(reg_PC >> 8); 
-            cpu_push(reg_PC & 0xFF); 
-            cpu_push(reg_P);
-            reg_P |= FLAG_I;
-            reg_PC = cpu_read_pointer(0xFFFE);
-            add_cycles(7);
-        }
-    }
-
     void execute_instruction() {
-        // Priority: NMI > IRQ
+        // Priority check for NMI before every block of execution
         if (ppu.check_nmi()) { 
             nmi_handler(); 
-        } else if (irq_pending) {
-            irq_handler();
-            irq_pending = false;
-        }
+        } 
+        // We call the Dispatcher to execute a block of recompiled code
         Dispatcher::execute();
     }
 }
@@ -131,7 +113,9 @@ void engine_loop() {
     ppu.reset();
     mapper.reset();
 
+    // Initial PC from Reset Vector
     reg_PC = cpu_read_pointer(0xFFFC); 
+    LOGI("Engine: Starting at PC $%04X", reg_PC);
 
     while (is_running) {
         if (is_paused) { 
@@ -140,22 +124,30 @@ void engine_loop() {
         }
 
         auto frame_start = std::chrono::steady_clock::now();
-        cycles_to_run += 29780; 
 
+        // --- STEP 1: VBLANK PERIOD START ---
+        // We set the VBlank bit and trigger NMI *at the start* of the frame
+        // so the recompiled code sees it immediately.
+        ppu.status |= 0x80; 
+        if (ppu.ctrl & 0x80) nmi_pending = true;
+
+        // --- STEP 2: CPU EXECUTION ---
+        cycles_to_run += 29780; // Standard NTSC frame cycles
         while (cycles_to_run > 0 && is_running) {
             execute_instruction();
         }
 
+        // --- STEP 3: RENDERING ---
         {
             std::lock_guard<std::mutex> lock(buffer_mutex);
             ppu.render_frame(mapper, nes_palette);
         }
 
-        ppu.status |= 0x80; 
-        if (ppu.ctrl & 0x80) ppu.nmi_pending = true;
-
-        std::this_thread::sleep_until(frame_start + std::chrono::microseconds(16666));
+        // --- STEP 4: VBLANK PERIOD END ---
         ppu.clear_status(); 
+
+        // Frame rate limiter (~60 FPS)
+        std::this_thread::sleep_until(frame_start + std::chrono::microseconds(16666));
     }
 }
 
@@ -172,14 +164,26 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstri
     uint8_t header[16]; 
     file.read((char*)header, 16);
 
-    // Basic iNES extraction
-    for (int i=0; i < header[4] && i < 4; i++) {
+    if (memcmp(header, "NES\x1A", 4) != 0) return env->NewStringUTF("Error: Invalid iNES header");
+
+    uint8_t prg_banks = header[4];
+    uint8_t chr_banks = header[5];
+    bool has_trainer = (header[6] & 0x04);
+
+    if (has_trainer) file.seekg(512, std::ios::cur);
+
+    // MMC1 Dragon Warrior usually has 4 PRG banks (64KB)
+    for (int i = 0; i < prg_banks && i < 4; i++) {
         file.read((char*)mapper.prg_rom[i], 16384);
     }
-    file.read((char*)mapper.chr_rom, 8192);
+
+    if (chr_banks > 0) {
+        file.read((char*)mapper.chr_rom, 8192);
+    }
 
     file.close();
     env->ReleaseStringUTFChars(romPath, path);
+    LOGI("ROM Loaded: PRG Banks=%d, CHR Banks=%d", prg_banks, chr_banks);
     return env->NewStringUTF("Success");
 }
 
@@ -198,6 +202,7 @@ Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv* env, jobject thiz, jo
     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
     {
         std::lock_guard<std::mutex> lock(buffer_mutex);
+        // Ensure we don't overflow the bitmap
         memcpy(pixels, ppu.screen_buffer, 256 * 240 * 4);
     }
     AndroidBitmap_unlockPixels(env, bitmap);
