@@ -6,10 +6,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Source files
-# Added MapperMMC1.cpp to resolve "undefined symbol" linker errors
+# Added PPU.cpp and cpu_shared.cpp to resolve the latest linker errors
 set(DWA_SOURCES
     native-lib.cpp
     MapperMMC1.cpp
+    PPU.cpp                         # Handles rendering and PPU registers
+    recompiled/cpu_shared.cpp       # Provides ADC, SBC, ASL, etc. for the banks
     recompiled/Dispatcher.cpp
     recompiled/Bank00.cpp
     recompiled/Bank01.cpp
