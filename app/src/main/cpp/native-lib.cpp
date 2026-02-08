@@ -1,209 +1,286 @@
 #include <jni.h>
-#include <string>
-#include <fstream>
-#include <android/log.h>
 #include <android/bitmap.h>
-#include <thread>
-#include <chrono>
-#include <mutex>
+#include <android/log.h>
 #include <cstring>
+#include <cstdint>
 #include <atomic>
-#include <vector>
+#include <mutex>
 
-#include "MapperMMC1.h"
-#include "PPU.h"
-#include "Controller.h" 
-#include "recompiled/cpu_shared.h"
-
-#define LOG_TAG "DWA_NATIVE"
+#define LOG_TAG "DWA_Native"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-namespace Dispatcher {
-    void execute();
+// External declarations
+extern void ppu_init();
+extern void ppu_reset();
+extern void ppu_render_frame(uint32_t* pixels);
+extern void ppu_step();
+extern uint8_t ppu_read_register(uint16_t addr);
+extern void ppu_write_register(uint16_t addr, uint8_t value);
+
+extern void mapper_init(uint8_t* prg_rom, size_t prg_size, uint8_t* chr_rom, size_t chr_size);
+extern void mapper_reset();
+extern uint8_t mapper_read(uint16_t addr);
+extern void mapper_write(uint16_t addr, uint8_t value);
+
+extern void controller_set_button(uint8_t button, bool pressed);
+extern uint8_t controller_read();
+extern void controller_write(uint8_t value);
+
+namespace recompiled {
+    extern void execute_at(uint16_t pc);
 }
 
-// ============================================================================
-// GLOBAL EMULATION STATE
-// ============================================================================
+// CPU State - shared with recompiled code
+uint8_t reg_A = 0;
+uint8_t reg_X = 0;
+uint8_t reg_Y = 0;
+uint8_t reg_P = 0x24;  // IRQ disabled on startup
+uint8_t reg_SP = 0xFD;
+uint16_t reg_PC = 0;
+int cycles_to_run = 0;
+
+// RAM
+static uint8_t ram[0x800];
+static uint8_t sram[0x2000];  // Battery-backed save RAM
+
+// ROM storage
+static uint8_t* prg_rom = nullptr;
+static uint8_t* chr_rom = nullptr;
+static size_t prg_size = 0;
+static size_t chr_size = 0;
+
+// Emulation state
+static std::atomic<bool> emulator_running{false};
+static std::mutex emu_mutex;
+static bool rom_loaded = false;
+
+// Frame buffer (256x240 NES resolution)
+static uint32_t frame_buffer[256 * 240];
+
+// CPU Bus Read
+uint8_t bus_read(uint16_t addr) {
+    if (addr < 0x2000) {
+        return ram[addr & 0x7FF];  // RAM mirrored
+    } else if (addr < 0x4000) {
+        return ppu_read_register(0x2000 | (addr & 0x7));  // PPU registers mirrored
+    } else if (addr == 0x4016) {
+        return controller_read();
+    } else if (addr >= 0x6000 && addr < 0x8000) {
+        return sram[addr - 0x6000];  // SRAM
+    } else if (addr >= 0x8000) {
+        return mapper_read(addr);  // ROM through mapper
+    }
+    return 0;
+}
+
+// CPU Bus Write
+void bus_write(uint16_t addr, uint8_t value) {
+    if (addr < 0x2000) {
+        ram[addr & 0x7FF] = value;
+    } else if (addr < 0x4000) {
+        ppu_write_register(0x2000 | (addr & 0x7), value);
+    } else if (addr == 0x4014) {
+        // OAM DMA
+        uint16_t dma_addr = value << 8;
+        for (int i = 0; i < 256; i++) {
+            uint8_t byte = bus_read(dma_addr + i);
+            ppu_write_register(0x2004, byte);
+        }
+        cycles_to_run -= 513;  // DMA takes 513 cycles
+    } else if (addr == 0x4016) {
+        controller_write(value);
+    } else if (addr >= 0x6000 && addr < 0x8000) {
+        sram[addr - 0x6000] = value;
+    } else if (addr >= 0x8000) {
+        mapper_write(addr, value);
+    }
+}
+
+// CPU Helper functions (used by recompiled code)
 extern "C" {
-    uint16_t reg_PC = 0;
-    uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
-    int64_t total_cycles = 0;
-    int32_t cycles_to_run = 0;
-    ATOMIC_BOOL is_running{false}; 
-    bool nmi_pending = false;
-    bool irq_pending = false;
-}
-
-uint8_t cpu_ram[0x0800] = {0};
-MapperMMC1 mapper;
-PPU ppu;
-Controller joypad1; 
-std::atomic<uint8_t> input_mask{0}; // Thread-safe mask for JNI -> Controller
-
-const uint32_t nes_palette[64] = {
-    0xFF757575, 0xFF8F1B27, 0xFFAB0000, 0xFF9F0047, 0xFF77008F, 0xFF1300AB, 0xFF0000A7, 0xFF000B7F,
-    0xFF002F43, 0xFF004700, 0xFF004700, 0xFF003B0B, 0xFF472F00, 0xFF000000, 0xFF000000, 0xFF000000,
-    0xFFBCBCBC, 0xFF0073EF, 0xFF233BEF, 0xFF8300F3, 0xFFBF00BF, 0xFFE7005B, 0xFFDB2B00, 0xFFCB4F0F,
-    0xFF8B7300, 0xFF009700, 0xFF00AB00, 0xFF00933B, 0xFF00838B, 0xFF000000, 0xFF000000, 0xFF000000,
-    0xFFFFFFFF, 0xFF3FBFFF, 0xFF5F97FF, 0xFFA78BFD, 0xFFF77BFF, 0xFFFF77B7, 0xFFFF7763, 0xFFFF9B3B,
-    0xFFF3BF3F, 0xFF83D313, 0xFF4FDF4B, 0xFF58F898, 0xFF00EBDB, 0xFF000000, 0xFF000000, 0xFF000000,
-    0xFFFFFFFF, 0xFFABE7FF, 0xFFC7D7FF, 0xFFD7CBFF, 0xFFFFC7FF, 0xFFFFC7DB, 0xFFFFBFB3, 0xFFFFD7AB,
-    0xFFFFE7A3, 0xFFE3FFA3, 0xFFABF3BF, 0xFFB3FFCF, 0xFF9FFFF3, 0xFF000000, 0xFF000000, 0xFF000000
-};
-
-std::mutex buffer_mutex;
-std::mutex engine_mutex;
-std::atomic<bool> is_paused{false};
-
-// ============================================================================
-// CORE BUS
-// ============================================================================
-extern "C" {
-    void cpu_push(uint8_t v) { cpu_ram[0x0100 | (reg_S--)] = v; }
-    uint8_t cpu_pop() { return cpu_ram[0x0100 | (++reg_S)]; }
-
-    uint8_t bus_read(uint16_t a) {
-        if (a < 0x2000) return cpu_ram[a & 0x07FF];
-        if (a < 0x4000) return ppu.cpu_read(0x2000 | (a & 0x0007), mapper);
-        if (a == 0x4016) return joypad1.read_serial();
-        if (a >= 0x4020) return mapper.read_prg(a);
-        return 0;
+    void cpu_push(uint8_t value) {
+        bus_write(0x100 | reg_SP, value);
+        reg_SP--;
     }
 
-    void bus_write(uint16_t a, uint8_t v) {
-        if (a < 0x2000) {
-            cpu_ram[a & 0x07FF] = v;
-        } else if (a < 0x4000) {
-            ppu.cpu_write(0x2000 | (a & 0x0007), v, mapper);
-        } else if (a == 0x4014) { 
-            if (v < 0x08) ppu.do_dma(&cpu_ram[v << 8]); 
-            cycles_to_run -= 513; 
-        } else if (a == 0x4016) { 
-            joypad1.write_latch(v);
-        } else if (a >= 0x6000) {
-            mapper.write(a, v);
-        }
+    uint8_t cpu_pop() {
+        reg_SP++;
+        return bus_read(0x100 | reg_SP);
     }
 
-    void nmi_handler() {
-        cpu_push(reg_PC >> 8); 
-        cpu_push(reg_PC & 0xFF); 
-        cpu_push(reg_P | 0x20); 
-        reg_P |= FLAG_I;
-        reg_PC = cpu_read_pointer(0xFFFA);
-        cycles_to_run -= 7;
+    uint16_t cpu_read_pointer(uint16_t addr) {
+        uint8_t lo = bus_read(addr);
+        uint8_t hi = bus_read(addr + 1);
+        return lo | (hi << 8);
     }
 
-    void execute_instruction() {
-        if (nmi_pending) { nmi_pending = false; nmi_handler(); } 
-        Dispatcher::execute();
+    void update_nz(uint8_t value) {
+        if (value == 0) reg_P |= 0x02;   // Zero flag
+        else reg_P &= ~0x02;
+        if (value & 0x80) reg_P |= 0x80; // Negative flag
+        else reg_P &= ~0x80;
     }
 }
 
-// ============================================================================
-// ENGINE
-// ============================================================================
-void engine_loop() {
-    std::lock_guard<std::mutex> lock(engine_mutex);
-    ppu.reset();
-    mapper.reset();
+// Reset CPU to power-on state
+static void cpu_reset() {
+    reg_A = 0;
+    reg_X = 0;
+    reg_Y = 0;
+    reg_P = 0x24;  // IRQ disabled
+    reg_SP = 0xFD;
+    
+    // Read reset vector from $FFFC
+    reg_PC = cpu_read_pointer(0xFFFC);
+    LOGI("CPU Reset: PC set to $%04X", reg_PC);
+    
+    cycles_to_run = 0;
+    memset(ram, 0, sizeof(ram));
+}
 
-    reg_PC = cpu_read_pointer(0xFFFC); 
-    if (reg_PC == 0x0000 || reg_PC == 0xFFFF) {
-        LOGE("FATAL: Reset Vector is invalid ($%04X). ROM load failed.", reg_PC);
-        is_running = false;
-        return;
-    }
-    LOGI("Engine: Booting at $%04X", reg_PC);
-
-    while (is_running) {
-        if (is_paused) { std::this_thread::sleep_for(std::chrono::milliseconds(16)); continue; }
-        auto frame_start = std::chrono::steady_clock::now();
-
-        ppu.status |= 0x80; 
-        if (ppu.ctrl & 0x80) nmi_pending = true;
-
-        cycles_to_run += 29780; 
-        while (cycles_to_run > 0 && is_running) {
-            execute_instruction();
-            // Sync the atomic input to the controller inside the CPU loop
-            joypad1.update_state(input_mask.load(std::memory_order_relaxed));
+// Execute CPU for one frame (29780 cycles @ 1.79 MHz)
+static void cpu_run_frame() {
+    cycles_to_run = 29780;
+    
+    while (cycles_to_run > 0) {
+        recompiled::execute_at(reg_PC);
+        
+        // Step PPU (3 PPU cycles per CPU cycle)
+        for (int i = 0; i < 3; i++) {
+            ppu_step();
         }
-
-        {
-            std::lock_guard<std::mutex> lock(buffer_mutex);
-            ppu.render_frame(mapper, nes_palette);
-        }
-
-        ppu.status &= ~0x80; 
-        std::this_thread::sleep_until(frame_start + std::chrono::microseconds(16666));
     }
 }
 
-// ============================================================================
-// JNI
-// ============================================================================
-extern "C" JNIEXPORT jstring JNICALL
-Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstring romPath, jstring outDir) {
-    const char *path = env->GetStringUTFChars(romPath, nullptr);
-    std::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) {
-        env->ReleaseStringUTFChars(romPath, path);
-        return env->NewStringUTF("Error: ROM not found");
+// JNI: Load ROM
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_canc_dwa_MainActivity_loadROM(JNIEnv* env, jobject, jbyteArray rom_data) {
+    std::lock_guard<std::mutex> lock(emu_mutex);
+    
+    LOGI("Loading ROM...");
+    
+    jsize rom_length = env->GetArrayLength(rom_data);
+    if (rom_length < 16) {
+        LOGE("ROM too small");
+        return JNI_FALSE;
     }
-
-    uint8_t header[16]; 
-    file.read((char*)header, 16);
-    if (memcmp(header, "NES\x1A", 4) != 0) {
-        env->ReleaseStringUTFChars(romPath, path);
-        return env->NewStringUTF("Error: Invalid iNES Header");
+    
+    uint8_t* rom_bytes = (uint8_t*)env->GetByteArrayElements(rom_data, nullptr);
+    
+    // Verify iNES header
+    if (rom_bytes[0] != 'N' || rom_bytes[1] != 'E' || rom_bytes[2] != 'S' || rom_bytes[3] != 0x1A) {
+        LOGE("Invalid NES header");
+        env->ReleaseByteArrayElements(rom_data, (jbyte*)rom_bytes, JNI_ABORT);
+        return JNI_FALSE;
     }
-
-    uint8_t prg_banks = header[4]; // Each bank is 16KB
-    uint8_t chr_banks = header[5]; // Each bank is 8KB
-
-    // Load ALL PRG banks sequentially into the mapper
-    for (int i = 0; i < prg_banks && i < 4; i++) {
-        file.read((char*)mapper.prg_rom[i], 16384);
+    
+    // Parse header
+    uint8_t prg_banks = rom_bytes[4];  // 16KB banks
+    uint8_t chr_banks = rom_bytes[5];  // 8KB banks
+    uint8_t mapper_num = (rom_bytes[6] >> 4) | (rom_bytes[7] & 0xF0);
+    
+    LOGI("PRG Banks: %d, CHR Banks: %d, Mapper: %d", prg_banks, chr_banks, mapper_num);
+    
+    if (mapper_num != 1) {
+        LOGE("Only MMC1 (mapper 1) is supported, got mapper %d", mapper_num);
+        env->ReleaseByteArrayElements(rom_data, (jbyte*)rom_bytes, JNI_ABORT);
+        return JNI_FALSE;
     }
-
-    // Load CHR banks
+    
+    // Allocate and copy PRG-ROM
+    prg_size = prg_banks * 16384;
+    if (prg_rom) delete[] prg_rom;
+    prg_rom = new uint8_t[prg_size];
+    memcpy(prg_rom, rom_bytes + 16, prg_size);
+    
+    // Allocate and copy CHR-ROM (or RAM if chr_banks == 0)
+    chr_size = chr_banks > 0 ? chr_banks * 8192 : 8192;
+    if (chr_rom) delete[] chr_rom;
+    chr_rom = new uint8_t[chr_size];
     if (chr_banks > 0) {
-        file.read((char*)mapper.chr_rom[0], 4096);
-        file.read((char*)mapper.chr_rom[1], 4096);
+        memcpy(chr_rom, rom_bytes + 16 + prg_size, chr_size);
+    } else {
+        memset(chr_rom, 0, chr_size);  // CHR-RAM
     }
-
-    file.close();
-    env->ReleaseStringUTFChars(romPath, path);
-    LOGI("ROM Loaded: %d PRG banks. Reset Vector: $%04X", prg_banks, cpu_read_pointer(0xFFFC));
-    return env->NewStringUTF("Success");
+    
+    env->ReleaseByteArrayElements(rom_data, (jbyte*)rom_bytes, JNI_ABORT);
+    
+    // Initialize subsystems
+    ppu_init();
+    mapper_init(prg_rom, prg_size, chr_rom, chr_size);
+    
+    // Reset to power-on state
+    ppu_reset();
+    mapper_reset();
+    cpu_reset();
+    
+    rom_loaded = true;
+    emulator_running = true;
+    
+    LOGI("ROM loaded successfully!");
+    return JNI_TRUE;
 }
 
+// JNI: Run one frame
 extern "C" JNIEXPORT void JNICALL
-Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv* e, jobject t, jstring d) {
-    if (is_running) { is_running = false; std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
-    is_running = true;
-    std::thread(engine_loop).detach();
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv* env, jobject thiz, jobject bitmap) {
-    AndroidBitmapInfo info; void* pixels;
-    if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) return;
-    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
-    {
-        std::lock_guard<std::mutex> lock(buffer_mutex);
-        memcpy(pixels, ppu.screen_buffer, 256 * 240 * 4);
+Java_com_canc_dwa_MainActivity_runFrame(JNIEnv* env, jobject, jobject bitmap) {
+    if (!rom_loaded || !emulator_running) return;
+    
+    std::lock_guard<std::mutex> lock(emu_mutex);
+    
+    // Clear frame buffer
+    memset(frame_buffer, 0, sizeof(frame_buffer));
+    
+    // Run CPU for one frame
+    cpu_run_frame();
+    
+    // Render PPU output to frame buffer
+    ppu_render_frame(frame_buffer);
+    
+    // Copy frame buffer to Android bitmap
+    AndroidBitmapInfo info;
+    void* pixels;
+    if (AndroidBitmap_getInfo(env, bitmap, &info) == ANDROID_BITMAP_RESULT_SUCCESS) {
+        if (AndroidBitmap_lockPixels(env, bitmap, &pixels) == ANDROID_BITMAP_RESULT_SUCCESS) {
+            // Scale 256x240 to bitmap size (should be 256x240 or larger)
+            if (info.width == 256 && info.height == 240) {
+                memcpy(pixels, frame_buffer, sizeof(frame_buffer));
+            } else {
+                // Simple nearest-neighbor scaling if needed
+                uint32_t* dest = (uint32_t*)pixels;
+                for (uint32_t y = 0; y < info.height; y++) {
+                    for (uint32_t x = 0; x < info.width; x++) {
+                        uint32_t src_x = (x * 256) / info.width;
+                        uint32_t src_y = (y * 240) / info.height;
+                        dest[y * info.width + x] = frame_buffer[src_y * 256 + src_x];
+                    }
+                }
+            }
+            AndroidBitmap_unlockPixels(env, bitmap);
+        }
     }
-    AndroidBitmap_unlockPixels(env, bitmap);
 }
 
+// JNI: Input handling
 extern "C" JNIEXPORT void JNICALL
-Java_com_canc_dwa_MainActivity_injectInput(JNIEnv* e, jobject t, jint b, jboolean p) {
-    uint8_t mask = input_mask.load();
-    if (p) mask |= (uint8_t)b; 
-    else mask &= ~((uint8_t)b);
-    input_mask.store(mask);
+Java_com_canc_dwa_MainActivity_setButton(JNIEnv*, jobject, jint button, jboolean pressed) {
+    controller_set_button((uint8_t)button, pressed);
+}
+
+// JNI: Cleanup
+extern "C" JNIEXPORT void JNICALL
+Java_com_canc_dwa_MainActivity_cleanup(JNIEnv*, jobject) {
+    std::lock_guard<std::mutex> lock(emu_mutex);
+    emulator_running = false;
+    rom_loaded = false;
+    
+    if (prg_rom) {
+        delete[] prg_rom;
+        prg_rom = nullptr;
+    }
+    if (chr_rom) {
+        delete[] chr_rom;
+        chr_rom = nullptr;
+    }
 }
