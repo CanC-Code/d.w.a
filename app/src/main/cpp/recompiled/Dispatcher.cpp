@@ -7,7 +7,7 @@
 
 extern MapperMMC1 mapper;
 
-// Recompiled bank namespaces
+// Recompiled bank namespaces from Bank00.cpp, Bank01.cpp, etc.
 namespace Bank00 { void execute_at(uint16_t pc); }
 namespace Bank01 { void execute_at(uint16_t pc); }
 namespace Bank02 { void execute_at(uint16_t pc); }
@@ -33,51 +33,59 @@ namespace Dispatcher {
      */
     inline uint8_t get_active_bank(uint16_t pc) {
         uint8_t mode = (mapper.control >> 2) & 0x03;
-        uint8_t bank_reg = mapper.prg_bank & 0x0F; // DW uses 4-8 banks, mask to 4 for safety
+        uint8_t bank_reg = mapper.prg_bank & 0x0F; 
 
         if (pc >= 0xC000) {
             switch (mode) {
                 case 0: 
-                case 1: return (bank_reg & 0x0E) | 0x01; // High 16KB of 32KB chunk
-                case 2: return bank_reg;                // Swappable
-                case 3: default: return 0x03;           // Fixed to Bank 3
+                case 1: return (bank_reg & 0x0E) | 0x01; 
+                case 2: return bank_reg;                
+                case 3: default: return 0x03;           
             }
         } else if (pc >= 0x8000) {
             switch (mode) {
                 case 0: 
-                case 1: return (bank_reg & 0x0E);       // Low 16KB of 32KB chunk
-                case 2: return 0x00;                    // Fixed to Bank 0
-                case 3: default: return bank_reg;       // Swappable
+                case 1: return (bank_reg & 0x0E);       
+                case 2: return 0x00;                    
+                case 3: default: return bank_reg;       
             }
         }
-        return 0xFF; // Outside of PRG ROM
+        return 0xFF; // Outside of PRG ROM ($0000-$7FFF)
     }
 
     void execute() {
-        /**
-         * The loop continues as long as we have cycles and are in ROM.
-         * The yield logic in the recompiled asm_to_c.py ensures that
-         * tight loops (like waiting for Sprite 0 or VBlank) return here
-         * so the PPU can update.
-         */
+        // The loop continues as long as we have cycles remaining for this frame.
         while (cycles_to_run > 0) {
+            
+            // 1. Handle RAM Execution Fallback
             if (reg_PC < 0x8000) {
-                // Fallback for code running in RAM ($0000-$07FF)
-                // Dragon Warrior rarely does this, but it's vital for safety.
-                // We increment PC and burn a cycle to prevent infinite lock.
+                // If code is in RAM (usually $0000-$07FF or $6000-$7FFF),
+                // we don't have recompiled functions for it.
+                // We perform a dummy read/increment to prevent the emulator from hanging.
+                // In a full emulator, this would call a standard 6502 interpreter.
                 reg_PC++;
-                add_cycles(1); 
+                add_cycles(1);
                 continue;
             }
 
+            // 2. Determine which 16KB bank is mapped to current PC
             uint8_t target_bank = get_active_bank(reg_PC);
-            
-            // Dragon Warrior (iNES Mapper 1) is typically 64KB (4 banks)
-            // Mask to prevent out-of-bounds array access.
-            target_bank &= 0x03; 
 
-            // Jump into the recompiled C++ logic for that specific bank.
+            // 3. Safety Check: Dragon Warrior is 64KB (4 banks). 
+            // If the bank is 0xFF or out of bounds, reset PC to a known safe state.
+            if (target_bank >= 4) {
+                LOGE("Dispatcher Error: Invalid bank %d at PC $%04X", target_bank, reg_PC);
+                reg_PC = 0xC000; // Emergency jump to reset vector area
+                return;
+            }
+
+            // 4. Execute recompiled code
+            // The recompiled function will execute instructions until it hits
+            // a branch, jump, or return, then it will return here.
             bank_dispatch_table[target_bank](reg_PC);
+            
+            // 5. Atomic check for engine stop (prevents hang on exit)
+            if (!is_running) break;
         }
     }
 }
