@@ -1,350 +1,252 @@
 package com.canc.dwa;
 
-import android.annotation.SuppressLint;
-import android.content.Context;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+
+import android.Manifest;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
-import android.graphics.Canvas;
-import android.graphics.Paint;
-import android.graphics.Rect;
 import android.net.Uri;
-import android.os.Build;
 import android.os.Bundle;
-import android.os.VibrationEffect;
-import android.os.Vibrator;
-import android.view.Choreographer;
+import android.util.Log;
 import android.view.MotionEvent;
-import android.view.SurfaceHolder;
-import android.view.SurfaceView;
 import android.view.View;
-import android.view.WindowInsets;
-import android.view.WindowInsetsController;
+import android.widget.ImageView;
 import android.widget.Toast;
 
-import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
-import androidx.appcompat.app.AlertDialog;
-import androidx.appcompat.app.AppCompatActivity;
-
-import java.io.File;
-import java.io.FileOutputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 
-public class MainActivity extends AppCompatActivity implements SurfaceHolder.Callback, Choreographer.FrameCallback {
-
+public class MainActivity extends AppCompatActivity {
+    private static final String TAG = "DWA_Main";
+    private static final int REQUEST_CODE_PICK_ROM = 1;
+    private static final int REQUEST_CODE_PERMISSIONS = 2;
+    
+    // Native methods
+    private native boolean loadROM(byte[] romData);
+    private native void runFrame(Bitmap bitmap);
+    private native void setButton(int button, boolean pressed);
+    private native void cleanup();
+    
+    // Button constants (must match Controller.cpp)
+    private static final int BTN_A = 0x01;
+    private static final int BTN_B = 0x02;
+    private static final int BTN_SELECT = 0x04;
+    private static final int BTN_START = 0x08;
+    private static final int BTN_UP = 0x10;
+    private static final int BTN_DOWN = 0x20;
+    private static final int BTN_LEFT = 0x40;
+    private static final int BTN_RIGHT = 0x80;
+    
     static {
         System.loadLibrary("dwa");
     }
-
-    private static final int PICK_ROM_REQUEST = 1;
-    private static final String ROM_FILENAME = "base.nes";
-
-    // UI Components
-    private View setupContainer, gameContainer, debugOverlay;
-    private SurfaceView gameSurface;
-    private Bitmap screenBitmap;
-    private final Rect destRect = new Rect();
-    private final Paint bitmapPaint = new Paint(Paint.FILTER_BITMAP_FLAG);
-
-    // Engine State
-    private boolean isEngineRunning = false;
-    private boolean isSurfaceReady = false;
-    private boolean isDebugVisible = false;
-    private boolean isTurboEnabled = false;
-    private boolean isEditMode = false;
-
-    private Vibrator vibrator;
-
+    
+    private ImageView screenView;
+    private Bitmap frameBitmap;
+    private boolean isRunning = false;
+    private Thread emulatorThread;
+    
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
-
-        vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
-
-        setupContainer = findViewById(R.id.setup_layout);
-        gameContainer = findViewById(R.id.game_layout);
-        gameSurface = findViewById(R.id.game_surface);
-        debugOverlay = findViewById(R.id.debug_overlay_bg);
-
-        // Standard NES Resolution
-        screenBitmap = Bitmap.createBitmap(256, 240, Bitmap.Config.ARGB_8888);
-        if (gameSurface != null) gameSurface.getHolder().addCallback(this);
-
-        findViewById(R.id.btn_select_rom).setOnClickListener(v -> openFilePicker());
-        findViewById(R.id.btn_debug).setOnClickListener(v -> toggleDebugUI());
         
-        View turboBtn = findViewById(R.id.btn_turbo);
-        if (turboBtn != null) turboBtn.setOnClickListener(v -> toggleTurbo());
-
-        checkExistingRom();
-    }
-
-    private void checkExistingRom() {
-        File romFile = new File(getFilesDir(), ROM_FILENAME);
-        if (romFile.exists()) {
-            initializeGameSession(romFile.getAbsolutePath());
-        }
-    }
-
-    // ============================================================================
-    // MENU SYSTEM
-    // ============================================================================
-
-    @Override
-    public void onBackPressed() {
-        if (gameContainer.getVisibility() == View.VISIBLE) {
-            showGameMenu();
-        } else {
-            super.onBackPressed();
-        }
-    }
-
-    private void showGameMenu() {
-        String[] options = {
-            isEditMode ? "Lock Controller Layout" : "Move Controller Layout",
-            "Reset Game",
-            "ROM Management...",
-            "Close App"
-        };
-
-        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-            .setTitle("Main Menu")
-            .setItems(options, (dialog, which) -> {
-                switch (which) {
-                    case 0: isEditMode = !isEditMode; break;
-                    case 1: nativeInitEngine(getFilesDir().getAbsolutePath()); break;
-                    case 2: showRomSubmenu(); break;
-                    case 3: finish(); break;
-                }
-            })
-            .setNegativeButton("Resume", null)
-            .show();
-    }
-
-    private void showRomSubmenu() {
-        String[] options = {"Offload (Delete) Saved ROM", "Back"};
-        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-            .setTitle("ROM Management")
-            .setItems(options, (dialog, which) -> {
-                if (which == 0) confirmRomDeletion();
-            })
-            .show();
-    }
-
-    private void confirmRomDeletion() {
-        new AlertDialog.Builder(this)
-            .setTitle("Delete ROM?")
-            .setMessage("This will remove the local copy of the ROM and return you to the setup screen.")
-            .setPositiveButton("Delete", (dialog, which) -> deleteLocalRom())
-            .setNegativeButton("Cancel", null)
-            .show();
-    }
-
-    private void deleteLocalRom() {
-        File romFile = new File(getFilesDir(), ROM_FILENAME);
-        if (romFile.exists() && romFile.delete()) {
-            showToast("ROM Removed");
-            returnToSetup();
-        }
-    }
-
-    private void returnToSetup() {
-        isEngineRunning = false;
-        Choreographer.getInstance().removeFrameCallback(this);
-        runOnUiThread(() -> {
-            gameContainer.setVisibility(View.GONE);
-            setupContainer.setVisibility(View.VISIBLE);
+        screenView = findViewById(R.id.screenView);
+        frameBitmap = Bitmap.createBitmap(256, 240, Bitmap.Config.ARGB_8888);
+        
+        // Set up controller buttons
+        setupButton(R.id.btnUp, BTN_UP);
+        setupButton(R.id.btnDown, BTN_DOWN);
+        setupButton(R.id.btnLeft, BTN_LEFT);
+        setupButton(R.id.btnRight, BTN_RIGHT);
+        setupButton(R.id.btnA, BTN_A);
+        setupButton(R.id.btnB, BTN_B);
+        setupButton(R.id.btnStart, BTN_START);
+        setupButton(R.id.btnSelect, BTN_SELECT);
+        
+        // Load ROM button
+        findViewById(R.id.btnLoadRom).setOnClickListener(v -> {
+            if (checkPermissions()) {
+                pickRomFile();
+            }
         });
+        
+        // Auto-load bundled ROM if exists
+        loadBundledROM();
     }
-
-    // ============================================================================
-    // ROM HANDLING
-    // ============================================================================
-
-    private void openFilePicker() {
+    
+    private void setupButton(int viewId, int buttonMask) {
+        View button = findViewById(viewId);
+        if (button != null) {
+            button.setOnTouchListener((v, event) -> {
+                switch (event.getAction()) {
+                    case MotionEvent.ACTION_DOWN:
+                        setButton(buttonMask, true);
+                        v.setAlpha(0.5f);
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL:
+                        setButton(buttonMask, false);
+                        v.setAlpha(1.0f);
+                        return true;
+                }
+                return false;
+            });
+        }
+    }
+    
+    private boolean checkPermissions() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            // Android 13+ doesn't need storage permissions for document picker
+            return true;
+        }
+        
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.READ_EXTERNAL_STORAGE},
+                    REQUEST_CODE_PERMISSIONS);
+            return false;
+        }
+        return true;
+    }
+    
+    private void pickRomFile() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("*/*");
-        startActivityForResult(intent, PICK_ROM_REQUEST);
+        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"application/octet-stream", "*/*"});
+        startActivityForResult(intent, REQUEST_CODE_PICK_ROM);
     }
-
+    
     @Override
-    protected void onActivityResult(int requestCode, int resultCode, @Nullable Intent data) {
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == PICK_ROM_REQUEST && resultCode == RESULT_OK && data != null) {
+        
+        if (requestCode == REQUEST_CODE_PICK_ROM && resultCode == RESULT_OK && data != null) {
             Uri uri = data.getData();
-            if (uri != null) copyAndExtractRom(uri);
+            if (uri != null) {
+                loadROMFromUri(uri);
+            }
         }
     }
-
-    private void copyAndExtractRom(Uri uri) {
-        try (InputStream is = getContentResolver().openInputStream(uri)) {
-            File internalRom = new File(getFilesDir(), ROM_FILENAME);
-            try (FileOutputStream os = new FileOutputStream(internalRom)) {
-                byte[] buffer = new byte[8192];
-                int read;
-                while ((read = is.read(buffer)) != -1) os.write(buffer, 0, read);
-            }
-
-            String result = nativeExtractRom(internalRom.getAbsolutePath(), getFilesDir().getAbsolutePath());
-            if ("Success".equals(result)) {
-                initializeGameSession(internalRom.getAbsolutePath());
+    
+    private void loadBundledROM() {
+        try {
+            InputStream is = getAssets().open("dragon_warrior.nes");
+            byte[] romData = readInputStream(is);
+            is.close();
+            
+            if (loadROM(romData)) {
+                Log.i(TAG, "Bundled ROM loaded successfully");
+                startEmulator();
             } else {
-                showToast("Extraction Failed: " + result);
+                Log.e(TAG, "Failed to load bundled ROM");
             }
         } catch (Exception e) {
-            showToast("Load Failed: " + e.getMessage());
+            Log.w(TAG, "No bundled ROM found: " + e.getMessage());
+            Toast.makeText(this, "Please select a Dragon Warrior ROM", Toast.LENGTH_LONG).show();
         }
     }
-
-    private void initializeGameSession(String romPath) {
-        runOnUiThread(() -> {
-            setupContainer.setVisibility(View.GONE);
-            gameContainer.setVisibility(View.VISIBLE);
-            setupTouchControls();
-
-            nativeInitEngine(getFilesDir().getAbsolutePath());
-            isEngineRunning = true;
-
-            if (isSurfaceReady) {
-                Choreographer.getInstance().postFrameCallback(this);
-            }
-        });
-    }
-
-    // ============================================================================
-    // RENDERING & INPUT
-    // ============================================================================
-
-    @Override
-    public void doFrame(long frameTimeNanos) {
-        if (!isEngineRunning || !isSurfaceReady) return;
-        nativeUpdateSurface(screenBitmap);
-        Canvas canvas = gameSurface.getHolder().lockCanvas();
-        if (canvas != null) {
-            try {
-                canvas.drawColor(0xFF000000);
-                float scale = Math.min((float)gameSurface.getWidth() / 256f, (float)gameSurface.getHeight() / 240f);
-                int sw = (int) (256 * scale), sh = (int) (240 * scale);
-                int left = (gameSurface.getWidth() - sw) / 2, top = (gameSurface.getHeight() - sh) / 2;
-                destRect.set(left, top, left + sw, top + sh);
-                canvas.drawBitmap(screenBitmap, null, destRect, bitmapPaint);
-            } finally {
-                gameSurface.getHolder().unlockCanvasAndPost(canvas);
-            }
-        }
-        Choreographer.getInstance().postFrameCallback(this);
-    }
-
-    private float dX, dY;
-    @SuppressLint("ClickableViewAccessibility")
-    private void bindButton(int resId, int mask) {
-        View button = findViewById(resId);
-        if (button == null) return;
-        button.setOnTouchListener((v, event) -> {
-            if (isEditMode) {
-                if (event.getAction() == MotionEvent.ACTION_DOWN) {
-                    dX = v.getX() - event.getRawX(); dY = v.getY() - event.getRawY();
-                } else if (event.getAction() == MotionEvent.ACTION_MOVE) {
-                    v.setX(event.getRawX() + dX); v.setY(event.getRawY() + dY);
-                }
-                return true;
+    
+    private void loadROMFromUri(Uri uri) {
+        try {
+            InputStream is = getContentResolver().openInputStream(uri);
+            byte[] romData = readInputStream(is);
+            is.close();
+            
+            if (loadROM(romData)) {
+                Toast.makeText(this, "ROM loaded!", Toast.LENGTH_SHORT).show();
+                startEmulator();
             } else {
-                if (event.getAction() == MotionEvent.ACTION_DOWN) {
-                    performHapticFeedback(); 
-                    injectInput(mask, true); 
-                    v.setPressed(true);
-                } else if (event.getAction() == MotionEvent.ACTION_UP || event.getAction() == MotionEvent.ACTION_CANCEL) {
-                    injectInput(mask, false); 
-                    v.setPressed(false);
-                }
-                return true;
+                Toast.makeText(this, "Failed to load ROM", Toast.LENGTH_SHORT).show();
             }
-        });
+        } catch (Exception e) {
+            Log.e(TAG, "Error loading ROM", e);
+            Toast.makeText(this, "Error: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
     }
-
-    private void setupTouchControls() {
-        /* Standard NES Bitmask (Standard Controller Port):
-           Bit 0: A      (0x01)
-           Bit 1: B      (0x02)
-           Bit 2: Select (0x04)
-           Bit 3: Start  (0x08)
-           Bit 4: Up     (0x10)
-           Bit 5: Down   (0x20)
-           Bit 6: Left   (0x40)
-           Bit 7: Right  (0x80)
-        */
-        int[][] btns = {
-            {R.id.btn_a,      0x01}, 
-            {R.id.btn_b,      0x02}, 
-            {R.id.btn_select, 0x04}, 
-            {R.id.btn_start,  0x08},
-            {R.id.btn_up,     0x10}, 
-            {R.id.btn_down,   0x20}, 
-            {R.id.btn_left,   0x40}, 
-            {R.id.btn_right,  0x80}
-        };
-        for (int[] b : btns) bindButton(b[0], b[1]);
-
-        View dpad = findViewById(R.id.dpad_container);
-        if (dpad != null) dpad.setOnTouchListener((v, event) -> {
-            if (isEditMode) {
-                if (event.getAction() == MotionEvent.ACTION_DOWN) {
-                    dX = v.getX() - event.getRawX(); dY = v.getY() - event.getRawY();
-                } else if (event.getAction() == MotionEvent.ACTION_MOVE) {
-                    v.setX(event.getRawX() + dX); v.setY(event.getRawY() + dY);
+    
+    private byte[] readInputStream(InputStream is) throws Exception {
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        byte[] data = new byte[16384];
+        int bytesRead;
+        
+        while ((bytesRead = is.read(data, 0, data.length)) != -1) {
+            buffer.write(data, 0, bytesRead);
+        }
+        
+        return buffer.toByteArray();
+    }
+    
+    private void startEmulator() {
+        if (isRunning) return;
+        
+        isRunning = true;
+        emulatorThread = new Thread(() -> {
+            Log.i(TAG, "Emulator thread started");
+            
+            while (isRunning) {
+                long frameStart = System.nanoTime();
+                
+                // Run one frame of emulation
+                runFrame(frameBitmap);
+                
+                // Update screen on UI thread
+                runOnUiThread(() -> screenView.setImageBitmap(frameBitmap));
+                
+                // Target 60 FPS (16.67ms per frame)
+                long frameTime = (System.nanoTime() - frameStart) / 1_000_000;
+                long sleepTime = 16 - frameTime;
+                
+                if (sleepTime > 0) {
+                    try {
+                        Thread.sleep(sleepTime);
+                    } catch (InterruptedException e) {
+                        break;
+                    }
                 }
-                return true;
             }
-            return false;
+            
+            Log.i(TAG, "Emulator thread stopped");
         });
+        
+        emulatorThread.start();
     }
-
-    // ============================================================================
-    // SYSTEM & NATIVE
-    // ============================================================================
-
-    private void hideSystemUI() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            final WindowInsetsController c = getWindow().getInsetsController();
-            if (c != null) {
-                c.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
-                c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+    
+    @Override
+    protected void onPause() {
+        super.onPause();
+        isRunning = false;
+        if (emulatorThread != null) {
+            try {
+                emulatorThread.join(1000);
+            } catch (InterruptedException e) {
+                Log.e(TAG, "Error stopping emulator thread", e);
             }
         }
     }
-
-    private void performHapticFeedback() {
-        if (vibrator != null && vibrator.hasVibrator()) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) 
-                vibrator.vibrate(VibrationEffect.createOneShot(15, VibrationEffect.DEFAULT_AMPLITUDE));
-            else vibrator.vibrate(15);
+    
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (frameBitmap != null && !isRunning) {
+            // Restart emulator if ROM was previously loaded
+            startEmulator();
         }
     }
-
-    private void toggleTurbo() { 
-        isTurboEnabled = !isTurboEnabled; 
-        nativeSetTurbo(isTurboEnabled); 
-        showToast("Turbo: " + (isTurboEnabled ? "ON" : "OFF")); 
+    
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        isRunning = false;
+        cleanup();
+        if (frameBitmap != null) {
+            frameBitmap.recycle();
+            frameBitmap = null;
+        }
     }
-
-    private void toggleDebugUI() { 
-        isDebugVisible = !isDebugVisible; 
-        toggleDebugMenu(); 
-        if (debugOverlay != null) debugOverlay.setVisibility(isDebugVisible ? View.VISIBLE : View.GONE); 
-    }
-
-    @Override public void surfaceCreated(@NonNull SurfaceHolder h) { isSurfaceReady = true; if (isEngineRunning) Choreographer.getInstance().postFrameCallback(this); }
-    @Override public void surfaceDestroyed(@NonNull SurfaceHolder h) { isSurfaceReady = false; }
-    @Override public void surfaceChanged(@NonNull SurfaceHolder h, int f, int w, int h1) {}
-    @Override protected void onResume() { super.onResume(); hideSystemUI(); }
-    public void showToast(String msg) { runOnUiThread(() -> Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()); }
-
-    public native String nativeExtractRom(String romPath, String outDir);
-    public native void nativeInitEngine(String filesDir);
-    public native void nativeUpdateSurface(Bitmap bitmap);
-    public native void injectInput(int buttonBit, boolean isPressed);
-    public native void toggleDebugMenu();
-    public native void nativeSetTurbo(boolean enabled);
 }
