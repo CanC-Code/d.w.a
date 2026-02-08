@@ -7,6 +7,7 @@
 #include <chrono>
 #include <mutex>
 #include <cstring>
+#include <atomic>
 #include "MapperMMC1.h"
 #include "recompiled/cpu_shared.h"
 
@@ -26,7 +27,7 @@ extern "C" {
     uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
     int64_t total_cycles = 0;
     int32_t cycles_to_run = 0;
-    bool is_running = false;
+    std::atomic<bool> is_running{false};
     bool nmi_pending = false;
     bool irq_pending = false;
     uint8_t joypad_state = 0;
@@ -38,6 +39,7 @@ uint8_t palette_ram[32] = {0};
 uint8_t oam_ram[256] = {0};
 uint32_t screen_buffer[256 * 240] = {0};
 std::mutex buffer_mutex;
+std::mutex engine_mutex; // Prevents multiple engine threads
 
 MapperMMC1 mapper;
 uint8_t ppu_status = 0, ppu_ctrl = 0, ppu_mask = 0, oam_addr = 0;
@@ -66,8 +68,6 @@ extern "C" {
     void cpu_push(uint8_t v) { cpu_ram[0x0100 | (reg_S--)] = v; }
     uint8_t cpu_pop() { return cpu_ram[0x0100 | (++reg_S)]; }
 
-    // --- New Hardware-Accurate Addressing Helpers ---
-    
     uint16_t addr_abs_x(uint16_t base, bool* page_crossed) {
         uint16_t addr = base + reg_X;
         if (page_crossed && (addr & 0xFF00) != (base & 0xFF00)) {
@@ -92,7 +92,6 @@ extern "C" {
 
     uint16_t cpu_read_jmp_indirect(uint16_t addr) {
         uint8_t low = bus_read(addr);
-        // Simulate 6502 Hardware Bug: Page Wrap
         uint16_t high_addr = (addr & 0xFF00) | ((addr + 1) & 0x00FF);
         uint8_t high = bus_read(high_addr);
         return (high << 8) | low;
@@ -113,8 +112,6 @@ extern "C" {
         return bus_read(addr_zp) | (bus_read((addr_zp + 1) & 0xFF) << 8);
     }
 
-    // --- Arithmetic & Logic ---
-
     void cpu_adc(uint8_t v) {
         uint16_t c = (reg_P & FLAG_C) ? 1 : 0;
         uint16_t sum = reg_A + v + c;
@@ -134,13 +131,12 @@ extern "C" {
         if (v & 0x80) reg_P |= FLAG_N;
     }
 
-    // Rotates/Shifts
     uint8_t cpu_asl(uint8_t v) {
         reg_P = (reg_P & ~FLAG_C) | ((v & 0x80) ? FLAG_C : 0);
         v <<= 1; update_nz(v); return v;
     }
     uint8_t cpu_lsr(uint8_t v) {
-        reg_P = (reg_P & ~FLAG_C) | (v & FLAG_C);
+        reg_P = (reg_P & ~FLAG_C) | (v & 0x01 ? FLAG_C : 0);
         v >>= 1; update_nz(v); return v;
     }
     uint8_t cpu_rol(uint8_t v) {
@@ -150,7 +146,7 @@ extern "C" {
     }
     uint8_t cpu_ror(uint8_t v) {
         uint8_t c = (reg_P & FLAG_C) ? 0x80 : 0;
-        reg_P = (reg_P & ~FLAG_C) | (v & FLAG_C);
+        reg_P = (reg_P & ~FLAG_C) | (v & 0x01 ? FLAG_C : 0);
         v = (v >> 1) | c; update_nz(v); return v;
     }
 
@@ -169,16 +165,26 @@ extern "C" uint8_t bus_read(uint16_t a) {
     if (a < 0x2000) return cpu_ram[a & 0x07FF];
     if (a < 0x4000) {
         uint16_t r = a & 7;
-        if (r == 2) { uint8_t s = ppu_status; ppu_status &= 0x7F; ppu_addr_latch = 0; return s; }
+        if (r == 2) { 
+            uint8_t s = ppu_status; 
+            ppu_status &= 0x7F; // Clear VBlank flag on read
+            ppu_addr_latch = 0; 
+            return s; 
+        }
         if (r == 7) { 
             uint8_t d = ppu_data_buffer; uint16_t pa = ppu_addr_reg & 0x3FFF;
             if (pa < 0x2000) ppu_data_buffer = mapper.read_chr(pa);
             else if (pa < 0x3F00) ppu_data_buffer = ppu_vram[pa & 0x07FF];
             else { d = palette_ram[pa & 0x1F]; ppu_data_buffer = d; }
-            ppu_addr_reg += (ppu_ctrl & 4) ? 32 : 1; return d;
+            ppu_addr_reg += (ppu_ctrl & 4) ? 32 : 1; 
+            return d;
         }
     }
-    if (a == 0x4016) { uint8_t r = (controller_shift & 0x80) >> 7; controller_shift <<= 1; return r; }
+    if (a == 0x4016) { 
+        uint8_t r = (controller_shift & 0x80) >> 7; 
+        controller_shift <<= 1; 
+        return r | 0x40; // High bits required for some NES checks
+    }
     return (a >= 0x6000) ? mapper.read_prg(a) : 0;
 }
 
@@ -200,8 +206,14 @@ extern "C" void bus_write(uint16_t a, uint8_t v) {
             ppu_addr_reg += (ppu_ctrl & 4) ? 32 : 1; 
         }
     }
-    else if (a == 0x4014) { add_cycles(513); uint16_t b = v << 8; for(int i=0; i<256; i++) oam_ram[i] = bus_read(b+i); }
-    else if (a == 0x4016) { if (!(v&1)) controller_shift = joypad_state; }
+    else if (a == 0x4014) { 
+        add_cycles(513); 
+        uint16_t b = v << 8; 
+        for(int i=0; i<256; i++) oam_ram[i] = bus_read(b+i); 
+    }
+    else if (a == 0x4016) { 
+        if (!(v & 1)) controller_shift = joypad_state; 
+    }
     else if (a >= 0x6000) mapper.write(a, v);
 }
 
@@ -226,21 +238,30 @@ extern "C" void irq_handler() {
 extern "C" void power_on_reset() {
     mapper.reset();
     reg_PC = cpu_read_pointer(0xFFFC);
-    if (reg_PC < 0x8000) reg_PC = 0xC000;
-    reg_S = 0xFD; reg_P = 0x24; is_running = true;
+    reg_S = 0xFD; reg_P = 0x24;
     LOGI("Engine: Reset to $%04X", reg_PC);
 }
 
 void engine_loop() {
+    std::lock_guard<std::mutex> lock(engine_mutex);
     power_on_reset();
     while (is_running) {
         if (is_paused) { std::this_thread::sleep_for(std::chrono::milliseconds(16)); continue; }
+        
         auto frame_start = std::chrono::steady_clock::now();
-        cycles_to_run += 29780;
-        while (cycles_to_run > 0) execute_instruction();
-        nmi_pending = true; ppu_status |= 0x80;
+        cycles_to_run += 29780; // Standard NTSC cycles per frame
+
+        while (cycles_to_run > 0 && is_running) {
+            execute_instruction();
+        }
+
+        // Trigger VBlank
+        ppu_status |= 0x80;
+        if (ppu_ctrl & 0x80) nmi_pending = true;
+
         std::this_thread::sleep_until(frame_start + std::chrono::microseconds(16666));
     }
+    LOGI("Engine: Stopped");
 }
 
 // ============================================================================
@@ -251,21 +272,41 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstring romPath, jstring outDir) {
     const char *path = env->GetStringUTFChars(romPath, nullptr);
     std::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) return env->NewStringUTF("Error: File not found");
+    if (!file.is_open()) {
+        env->ReleaseStringUTFChars(romPath, path);
+        return env->NewStringUTF("Error: File not found");
+    }
 
-    uint8_t header[16]; file.read((char*)header, 16);
-    if (header[0]!='N' || header[1]!='E' || header[2]!='S') return env->NewStringUTF("Error: Invalid iNES");
+    uint8_t header[16]; 
+    file.read((char*)header, 16);
+    if (header[0]!='N' || header[1]!='E' || header[2]!='S') {
+        file.close();
+        env->ReleaseStringUTFChars(romPath, path);
+        return env->NewStringUTF("Error: Invalid iNES");
+    }
 
-    for (int i=0; i<header[4] && i<4; i++) file.read((char*)mapper.prg_rom[i], 16384);
-    if (header[5]>0) file.read((char*)mapper.chr_rom, header[5]*8192);
+    // Dragon Warrior (MMC1) usually has 4 PRG banks (64KB)
+    int prg_size = header[4] * 16384;
+    for (int i=0; i < header[4] && i < 4; i++) {
+        file.read((char*)mapper.prg_rom[i], 16384);
+    }
+    
+    // Load CHR data
+    if (header[5] > 0) {
+        file.read((char*)mapper.chr_rom, 8192);
+    }
 
-    file.close(); env->ReleaseStringUTFChars(romPath, path);
+    file.close();
+    env->ReleaseStringUTFChars(romPath, path);
     return env->NewStringUTF("Success");
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_nativeInitEngine(JNIEnv* e, jobject t, jstring d) {
-    if (!is_running) std::thread(engine_loop).detach();
+    if (!is_running) {
+        is_running = true;
+        std::thread(engine_loop).detach();
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -273,11 +314,19 @@ Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv* env, jobject thiz, jo
     AndroidBitmapInfo info; void* pixels;
     if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) return;
     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
-    { std::lock_guard<std::mutex> lock(buffer_mutex); memcpy(pixels, screen_buffer, 256*240*4); }
+    
+    {
+        std::lock_guard<std::mutex> lock(buffer_mutex);
+        // Ensure we don't copy more than the buffer size
+        memcpy(pixels, screen_buffer, 256 * 240 * 4);
+    }
+    
     AndroidBitmap_unlockPixels(env, bitmap);
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_injectInput(JNIEnv* e, jobject t, jint b, jboolean p) {
-    if (p) joypad_state |= (uint8_t)b; else joypad_state &= ~((uint8_t)b);
+    // b corresponds to bitmask of buttons (A=1, B=2, Select=4, Start=8...)
+    if (p) joypad_state |= (uint8_t)b; 
+    else joypad_state &= ~((uint8_t)b);
 }
