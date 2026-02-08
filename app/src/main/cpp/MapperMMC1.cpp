@@ -16,7 +16,7 @@ MapperMMC1::MapperMMC1() {
 void MapperMMC1::reset() {
     shift_register = 0x10; 
     write_count = 0;
-    control = 0x1C; // Mode 3: Fixed C000, 16KB switchable 8000
+    control = 0x1C; // Mode 3: Fixed C000 to last bank, 16KB switchable 8000
     prg_bank = 0;
     chr_bank_0 = 0;
     chr_bank_1 = 0;
@@ -26,6 +26,7 @@ const uint8_t* MapperMMC1::get_bank_ptr(uint16_t addr) const {
     uint8_t mode = (control >> 2) & 0x03;
     uint8_t bank_select = prg_bank & 0x0F;
 
+    // We mask with 0x03 because Dragon Warrior is 64KB (4 banks of 16KB)
     if (addr >= 0x8000 && addr < 0xC000) {
         switch (mode) {
             case 0: case 1: return prg_rom[(bank_select & 0x0E) & 0x03]; 
@@ -36,7 +37,7 @@ const uint8_t* MapperMMC1::get_bank_ptr(uint16_t addr) const {
         switch (mode) {
             case 0: case 1: return prg_rom[(bank_select | 0x01) & 0x03]; 
             case 2: return prg_rom[bank_select & 0x03];                 
-            case 3: default: return prg_rom[3];                               
+            case 3: default: return prg_rom[3]; // Fixed to last bank                              
         }
     }
     return nullptr;
@@ -52,28 +53,28 @@ Mirroring MapperMMC1::get_mirroring() const {
 }
 
 void MapperMMC1::write(uint16_t addr, uint8_t val) {
-    // PRG RAM ($6000-$7FFF)
+    // PRG RAM ($6000-$7FFF) - Used for Save Games in Dragon Warrior
     if (addr >= 0x6000 && addr <= 0x7FFF) {
-        // Bit 4 of prg_bank is often used as a RAM chip enable in MMC1
+        // Bit 4 of prg_bank is the RAM Disable bit
         if (!(prg_bank & 0x10)) prg_ram[addr - 0x6000] = val;
         return;
     }
 
     if (addr < 0x8000) return;
 
-    // Hardware Bug/Feature: MMC1 ignores writes that happen too quickly
+    // Hardware Limit: Ignore writes occurring on consecutive CPU cycles
     if (total_cycles <= last_write_cycle + 1) return;
     last_write_cycle = total_cycles;
 
-    // Reset logic (Any write with bit 7 set)
+    // Reset logic (Write any value with bit 7 set)
     if (val & 0x80) {
         shift_register = 0x10;
         write_count = 0;
-        control |= 0x0C; 
+        control |= 0x0C; // Resets PRG mode to 3 (Fixed $C000)
         return;
     }
 
-    // Serial shift: 5 bits required to update a register
+    // Serial shift: MMC1 registers are updated 1 bit at a time
     shift_register = (shift_register >> 1) | ((val & 0x01) << 4);
     write_count++;
 
@@ -96,14 +97,13 @@ uint8_t MapperMMC1::read_prg(uint16_t addr) {
 }
 
 uint8_t MapperMMC1::read_chr(uint16_t addr) {
-    // Dragon Warrior (NES) uses 8KB CHR
     // addr is 0x0000 - 0x1FFF
     if (!(control & 0x10)) {
-        // 8KB switching mode
+        // 8KB switching mode: Use bit 0 as ignored, shift right 1
         uint32_t bank_offset = (chr_bank_0 & 0x1E) * 4096;
         return chr_rom[(bank_offset + addr) % 8192];
     } else {
-        // 4KB switching mode
+        // 4KB switching mode: Separate banks for $0000 and $1000
         if (addr < 0x1000) {
             uint32_t bank_offset = (chr_bank_0 & 0x1F) * 4096;
             return chr_rom[(bank_offset + addr) % 8192];
@@ -115,6 +115,6 @@ uint8_t MapperMMC1::read_chr(uint16_t addr) {
 }
 
 void MapperMMC1::write_chr(uint16_t addr, uint8_t val) {
-    // Support for CHR-RAM if the ROM uses it
+    // While DW uses CHR-ROM, this is required for games that use CHR-RAM
     chr_rom[addr % 8192] = val;
 }
