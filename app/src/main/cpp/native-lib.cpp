@@ -22,16 +22,19 @@ extern void mapper_init(uint8_t* prg_rom, size_t prg_size, uint8_t* chr_rom, siz
 extern void mapper_reset();
 extern uint8_t mapper_read(uint16_t addr);
 extern void mapper_write(uint16_t addr, uint8_t value);
+extern uint8_t mapper_get_current_bank();  // NEW: Get current PRG bank number
 
 extern void controller_set_button(uint8_t button, bool pressed);
 extern uint8_t controller_read();
 extern void controller_write(uint8_t value);
 
-namespace recompiled {
-    extern void execute_at(uint16_t pc);
-}
+// Recompiled banks - forward declarations
+namespace Bank00 { void execute_at(uint16_t pc); }
+namespace Bank01 { void execute_at(uint16_t pc); }
+namespace Bank02 { void execute_at(uint16_t pc); }
+namespace Bank03 { void execute_at(uint16_t pc); }
 
-// CPU State - shared with recompiled code
+// CPU State - shared globally with recompiled code
 uint8_t reg_A = 0;
 uint8_t reg_X = 0;
 uint8_t reg_Y = 0;
@@ -121,6 +124,119 @@ extern "C" {
         if (value & 0x80) reg_P |= 0x80; // Negative flag
         else reg_P &= ~0x80;
     }
+
+    void update_flags_cmp(uint8_t reg_val, uint8_t value) {
+        uint16_t result = reg_val - value;
+        if (reg_val >= value) reg_P |= 0x01;  // Carry
+        else reg_P &= ~0x01;
+        update_nz(result & 0xFF);
+    }
+
+    void cpu_adc(uint8_t value) {
+        uint16_t result = reg_A + value + (reg_P & 0x01 ? 1 : 0);
+        if (((reg_A ^ result) & (value ^ result) & 0x80) != 0) reg_P |= 0x40;  // Overflow
+        else reg_P &= ~0x40;
+        if (result > 0xFF) reg_P |= 0x01;  // Carry
+        else reg_P &= ~0x01;
+        reg_A = result & 0xFF;
+        update_nz(reg_A);
+    }
+
+    void cpu_sbc(uint8_t value) {
+        cpu_adc(~value);
+    }
+
+    void cpu_bit(uint8_t value) {
+        if ((reg_A & value) == 0) reg_P |= 0x02;  // Zero
+        else reg_P &= ~0x02;
+        if (value & 0x80) reg_P |= 0x80;  // Negative
+        else reg_P &= ~0x80;
+        if (value & 0x40) reg_P |= 0x40;  // Overflow
+        else reg_P &= ~0x40;
+    }
+
+    uint8_t cpu_asl(uint8_t value) {
+        if (value & 0x80) reg_P |= 0x01;
+        else reg_P &= ~0x01;
+        value <<= 1;
+        update_nz(value);
+        return value;
+    }
+
+    uint8_t cpu_lsr(uint8_t value) {
+        if (value & 0x01) reg_P |= 0x01;
+        else reg_P &= ~0x01;
+        value >>= 1;
+        update_nz(value);
+        return value;
+    }
+
+    uint8_t cpu_rol(uint8_t value) {
+        uint8_t old_carry = (reg_P & 0x01) ? 1 : 0;
+        if (value & 0x80) reg_P |= 0x01;
+        else reg_P &= ~0x01;
+        value = (value << 1) | old_carry;
+        update_nz(value);
+        return value;
+    }
+
+    uint8_t cpu_ror(uint8_t value) {
+        uint8_t old_carry = (reg_P & 0x01) ? 0x80 : 0;
+        if (value & 0x01) reg_P |= 0x01;
+        else reg_P &= ~0x01;
+        value = (value >> 1) | old_carry;
+        update_nz(value);
+        return value;
+    }
+
+    uint16_t addr_abs_x(uint16_t addr, bool* page_crossed) {
+        uint16_t result = addr + reg_X;
+        if (page_crossed) *page_crossed = ((addr & 0xFF00) != (result & 0xFF00));
+        return result;
+    }
+
+    uint16_t addr_abs_y(uint16_t addr, bool* page_crossed) {
+        uint16_t result = addr + reg_Y;
+        if (page_crossed) *page_crossed = ((addr & 0xFF00) != (result & 0xFF00));
+        return result;
+    }
+
+    uint16_t read_pointer_indexed_x(uint16_t zp_addr) {
+        uint8_t addr = (zp_addr + reg_X) & 0xFF;
+        uint8_t lo = bus_read(addr);
+        uint8_t hi = bus_read((addr + 1) & 0xFF);
+        return lo | (hi << 8);
+    }
+
+    uint16_t read_pointer_indexed_y(uint16_t zp_addr, bool* page_crossed) {
+        uint8_t lo = bus_read(zp_addr & 0xFF);
+        uint8_t hi = bus_read((zp_addr + 1) & 0xFF);
+        uint16_t base = lo | (hi << 8);
+        uint16_t result = base + reg_Y;
+        if (page_crossed) *page_crossed = ((base & 0xFF00) != (result & 0xFF00));
+        return result;
+    }
+}
+
+// Dispatcher - routes execution to correct bank
+static void execute_recompiled(uint16_t pc) {
+    if (pc >= 0xC000) {
+        // Fixed bank 3
+        Bank03::execute_at(pc);
+    } else if (pc >= 0x8000) {
+        // Switchable bank - ask mapper which one
+        uint8_t bank_num = mapper_get_current_bank();
+        switch (bank_num) {
+            case 0: Bank00::execute_at(pc); break;
+            case 1: Bank01::execute_at(pc); break;
+            case 2: Bank02::execute_at(pc); break;
+            default: Bank00::execute_at(pc); break;
+        }
+    } else {
+        // Invalid PC
+        LOGE("Invalid PC: $%04X", pc);
+        reg_PC++;
+    }
 }
 
 // Reset CPU to power-on state
@@ -142,9 +258,23 @@ static void cpu_reset() {
 // Execute CPU for one frame (29780 cycles @ 1.79 MHz)
 static void cpu_run_frame() {
     cycles_to_run = 29780;
+    int safety_counter = 0;
     
     while (cycles_to_run > 0) {
-        recompiled::execute_at(reg_PC);
+        // Safety check to prevent infinite loops
+        if (++safety_counter > 100000) {
+            LOGE("CPU safety limit reached at PC=$%04X", reg_PC);
+            break;
+        }
+        
+        uint16_t prev_pc = reg_PC;
+        execute_recompiled(reg_PC);
+        
+        // If PC didn't change, something is wrong
+        if (reg_PC == prev_pc) {
+            LOGE("PC stuck at $%04X", reg_PC);
+            reg_PC++;
+        }
         
         // Step PPU (3 PPU cycles per CPU cycle)
         for (int i = 0; i < 3; i++) {
@@ -162,7 +292,7 @@ Java_com_canc_dwa_MainActivity_loadROM(JNIEnv* env, jobject, jbyteArray rom_data
     
     jsize rom_length = env->GetArrayLength(rom_data);
     if (rom_length < 16) {
-        LOGE("ROM too small");
+        LOGE("ROM too small: %d bytes", rom_length);
         return JNI_FALSE;
     }
     
@@ -170,7 +300,8 @@ Java_com_canc_dwa_MainActivity_loadROM(JNIEnv* env, jobject, jbyteArray rom_data
     
     // Verify iNES header
     if (rom_bytes[0] != 'N' || rom_bytes[1] != 'E' || rom_bytes[2] != 'S' || rom_bytes[3] != 0x1A) {
-        LOGE("Invalid NES header");
+        LOGE("Invalid NES header: %02X %02X %02X %02X", 
+             rom_bytes[0], rom_bytes[1], rom_bytes[2], rom_bytes[3]);
         env->ReleaseByteArrayElements(rom_data, (jbyte*)rom_bytes, JNI_ABORT);
         return JNI_FALSE;
     }
@@ -193,6 +324,7 @@ Java_com_canc_dwa_MainActivity_loadROM(JNIEnv* env, jobject, jbyteArray rom_data
     if (prg_rom) delete[] prg_rom;
     prg_rom = new uint8_t[prg_size];
     memcpy(prg_rom, rom_bytes + 16, prg_size);
+    LOGI("Loaded PRG-ROM: %zu bytes", prg_size);
     
     // Allocate and copy CHR-ROM (or RAM if chr_banks == 0)
     chr_size = chr_banks > 0 ? chr_banks * 8192 : 8192;
@@ -200,25 +332,36 @@ Java_com_canc_dwa_MainActivity_loadROM(JNIEnv* env, jobject, jbyteArray rom_data
     chr_rom = new uint8_t[chr_size];
     if (chr_banks > 0) {
         memcpy(chr_rom, rom_bytes + 16 + prg_size, chr_size);
+        LOGI("Loaded CHR-ROM: %zu bytes", chr_size);
     } else {
         memset(chr_rom, 0, chr_size);  // CHR-RAM
+        LOGI("Initialized CHR-RAM: %zu bytes", chr_size);
     }
     
     env->ReleaseByteArrayElements(rom_data, (jbyte*)rom_bytes, JNI_ABORT);
     
     // Initialize subsystems
+    LOGI("Initializing PPU...");
     ppu_init();
+    
+    LOGI("Initializing Mapper...");
     mapper_init(prg_rom, prg_size, chr_rom, chr_size);
     
     // Reset to power-on state
+    LOGI("Resetting PPU...");
     ppu_reset();
+    
+    LOGI("Resetting Mapper...");
     mapper_reset();
+    
+    LOGI("Resetting CPU...");
     cpu_reset();
     
     rom_loaded = true;
     emulator_running = true;
     
-    LOGI("ROM loaded successfully!");
+    LOGI("=== ROM LOADED SUCCESSFULLY ===");
+    LOGI("Reset vector points to: $%04X", reg_PC);
     return JNI_TRUE;
 }
 
@@ -243,11 +386,10 @@ Java_com_canc_dwa_MainActivity_runFrame(JNIEnv* env, jobject, jobject bitmap) {
     void* pixels;
     if (AndroidBitmap_getInfo(env, bitmap, &info) == ANDROID_BITMAP_RESULT_SUCCESS) {
         if (AndroidBitmap_lockPixels(env, bitmap, &pixels) == ANDROID_BITMAP_RESULT_SUCCESS) {
-            // Scale 256x240 to bitmap size (should be 256x240 or larger)
             if (info.width == 256 && info.height == 240) {
                 memcpy(pixels, frame_buffer, sizeof(frame_buffer));
             } else {
-                // Simple nearest-neighbor scaling if needed
+                // Nearest-neighbor scaling
                 uint32_t* dest = (uint32_t*)pixels;
                 for (uint32_t y = 0; y < info.height; y++) {
                     for (uint32_t x = 0; x < info.width; x++) {
