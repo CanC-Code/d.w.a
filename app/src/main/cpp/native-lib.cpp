@@ -6,7 +6,7 @@
 #include <atomic>
 #include <mutex>
 
-#include "recompiled/cpu_shared.h" // Ensures signatures match recompiled math
+#include "recompiled/cpu_shared.h" 
 
 #define LOG_TAG "DWA_Native"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -37,16 +37,16 @@ namespace Bank02 { void execute_at(uint16_t pc); }
 namespace Bank03 { void execute_at(uint16_t pc); }
 
 // ============================================================================
-// GLOBAL CPU STATE (Shared with recompiled code via cpu_shared.h)
+// GLOBAL CPU STATE - Wrapped in extern "C" to match header linkage
 // ============================================================================
 extern "C" {
     uint8_t reg_A = 0;
     uint8_t reg_X = 0;
     uint8_t reg_Y = 0;
     uint8_t reg_P = 0x24; 
-    uint8_t reg_S = 0xFD; // Stack Pointer
+    uint8_t reg_SP = 0xFD; 
     uint16_t reg_PC = 0;
-    int32_t cycles_to_run = 0;
+    int cycles_to_run = 0;
 }
 
 // Memory Layout
@@ -175,7 +175,7 @@ Java_com_canc_dwa_MainActivity_loadROM(JNIEnv* env, jobject, jbyteArray rom_data
     
     reg_PC = cpu_read_pointer(0xFFFC); // Reset Vector
     reg_P = 0x24;
-    reg_S = 0xFD;
+    reg_SP = 0xFD;
     
     rom_loaded = true;
     emulator_running = true;
