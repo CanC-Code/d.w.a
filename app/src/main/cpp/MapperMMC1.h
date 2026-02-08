@@ -17,9 +17,15 @@ enum class Mirroring {
 
 class MapperMMC1 {
 public:
-    // Memory layout: 4 Banks of 16KB PRG, 8KB CHR, 8KB Work/Save RAM
+    // PRG ROM: 4 Banks of 16KB (64KB total for Dragon Warrior)
     uint8_t prg_rom[4][16384];
-    uint8_t chr_rom[8192];
+
+    // CHR ROM/RAM: MMC1 can address up to 32 banks of 4KB.
+    // Even if Dragon Warrior only uses 8KB total, defining it as banked 
+    // prevents "subscripted value is not an array" errors in the mapper logic.
+    uint8_t chr_rom[32][4096]; 
+
+    // Work/Save RAM: 8KB
     uint8_t prg_ram[8192]; 
 
     // MMC1 Internal Registers
