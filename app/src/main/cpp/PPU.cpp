@@ -1,152 +1,92 @@
-#include "PPU.h"
-#include <cstring>
-#include <algorithm>
-
-PPU::PPU() { reset(); }
-
-void PPU::reset() {
-    std::memset(vram, 0, sizeof(vram));
-    std::memset(palette_ram, 0, sizeof(palette_ram));
-    std::memset(oam_ram, 0, sizeof(oam_ram));
-    std::fill(screen_buffer, screen_buffer + (256 * 240), 0xFF000000); 
-    ctrl = mask = status = oam_addr = 0;
-    addr_reg = 0; addr_latch = 0; data_buffer = 0;
-    scroll_x = 0; scroll_y = 0;
-    nmi_pending = false;
-}
-
 /**
- * NES Mirroring Logic: Maps the 4KB virtual space ($2000-$2FFF) into 2KB physical VRAM.
- */
-
-uint16_t PPU::get_mirrored_addr(uint16_t addr, Mirroring mode) {
-    uint16_t mirrored = addr & 0x0FFF; // Relative to $2000
-    switch (mode) {
-        case Mirroring::ONE_SCREEN_LOW:  return mirrored & 0x03FF;
-        case Mirroring::ONE_SCREEN_HIGH: return (mirrored & 0x03FF) + 0x0400;
-        case Mirroring::VERTICAL:        return mirrored & 0x07FF;
-        case Mirroring::HORIZONTAL:      
-            // Correct Horizontal: Maps NT0/NT1 to first 1KB, NT2/NT3 to second 1KB
-            return ((mirrored & 0x0800) >> 1) | (mirrored & 0x03FF);
-        default: return mirrored & 0x07FF;
-    }
-}
-
-uint8_t PPU::cpu_read(uint16_t addr, MapperMMC1& mapper) {
-    uint8_t reg = addr & 0x0007;
-    switch (reg) {
-        case 2: { // PPUSTATUS
-            uint8_t res = (status & 0xE0) | (data_buffer & 0x1F);
-            status &= ~0x80; // Clear VBlank flag on read
-            addr_latch = 0;  // Reset address/scroll latch
-            return res;
-        }
-        case 4: return oam_ram[oam_addr];
-        case 7: { // PPUDATA
-            uint16_t p_addr = addr_reg & 0x3FFF;
-            uint8_t data = data_buffer; // Buffered read
-
-            if (p_addr < 0x2000) {
-                data_buffer = mapper.read_chr(p_addr);
-            } else if (p_addr < 0x3F00) {
-                data_buffer = vram[get_mirrored_addr(p_addr, mapper.get_mirroring())];
-            } else {
-                // Palette reads are immediate (no buffer delay)
-                data = palette_ram[p_addr & 0x1F];
-                // Buffer is filled with the mirrored VRAM data "underneath" the palette
-                data_buffer = vram[get_mirrored_addr(p_addr, mapper.get_mirroring())];
-            }
-            addr_reg += (ctrl & 0x04) ? 32 : 1;
-            return data;
-        }
-    }
-    return 0;
-}
-
-void PPU::cpu_write(uint16_t addr, uint8_t val, MapperMMC1& mapper) {
-    uint8_t reg = addr & 0x0007;
-    switch (reg) {
-        case 0: ctrl = val; break;
-        case 1: mask = val; break;
-        case 3: oam_addr = val; break;
-        case 4: oam_ram[oam_addr++] = val; break;
-        case 5: // PPUSCROLL
-            if (addr_latch == 0) { scroll_x = val; addr_latch = 1; }
-            else { scroll_y = val; addr_latch = 0; }
-            break;
-        case 6: // PPUADDR
-            if (addr_latch == 0) { 
-                addr_reg = (uint16_t)((addr_reg & 0x00FF) | ((val & 0x3F) << 8)); 
-                addr_latch = 1; 
-            } else { 
-                addr_reg = (addr_reg & 0xFF00) | val; 
-                addr_latch = 0; 
-            }
-            break;
-        case 7: { // PPUDATA
-            uint16_t p_addr = addr_reg & 0x3FFF;
-            if (p_addr < 0x2000) {
-                mapper.write_chr(p_addr, val);
-            } else if (p_addr < 0x3F00) {
-                vram[get_mirrored_addr(p_addr, mapper.get_mirroring())] = val;
-            } else {
-                uint16_t p_idx = p_addr & 0x1F;
-                // Palette Mirroring hardware behavior
-                if ((p_idx & 0x03) == 0) {
-                    palette_ram[0x00] = palette_ram[0x04] = palette_ram[0x08] = 
-                    palette_ram[0x0C] = palette_ram[0x10] = palette_ram[0x14] = 
-                    palette_ram[0x18] = palette_ram[0x1C] = val;
-                }
-                palette_ram[p_idx] = val;
-            }
-            addr_reg += (ctrl & 0x04) ? 32 : 1;
-            break;
-        }
-    }
-}
-
-/**
- * Basic Frame Rendering
- * Handles Background Nametables and Attribute Palettes.
+ * Finalized PPU Rendering for Dragon Warrior
  */
 void PPU::render_frame(MapperMMC1& mapper, const uint32_t* nes_palette) {
     if (!(mask & 0x18)) {
-        std::fill(screen_buffer, screen_buffer + (256 * 240), 0xFF000000);
+        std::fill(screen_buffer, screen_buffer + (256 * 240), nes_palette[palette_ram[0] & 0x3F]);
         return; 
     }
 
-    uint16_t pt_base = (ctrl & 0x10) ? 0x1000 : 0x0000;
+    // Temporary buffer to track background transparency for Sprite-Zero Hit
+    uint8_t bg_pixel_map[256 * 240] = {0};
+
+    // 1. RENDER BACKGROUND
+    uint16_t bg_pt_base = (ctrl & 0x10) ? 0x1000 : 0x0000;
     Mirroring mirroring = mapper.get_mirroring();
 
-    for (int ty = 0; ty < 30; ty++) {
-        for (int tx = 0; tx < 32; tx++) {
-            // 1. Fetch Nametable Tile index
-            uint16_t nt_addr = 0x2000 + (ty * 32) + tx;
+    for (int y = 0; y < 240; y++) {
+        for (int x = 0; x < 256; x++) {
+            // Scrolling Logic
+            int fine_x = (x + scroll_x) % 512;
+            int fine_y = (y + scroll_y) % 480;
+            
+            uint16_t nt_base = 0x2000 + ((ctrl & 0x03) * 0x0400);
+            int tx = fine_x / 8;
+            int ty = fine_y / 8;
+            
+            // Handle Nametable wrap-around correctly for MMC1
+            uint16_t current_nt = nt_base;
+            if (tx >= 32) { current_nt ^= 0x0400; tx -= 32; }
+            if (ty >= 30) { current_nt ^= 0x0800; ty -= 30; }
+            
+            uint16_t nt_addr = current_nt + (ty * 32) + tx;
             uint8_t tile_idx = vram[get_mirrored_addr(nt_addr, mirroring)];
 
-            // 2. Fetch Attribute Byte for palette selection
-            uint16_t attr_addr = 0x23C0 + (ty / 4) * 8 + (tx / 4);
+            uint16_t attr_addr = current_nt + 0x3C0 + (ty / 4) * 8 + (tx / 4);
             uint8_t attr = vram[get_mirrored_addr(attr_addr, mirroring)];
             uint8_t palette_idx = (attr >> (((ty & 2) ? 4 : 0) | ((tx & 2) ? 2 : 0))) & 0x03;
 
-            // 3. Render the 8x8 tile
+            uint8_t p_low = mapper.read_chr(bg_pt_base + (tile_idx * 16) + (fine_y % 8));
+            uint8_t p_high = mapper.read_chr(bg_pt_base + (tile_idx * 16) + (fine_y % 8) + 8);
+            uint8_t pixel = ((p_low >> (7 - (fine_x % 8))) & 0x01) | (((p_high >> (7 - (fine_x % 8))) & 0x01) << 1);
+
+            bg_pixel_map[y * 256 + x] = pixel; // Store for Sprite-Zero check
+            
+            uint8_t color_final = (pixel == 0) ? palette_ram[0] : palette_ram[(palette_idx << 2) | pixel];
+            screen_buffer[y * 256 + x] = nes_palette[color_final & 0x3F];
+        }
+    }
+
+    // 2. RENDER SPRITES
+    if (mask & 0x10) {
+        uint16_t sp_pt_base = (ctrl & 0x08) ? 0x1000 : 0x0000;
+        for (int i = 63; i >= 0; i--) {
+            uint8_t sy = oam_ram[i * 4];
+            uint8_t tile = oam_ram[i * 4 + 1];
+            uint8_t attr = oam_ram[i * 4 + 2];
+            uint8_t sx = oam_ram[i * 4 + 3];
+
+            if (sy >= 239) continue;
+            sy++; // Sprites are offset by one scanline vertically
+
             for (int py = 0; py < 8; py++) {
-                uint8_t low = mapper.read_chr(pt_base + (tile_idx * 16) + py);
-                uint8_t high = mapper.read_chr(pt_base + (tile_idx * 16) + py + 8);
+                if (sy + py >= 240) continue;
+                
+                int line = (attr & 0x80) ? (7 - py) : py;
+                uint8_t low = mapper.read_chr(sp_pt_base + (tile * 16) + line);
+                uint8_t high = mapper.read_chr(sp_pt_base + (tile * 16) + line + 8);
 
                 for (int px = 0; px < 8; px++) {
-                    uint8_t pixel = ((low >> (7 - px)) & 0x01) | (((high >> (7 - px)) & 0x01) << 1);
+                    if (sx + px >= 256) continue;
                     
-                    int screen_x = tx * 8 + px;
-                    int screen_y = ty * 8 + py;
+                    int bit = (attr & 0x40) ? px : (7 - px);
+                    uint8_t pixel = ((low >> bit) & 0x01) | (((high >> bit) & 0x01) << 1);
 
-                    if (pixel != 0) { // Color 0 is transparent/background
-                        uint8_t color_final = palette_ram[(palette_idx << 2) | pixel];
-                        screen_buffer[screen_y * 256 + screen_x] = nes_palette[color_final & 0x3F];
-                    } else {
-                        // Background color (Universal Background)
-                        screen_buffer[screen_y * 256 + screen_x] = nes_palette[palette_ram[0] & 0x3F];
+                    if (pixel == 0) continue; 
+
+                    // --- NEW: Sprite-Zero Hit Logic ---
+                    if (i == 0 && bg_pixel_map[(sy + py) * 256 + (sx + px)] != 0) {
+                        status |= 0x40; // Set Sprite-Zero flag
                     }
+
+                    // --- NEW: Priority Check (Behind Background) ---
+                    if ((attr & 0x20) && bg_pixel_map[(sy + py) * 256 + (sx + px)] != 0) continue;
+
+                    uint8_t p_idx = (attr & 0x03) + 4;
+                    // Palette Mirroring: Correct for $3F10, $3F14...
+                    uint16_t pal_addr = (p_idx << 2) | pixel;
+                    uint8_t color_final = palette_ram[pal_addr];
+                    screen_buffer[(sy + py) * 256 + (sx + px)] = nes_palette[color_final & 0x3F];
                 }
             }
         }
