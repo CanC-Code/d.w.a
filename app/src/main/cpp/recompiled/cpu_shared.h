@@ -13,12 +13,13 @@
 #define FLAG_V 0x40
 #define FLAG_N 0x80
 
-// Shared Registers (Definitions live in native-lib.cpp)
-extern uint8_t reg_A, reg_X, reg_Y, reg_P, reg_SP;
-extern uint16_t reg_PC;
-extern int cycles_to_run;
-
 extern "C" {
+    // Shared Registers (Definitions live in native-lib.cpp)
+    // Using reg_SP to match your recompiled bank files
+    extern uint8_t reg_A, reg_X, reg_Y, reg_P, reg_SP;
+    extern uint16_t reg_PC;
+    extern int cycles_to_run;
+
     // Memory Interface (Definitions in native-lib.cpp)
     uint8_t bus_read(uint16_t addr);
     void bus_write(uint16_t addr, uint8_t value);
