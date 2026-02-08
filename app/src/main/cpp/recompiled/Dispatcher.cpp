@@ -5,10 +5,9 @@
 #define LOG_TAG "DWA_DISPATCHER"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// External reference to the global mapper defined in native-lib.cpp
 extern MapperMMC1 mapper;
+extern int32_t cycles_to_run; // From native-lib.cpp
 
-// --- RECOMPILED BANK ENTRY POINTS ---
 namespace Bank00 { void execute_at(uint16_t pc); }
 namespace Bank01 { void execute_at(uint16_t pc); }
 namespace Bank02 { void execute_at(uint16_t pc); }
@@ -16,7 +15,6 @@ namespace Bank03 { void execute_at(uint16_t pc); }
 
 typedef void (*BankExecFn)(uint16_t);
 
-// Table of function pointers for the 4 available 16KB banks
 static const BankExecFn bank_dispatch_table[] = {
     Bank00::execute_at,
     Bank01::execute_at,
@@ -26,55 +24,51 @@ static const BankExecFn bank_dispatch_table[] = {
 
 namespace Dispatcher {
 
-    void execute_at(uint16_t pc) {
-        if (pc >= 0x8000) {
-            uint8_t mode = (mapper.control >> 2) & 0x03; // MMC1 PRG Banking Mode
-            uint8_t bank_reg = mapper.prg_bank & 0x0F;
-            uint8_t target_index = 0;
+    inline uint8_t get_active_bank(uint16_t pc) {
+        uint8_t mode = (mapper.control >> 2) & 0x03;
+        uint8_t bank_reg = mapper.prg_bank & 0x0F;
 
-            if (pc >= 0xC000) {
-                // --- Upper Window: $C000 - $FFFF ---
-                switch (mode) {
-                    case 0:
-                    case 1: // 32KB Mode
-                        target_index = (bank_reg & 0x0E) | 0x01;
-                        break;
-                    case 2: // $C000 is Switchable
-                        target_index = bank_reg;
-                        break;
-                    case 3:
-                    default: // $C000 is Fixed to the Last Bank
-                        target_index = 3;
-                        break;
-                }
-            } else {
-                // --- Lower Window: $8000 - $BFFF ---
-                switch (mode) {
-                    case 0:
-                    case 1: // 32KB Mode
-                        target_index = (bank_reg & 0x0E);
-                        break;
-                    case 2: // $8000 is Fixed to the First Bank
-                        target_index = 0;
-                        break;
-                    case 3:
-                    default: // $8000 is Switchable
-                        target_index = bank_reg;
-                        break;
-                }
+        if (pc >= 0xC000) {
+            switch (mode) {
+                case 0: case 1: return (bank_reg & 0x0E) | 0x01;
+                case 2:         return bank_reg; 
+                case 3: default: return 3; // Fixed to last bank
             }
-
-            target_index &= 0x03; // Safety mask for 64KB ROM
-            bank_dispatch_table[target_index](pc);
-        } else {
-            reg_PC++;
+        } else { // $8000 - $BFFF
+            switch (mode) {
+                case 0: case 1: return (bank_reg & 0x0E);
+                case 2:         return 0; // Fixed to first bank
+                case 3: default: return bank_reg;
+            }
         }
     }
 
-    /**
-     * Entry point called by engine_loop() in native-lib.cpp
-     */
     void execute() {
-        execute_at(reg_PC);
+        /**
+         * CRITICAL LOGIC: Dragon Warrior uses "Wait for VBlank" loops.
+         * We MUST return to the main engine loop frequently so PPU flags 
+         * can be updated. If we don't, the recompiled C++ will hang 
+         * in a high-speed loop checking a flag that never changes.
+         */
+        
+        while (reg_PC >= 0x8000 && cycles_to_run > 0) {
+            uint8_t target_bank = get_active_bank(reg_PC);
+            
+            // Mask for safety (DW is 64KB = 4 banks)
+            target_bank &= 0x03; 
+
+            // Call recompiled logic
+            bank_dispatch_table[target_bank](reg_PC);
+
+            // Note: The recompiled bank code MUST be generated to check 
+            // for cycle exhaustion or return frequently on branches.
+        }
+
+        // Handle RAM execution fallback
+        if (reg_PC < 0x8000) {
+            // Very rare in DW, but prevents a hang if the game jumps to RAM
+            reg_PC++; 
+            cycles_to_run--;
+        }
     }
 }
