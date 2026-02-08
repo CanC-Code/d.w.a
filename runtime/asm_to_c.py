@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Dragon Warrior ASM to C++ Converter - COMPLETE PRODUCTION VERSION
-Full addressing mode support + execute_at(uint16_t pc) signature.
+Dragon Warrior ASM to C++ Converter - FINAL PRODUCTION VERSION
+Features: 
+- Hardware-accurate JSR return addresses (PC+2)
+- Indirect JMP page-wrap bug simulation
+- Branch Yielding to prevent Android ANRs
+- Corrected C++ signatures for all memory helpers
 """
 
 import os
@@ -30,9 +34,8 @@ def get_instruction_size(opcode, operand):
     opcode = opcode.lower()
     if opcode in ['.byte', '.db', '.asc']: return 1
     if opcode in ['.word', '.dw', '.addr']: return 2
-    if opcode in ['.ds']: return 0 # Size determined elsewhere
+    if opcode in ['.ds']: return 0 
 
-    # Implied / Accumulator
     implied_opcodes = {
         'brk', 'clc', 'cld', 'cli', 'clv', 'dex', 'dey', 'inx', 'iny',
         'nop', 'pha', 'php', 'pla', 'plp', 'rti', 'rts', 'sec', 'sed',
@@ -43,25 +46,22 @@ def get_instruction_size(opcode, operand):
         return 1
 
     if not operand or operand.strip() == "": return 1
-    
-    # Addressing Mode Detection
+
     operand = operand.strip()
-    if operand.startswith('#'): return 2                 # Immediate
-    if operand.startswith('('): return 2                 # Indirect (assuming ZP for DW)
-    if opcode in ['bcc', 'bcs', 'beq', 'bmi', 'bne', 'bpl', 'bvc', 'bvs']: return 2 # Relative
-    
-    # Check for Absolute vs Zero Page
+    if operand.startswith('#'): return 2
+    if operand.startswith('('): return 2
+    if opcode in ['bcc', 'bcs', 'beq', 'bmi', 'bne', 'bpl', 'bvc', 'bvs']: return 2
+
     clean = re.sub(r'[#$(),\sXY%]', '', operand)
     if clean in global_symbols:
         val = int(global_symbols[clean], 16)
         return 2 if val <= 0xFF else 3
-    
-    # Literal check
+
     if '$' in operand:
         hex_val = re.search(r'\$([0-9A-Fa-f]+)', operand)
         if hex_val:
             return 2 if len(hex_val.group(1)) <= 2 else 3
-            
+
     return 2 if len(clean) <= 2 else 3
 
 def resolve_symbol(symbol):
@@ -79,7 +79,7 @@ def translate_instruction(opcode, operand, pc):
     opcode = opcode.lower()
     if opcode in ['.byte', '.db', '.word', '.dw', '.addr', '.asc', '.ds']:
         return f"// Data: {opcode} {operand}", get_instruction_size(opcode, operand)
-    
+
     if opcode not in VALID_OPCODES:
         return f"// Unsupported Opcode: {opcode}", 0
 
@@ -87,7 +87,13 @@ def translate_instruction(opcode, operand, pc):
     val = resolve_symbol(operand)
     addr_val = int(val, 16) & 0xFFFF
     addr_str = f"0x{addr_val:04X}"
-    
+
+    # Yield logic for loops (prevents Android ANR)
+    yield_logic = ""
+    if opcode in ['beq', 'bne', 'bcs', 'bcc', 'bmi', 'bpl', 'bvs', 'bvc']:
+        if addr_val < pc: 
+            yield_logic = "if (cycles_to_run <= 0) return; "
+
     # 1. IMMEDIATE
     if operand.startswith('#'):
         imm = f"0x{addr_val & 0xFF:02X}"
@@ -106,25 +112,27 @@ def translate_instruction(opcode, operand, pc):
         }
         return ops.get(opcode, f"// Error {opcode} imm"), size
 
-    # 2. INDIRECT (e.g., ($20),Y or ($20,X))
+    # 2. INDIRECT
     if '(' in operand:
         zp = f"0x{addr_val & 0xFF:02X}"
         if '),Y' in operand.upper():
+            ptr = f"read_pointer_indexed_y({zp}, nullptr)"
             ops = {
-                'lda': f'reg_A = bus_read(read_pointer_indexed_y({zp})); update_nz(reg_A);',
-                'sta': f'bus_write(read_pointer_indexed_y({zp}), reg_A);',
-                'ora': f'reg_A |= bus_read(read_pointer_indexed_y({zp})); update_nz(reg_A);',
-                'and': f'reg_A &= bus_read(read_pointer_indexed_y({zp})); update_nz(reg_A);',
-                'eor': f'reg_A ^= bus_read(read_pointer_indexed_y({zp})); update_nz(reg_A);',
-                'adc': f'cpu_adc(bus_read(read_pointer_indexed_y({zp})));',
-                'sbc': f'cpu_sbc(bus_read(read_pointer_indexed_y({zp})));',
-                'cmp': f'update_flags_cmp(reg_A, bus_read(read_pointer_indexed_y({zp})));'
+                'lda': f'reg_A = bus_read({ptr}); update_nz(reg_A);',
+                'sta': f'bus_write({ptr}, reg_A);',
+                'ora': f'reg_A |= bus_read({ptr}); update_nz(reg_A);',
+                'and': f'reg_A &= bus_read({ptr}); update_nz(reg_A);',
+                'eor': f'reg_A ^= bus_read({ptr}); update_nz(reg_A);',
+                'adc': f'cpu_adc(bus_read({ptr}));',
+                'sbc': f'cpu_sbc(bus_read({ptr}));',
+                'cmp': f'update_flags_cmp(reg_A, bus_read({ptr}));'
             }
             return ops.get(opcode, f"// Error {opcode} ind_y"), size
         if ',X)' in operand.upper():
-            return f'reg_A = bus_read(read_pointer_indexed_x({zp})); update_nz(reg_A);', size
+            ptr = f"read_pointer_indexed_x({zp})"
+            return f'reg_A = bus_read({ptr}); update_nz(reg_A);', size
         if opcode == 'jmp':
-            return f'reg_PC = read_pointer({addr_str}); return;', size
+            return f'reg_PC = cpu_read_jmp_indirect({addr_str}); return;', size
 
     # 3. ACCUMULATOR
     if not operand or operand.strip().upper() == 'A':
@@ -133,7 +141,7 @@ def translate_instruction(opcode, operand, pc):
         if opcode == 'rol': return 'reg_A = cpu_rol(reg_A);', size
         if opcode == 'ror': return 'reg_A = cpu_ror(reg_A);', size
 
-    # 4. RELATIVE (Branches)
+    # 4. RELATIVE
     branch_conds = {
         'beq': 'reg_P & FLAG_Z', 'bne': '!(reg_P & FLAG_Z)',
         'bcs': 'reg_P & FLAG_C', 'bcc': '!(reg_P & FLAG_C)',
@@ -141,12 +149,12 @@ def translate_instruction(opcode, operand, pc):
         'bvs': 'reg_P & FLAG_V', 'bvc': '!(reg_P & FLAG_V)'
     }
     if opcode in branch_conds:
-        return f'if ({branch_conds[opcode]}) {{ reg_PC = {addr_str}; return; }}', size
+        return f'{yield_logic}if ({branch_conds[opcode]}) {{ reg_PC = {addr_str}; return; }}', size
 
     # 5. ABSOLUTE / ZERO PAGE / INDEXED
     final_addr = addr_str
-    if ',X' in operand.upper(): final_addr = f"(uint16_t)({addr_str} + reg_X)"
-    if ',Y' in operand.upper(): final_addr = f"(uint16_t)({addr_str} + reg_Y)"
+    if ',X' in operand.upper(): final_addr = f"addr_abs_x({addr_str}, nullptr)"
+    if ',Y' in operand.upper(): final_addr = f"addr_abs_y({addr_str}, nullptr)"
 
     mem_ops = {
         'lda': f'reg_A = bus_read({final_addr}); update_nz(reg_A);',
@@ -159,14 +167,14 @@ def translate_instruction(opcode, operand, pc):
         'cpx': f'update_flags_cmp(reg_X, bus_read({final_addr}));',
         'cpy': f'update_flags_cmp(reg_Y, bus_read({final_addr}));',
         'bit': f'cpu_bit(bus_read({final_addr}));',
-        'inc': f'{{ uint8_t v = bus_read({final_addr}) + 1; bus_write({final_addr}, v); update_nz(v); }}',
-        'dec': f'{{ uint8_t v = bus_read({final_addr}) - 1; bus_write({final_addr}, v); update_nz(v); }}',
-        'asl': f'{{ uint8_t v = cpu_asl(bus_read({final_addr})); bus_write({final_addr}, v); }}',
-        'lsr': f'{{ uint8_t v = cpu_lsr(bus_read({final_addr})); bus_write({final_addr}, v); }}',
-        'rol': f'{{ uint8_t v = cpu_rol(bus_read({final_addr})); bus_write({final_addr}, v); }}',
-        'ror': f'{{ uint8_t v = cpu_ror(bus_read({final_addr})); bus_write({final_addr}, v); }}',
+        'inc': f'{{ uint16_t a = {final_addr}; uint8_t v = bus_read(a) + 1; bus_write(a, v); update_nz(v); }}',
+        'dec': f'{{ uint16_t a = {final_addr}; uint8_t v = bus_read(a) - 1; bus_write(a, v); update_nz(v); }}',
+        'asl': f'{{ uint16_t a = {final_addr}; uint8_t v = cpu_asl(bus_read(a)); bus_write(a, v); }}',
+        'lsr': f'{{ uint16_t a = {final_addr}; uint8_t v = cpu_lsr(bus_read(a)); bus_write(a, v); }}',
+        'rol': f'{{ uint16_t a = {final_addr}; uint8_t v = cpu_rol(bus_read(a)); bus_write(a, v); }}',
+        'ror': f'{{ uint16_t a = {final_addr}; uint8_t v = cpu_ror(bus_read(a)); bus_write(a, v); }}',
         'jmp': f'reg_PC = {final_addr}; return;',
-        'jsr': f'{{ uint16_t ret = reg_PC + {size-1}; push_stack(ret >> 8); push_stack(ret & 0xFF); reg_PC = {final_addr}; return; }}',
+        'jsr': f'{{ uint16_t ret = reg_PC + 2; cpu_push(ret >> 8); cpu_push(ret & 0xFF); reg_PC = {final_addr}; return; }}',
         'adc': f'cpu_adc(bus_read({final_addr}));',
         'sbc': f'cpu_sbc(bus_read({final_addr}));',
         'ora': f'reg_A |= bus_read({final_addr}); update_nz(reg_A);',
@@ -185,12 +193,12 @@ def translate_instruction(opcode, operand, pc):
         'tsx': 'reg_X = reg_S; update_nz(reg_X);', 'txs': 'reg_S = reg_X;',
         'dex': 'reg_X--; update_nz(reg_X);', 'inx': 'reg_X++; update_nz(reg_X);',
         'dey': 'reg_Y--; update_nz(reg_Y);', 'iny': 'reg_Y++; update_nz(reg_Y);',
-        'pha': 'push_stack(reg_A);', 'pla': 'reg_A = pop_stack(); update_nz(reg_A);',
-        'php': 'push_stack(reg_P | 0x10);', 'plp': 'reg_P = pop_stack();',
-        'rts': 'reg_PC = (pop_stack() | (pop_stack() << 8)) + 1; return;',
-        'rti': 'reg_P = pop_stack(); reg_PC = (pop_stack() | (pop_stack() << 8)); return;',
+        'pha': 'cpu_push(reg_A);', 'pla': 'reg_A = cpu_pop(); update_nz(reg_A);',
+        'php': 'cpu_push(reg_P | 0x10);', 'plp': 'reg_P = cpu_pop();',
+        'rts': 'reg_PC = (cpu_pop() | (cpu_pop() << 8)) + 1; return;',
+        'rti': 'reg_P = cpu_pop(); reg_PC = (cpu_pop() | (cpu_pop() << 8)); return;',
         'nop': '// NOP',
-        'brk': 'push_stack((reg_PC+2) >> 8); push_stack((reg_PC+2) & 0xFF); push_stack(reg_P | 0x10); reg_P |= FLAG_I; reg_PC = read_pointer(0xFFFE); return;'
+        'brk': 'cpu_push((reg_PC+2) >> 8); cpu_push((reg_PC+2) & 0xFF); cpu_push(reg_P | 0x10); reg_P |= FLAG_I; reg_PC = cpu_read_pointer(0xFFFE); return;'
     }
     if opcode in implied_ops: return implied_ops[opcode], size
 
@@ -199,15 +207,11 @@ def translate_instruction(opcode, operand, pc):
 def convert_asm_file(filename):
     filepath = os.path.join(SOURCE_DIR, filename)
     bank_name = os.path.splitext(filename)[0].replace("-", "_")
-    
-    # Starting PC context
     current_pc = 0xC000 if "Bank03" in filename else 0x8000
-    
     output_path = os.path.join(OUTPUT_DIR, f"{bank_name}.cpp")
-    print(f"Generating {output_path}...")
-    
+
     with open(output_path, 'w') as out:
-        out.write(f'// Auto-generated from {filename}\n')
+        out.write(f'// Generated for Dragon Warrior Android\n')
         out.write('#include "cpu_shared.h"\n\n')
         out.write(f'namespace {bank_name} {{\n')
         out.write('void execute_at(uint16_t pc) {\n')
@@ -215,43 +219,27 @@ def convert_asm_file(filename):
 
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
-                # 1. Strip comments and whitespace
-                raw_line = line.strip()
                 clean = line.split(';')[0].strip()
                 if not clean: continue
-
-                # 2. Handle ORG
                 org_match = re.match(r'^\.org\s+\$?([0-9A-Fa-f]+)', clean)
                 if org_match:
                     current_pc = int(org_match.group(1), 16)
                     continue
-
-                # 3. Split Label, Opcode, Operand
                 match = re.match(r'^(?:(\w+):)?\s*(\.?\w+)?\s*(.*)$', clean)
                 if not match: continue
                 label, opcode, operand = match.groups()
-                
                 if not opcode: continue
-
-                # 4. Translate
                 code, size = translate_instruction(opcode, operand, current_pc)
-                
-                # 5. Output Switch Case
                 if size > 0 and opcode.lower() in VALID_OPCODES:
                     addr_hex = f"0x{current_pc & 0xFFFF:04X}"
-                    out.write(f'        case {addr_hex}: ')
-                    out.write(code)
-                    if 'return' not in code:
-                        out.write(f' reg_PC += {size}; return;')
+                    out.write(f'        case {addr_hex}: {code}')
+                    if 'return' not in code: out.write(f' reg_PC += {size}; return;')
                     out.write(f' // {clean}\n')
-                
                 current_pc += size
 
-        out.write('        default: reg_PC++; return;\n')
-        out.write('    }\n}\n}\n')
+        out.write('        default: reg_PC++; return;\n    }\n}\n}\n')
 
 def pre_parse_symbols(asm_files):
-    print("Pre-parsing symbols...")
     for filename in sorted(asm_files):
         filepath = os.path.join(SOURCE_DIR, filename)
         current_pc = 0xC000 if "Bank03" in filename else 0x8000
@@ -272,15 +260,12 @@ def pre_parse_symbols(asm_files):
                     current_pc += get_instruction_size(opcode, operand)
 
 def main():
-    if not os.path.exists(SOURCE_DIR):
-        print(f"Error: {SOURCE_DIR} missing")
-        return 1
+    if not os.path.exists(SOURCE_DIR): return 1
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     asm_files = [f for f in os.listdir(SOURCE_DIR) if f.endswith('.asm') and "Defines" not in f]
     pre_parse_symbols(asm_files)
     for filename in asm_files:
         convert_asm_file(filename)
-    print("Done.")
     return 0
 
 if __name__ == "__main__":
