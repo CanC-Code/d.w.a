@@ -16,6 +16,8 @@ static uint8_t control = 0x0C;         // Start with 16KB PRG mode
 static uint8_t chr_bank_0 = 0;
 static uint8_t chr_bank_1 = 0;
 static uint8_t prg_bank = 0;
+static uint8_t current_bank_low = 0;   // NEW: Track which bank is at $8000
+static uint8_t current_bank_high = 0;  // NEW: Track which bank is at $C000
 
 // Current bank pointers
 static uint8_t* prg_bank_low = nullptr;   // $8000-$BFFF
@@ -35,17 +37,26 @@ static void update_banks() {
         int bank = (prg_bank & 0x0E) % num_prg_banks;
         prg_bank_low = prg_rom_ptr + (bank * 16384);
         prg_bank_high = prg_bank_low + 16384;
+        current_bank_low = bank;
+        current_bank_high = bank + 1;
     } else if (prg_mode == 2) {
         // Fix first bank at $8000, switch $C000
         prg_bank_low = prg_rom_ptr;
         int bank = (prg_bank & 0x0F) % num_prg_banks;
         prg_bank_high = prg_rom_ptr + (bank * 16384);
+        current_bank_low = 0;
+        current_bank_high = bank;
     } else {
         // Fix last bank at $C000, switch $8000
         int bank = (prg_bank & 0x0F) % num_prg_banks;
         prg_bank_low = prg_rom_ptr + (bank * 16384);
         prg_bank_high = prg_rom_ptr + ((num_prg_banks - 1) * 16384);
+        current_bank_low = bank;
+        current_bank_high = num_prg_banks - 1;
     }
+    
+    LOGI("Bank switch: Low=%d ($8000), High=%d ($C000), Mode=%d", 
+         current_bank_low, current_bank_high, prg_mode);
     
     // CHR bank mode
     if (chr_rom_size > 0) {
@@ -70,7 +81,8 @@ void mapper_init(uint8_t* prg_rom, size_t prg_size, uint8_t* chr_rom, size_t chr
     prg_rom_size = prg_size;
     chr_rom_size = chr_size;
     
-    LOGI("Mapper initialized: PRG=%zu bytes, CHR=%zu bytes", prg_size, chr_size);
+    LOGI("Mapper initialized: PRG=%zu bytes (%d banks), CHR=%zu bytes", 
+         prg_size, (int)(prg_size / 16384), chr_size);
 }
 
 void mapper_reset() {
@@ -81,7 +93,7 @@ void mapper_reset() {
     prg_bank = 0;
     
     update_banks();
-    LOGI("Mapper reset");
+    LOGI("Mapper reset: control=$%02X", control);
 }
 
 // Read from PRG-ROM ($8000-$FFFF)
@@ -101,7 +113,7 @@ void mapper_write(uint16_t addr, uint8_t value) {
     // Reset shift register on bit 7
     if (value & 0x80) {
         shift_register = 0x10;
-        control |= 0x0C;  // Reset to 16KB mode on write
+        control |= 0x0C;  // Reset to 16KB mode
         update_banks();
         return;
     }
@@ -118,7 +130,11 @@ void mapper_write(uint16_t addr, uint8_t value) {
         // Determine which register based on address
         if (addr < 0xA000) {
             // Control register
+            uint8_t old_control = control;
             control = reg_value;
+            if (old_control != control) {
+                LOGI("Control changed: $%02X -> $%02X", old_control, control);
+            }
         } else if (addr < 0xC000) {
             // CHR bank 0
             chr_bank_0 = reg_value;
@@ -127,7 +143,11 @@ void mapper_write(uint16_t addr, uint8_t value) {
             chr_bank_1 = reg_value;
         } else {
             // PRG bank
+            uint8_t old_bank = prg_bank;
             prg_bank = reg_value;
+            if (old_bank != prg_bank) {
+                LOGI("PRG bank changed: $%02X -> $%02X", old_bank, prg_bank);
+            }
         }
         
         update_banks();
@@ -152,4 +172,9 @@ void mapper_write_chr(uint16_t addr, uint8_t value) {
             chr_bank_1_ptr[addr - 0x1000] = value;
         }
     }
+}
+
+// NEW: Get current bank number at $8000-$BFFF for dispatcher
+uint8_t mapper_get_current_bank() {
+    return current_bank_low;
 }
