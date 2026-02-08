@@ -67,28 +67,28 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         gameSurface = findViewById(R.id.game_surface);
         debugOverlay = findViewById(R.id.debug_overlay_bg);
 
+        // Standard NES Resolution
         screenBitmap = Bitmap.createBitmap(256, 240, Bitmap.Config.ARGB_8888);
         if (gameSurface != null) gameSurface.getHolder().addCallback(this);
 
         findViewById(R.id.btn_select_rom).setOnClickListener(v -> openFilePicker());
         findViewById(R.id.btn_debug).setOnClickListener(v -> toggleDebugUI());
+        
         View turboBtn = findViewById(R.id.btn_turbo);
         if (turboBtn != null) turboBtn.setOnClickListener(v -> toggleTurbo());
 
-        // Check for existing ROM on launch
         checkExistingRom();
     }
 
     private void checkExistingRom() {
         File romFile = new File(getFilesDir(), ROM_FILENAME);
         if (romFile.exists()) {
-            // Automatically boot if ROM exists
             initializeGameSession(romFile.getAbsolutePath());
         }
     }
 
     // ============================================================================
-    // MENU SYSTEM & ROM OFFLOADING
+    // MENU SYSTEM
     // ============================================================================
 
     @Override
@@ -159,7 +159,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     }
 
     // ============================================================================
-    // ROM HANDLING & INITIALIZATION
+    // ROM HANDLING
     // ============================================================================
 
     private void openFilePicker() {
@@ -203,10 +203,10 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
             setupContainer.setVisibility(View.GONE);
             gameContainer.setVisibility(View.VISIBLE);
             setupTouchControls();
-            
+
             nativeInitEngine(getFilesDir().getAbsolutePath());
             isEngineRunning = true;
-            
+
             if (isSurfaceReady) {
                 Choreographer.getInstance().postFrameCallback(this);
             }
@@ -214,7 +214,7 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     }
 
     // ============================================================================
-    // RENDERING, INPUT & UTILS
+    // RENDERING & INPUT
     // ============================================================================
 
     @Override
@@ -252,9 +252,12 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
                 return true;
             } else {
                 if (event.getAction() == MotionEvent.ACTION_DOWN) {
-                    performHapticFeedback(); injectInput(mask, true); v.setPressed(true);
+                    performHapticFeedback(); 
+                    injectInput(mask, true); 
+                    v.setPressed(true);
                 } else if (event.getAction() == MotionEvent.ACTION_UP || event.getAction() == MotionEvent.ACTION_CANCEL) {
-                    injectInput(mask, false); v.setPressed(false);
+                    injectInput(mask, false); 
+                    v.setPressed(false);
                 }
                 return true;
             }
@@ -262,10 +265,28 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
     }
 
     private void setupTouchControls() {
-        int[][] btns = {{R.id.btn_up, 0x08}, {R.id.btn_down, 0x04}, {R.id.btn_left, 0x02}, {R.id.btn_right, 0x01},
-                        {R.id.btn_a, 0x80}, {R.id.btn_b, 0x40}, {R.id.btn_start, 0x10}, {R.id.btn_select, 0x20}};
+        /* Standard NES Bitmask (Standard Controller Port):
+           Bit 0: A      (0x01)
+           Bit 1: B      (0x02)
+           Bit 2: Select (0x04)
+           Bit 3: Start  (0x08)
+           Bit 4: Up     (0x10)
+           Bit 5: Down   (0x20)
+           Bit 6: Left   (0x40)
+           Bit 7: Right  (0x80)
+        */
+        int[][] btns = {
+            {R.id.btn_a,      0x01}, 
+            {R.id.btn_b,      0x02}, 
+            {R.id.btn_select, 0x04}, 
+            {R.id.btn_start,  0x08},
+            {R.id.btn_up,     0x10}, 
+            {R.id.btn_down,   0x20}, 
+            {R.id.btn_left,   0x40}, 
+            {R.id.btn_right,  0x80}
+        };
         for (int[] b : btns) bindButton(b[0], b[1]);
-        
+
         View dpad = findViewById(R.id.dpad_container);
         if (dpad != null) dpad.setOnTouchListener((v, event) -> {
             if (isEditMode) {
@@ -280,6 +301,10 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
         });
     }
 
+    // ============================================================================
+    // SYSTEM & NATIVE
+    // ============================================================================
+
     private void hideSystemUI() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             final WindowInsetsController c = getWindow().getInsetsController();
@@ -292,13 +317,24 @@ public class MainActivity extends AppCompatActivity implements SurfaceHolder.Cal
 
     private void performHapticFeedback() {
         if (vibrator != null && vibrator.hasVibrator()) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) vibrator.vibrate(VibrationEffect.createOneShot(15, VibrationEffect.DEFAULT_AMPLITUDE));
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) 
+                vibrator.vibrate(VibrationEffect.createOneShot(15, VibrationEffect.DEFAULT_AMPLITUDE));
             else vibrator.vibrate(15);
         }
     }
 
-    private void toggleTurbo() { isTurboEnabled = !isTurboEnabled; nativeSetTurbo(isTurboEnabled); showToast("Turbo: " + (isTurboEnabled ? "ON" : "OFF")); }
-    private void toggleDebugUI() { isDebugVisible = !isDebugVisible; toggleDebugMenu(); if (debugOverlay != null) debugOverlay.setVisibility(isDebugVisible ? View.VISIBLE : View.GONE); }
+    private void toggleTurbo() { 
+        isTurboEnabled = !isTurboEnabled; 
+        nativeSetTurbo(isTurboEnabled); 
+        showToast("Turbo: " + (isTurboEnabled ? "ON" : "OFF")); 
+    }
+
+    private void toggleDebugUI() { 
+        isDebugVisible = !isDebugVisible; 
+        toggleDebugMenu(); 
+        if (debugOverlay != null) debugOverlay.setVisibility(isDebugVisible ? View.VISIBLE : View.GONE); 
+    }
+
     @Override public void surfaceCreated(@NonNull SurfaceHolder h) { isSurfaceReady = true; if (isEngineRunning) Choreographer.getInstance().postFrameCallback(this); }
     @Override public void surfaceDestroyed(@NonNull SurfaceHolder h) { isSurfaceReady = false; }
     @Override public void surfaceChanged(@NonNull SurfaceHolder h, int f, int w, int h1) {}
