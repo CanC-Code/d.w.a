@@ -8,8 +8,10 @@
 #include <mutex>
 #include <cstring>
 #include <atomic>
+
 #include "MapperMMC1.h"
 #include "PPU.h"
+#include "Controller.h" // Your new file
 #include "recompiled/cpu_shared.h"
 
 #define LOG_TAG "DWA_NATIVE"
@@ -28,19 +30,19 @@ extern "C" {
     uint8_t reg_A = 0, reg_X = 0, reg_Y = 0, reg_S = 0xFD, reg_P = 0x24;
     int64_t total_cycles = 0;
     int32_t cycles_to_run = 0;
-    std::atomic<bool> is_running{false}; 
+    
+    // Uses the ATOMIC_BOOL defined in your updated cpu_shared.h
+    ATOMIC_BOOL is_running{false}; 
+    
     bool nmi_pending = false;
     bool irq_pending = false;
-    uint8_t joypad_state = 0; 
+    // We remove the old joypad_state byte here to prevent conflicts
 }
 
 uint8_t cpu_ram[0x0800] = {0};
 MapperMMC1 mapper;
 PPU ppu;
-
-// Enhanced Input Handling
-uint8_t controller_latch = 0; 
-bool controller_strobe = false;
+Controller joypad1; // Instance of your new thread-safe controller
 
 const uint32_t nes_palette[64] = {
     0xFF757575, 0xFF8F1B27, 0xFFAB0000, 0xFF9F0047, 0xFF77008F, 0xFF1300AB, 0xFF0000A7, 0xFF000B7F,
@@ -61,32 +63,19 @@ std::atomic<bool> is_paused{false};
 // CORE BUS IMPLEMENTATION
 // ============================================================================
 
-
-
 extern "C" {
     void cpu_push(uint8_t v) { cpu_ram[0x0100 | (reg_S--)] = v; }
     uint8_t cpu_pop() { return cpu_ram[0x0100 | (++reg_S)]; }
 
     uint8_t bus_read(uint16_t a) {
-        // RAM with Mirroring
         if (a < 0x2000) return cpu_ram[a & 0x07FF];
-        
-        // PPU Registers
         if (a < 0x4000) return ppu.cpu_read(0x2000 | (a & 0x0007), mapper);
-        
-        // Input Read
-        if (a == 0x4016) { 
-            if (controller_strobe) return (joypad_state & 0x01) | 0x40;
-            uint8_t r = (controller_latch & 0x01);
-            controller_latch >>= 1;
-            controller_latch |= 0x80; // Standard NES Open Bus behavior
-            return r | 0x40; 
-        }
-        
-        // Expansion / PRG RAM / ROM
+
+        // Input Read using Controller class logic
+        if (a == 0x4016) return joypad1.read_serial();
+
         if (a >= 0x4020) return mapper.read_prg(a);
-        
-        return 0; // Default open bus
+        return 0;
     }
 
     void bus_write(uint16_t a, uint8_t v) {
@@ -94,12 +83,12 @@ extern "C" {
             cpu_ram[a & 0x07FF] = v;
         } else if (a < 0x4000) {
             ppu.cpu_write(0x2000 | (a & 0x0007), v, mapper);
-        } else if (a == 0x4014) { // OAM DMA
-            ppu.do_dma(&cpu_ram[(v & 0x07) << 8]); // Safety mask
+        } else if (a == 0x4014) { 
+            // OAM DMA: High byte of address is 'v', source is v*0x100
+            ppu.do_dma(&cpu_ram[v << 8]); 
             cycles_to_run -= 513; 
-        } else if (a == 0x4016) { // Joypad Strobe
-            controller_strobe = (v & 0x01);
-            if (!controller_strobe) controller_latch = joypad_state;
+        } else if (a == 0x4016) { 
+            joypad1.write_latch(v);
         } else if (a >= 0x6000) {
             mapper.write(a, v);
         }
@@ -108,7 +97,7 @@ extern "C" {
     void nmi_handler() {
         cpu_push(reg_PC >> 8); 
         cpu_push(reg_PC & 0xFF); 
-        cpu_push(reg_P | 0x20); // Push status with reserved bit set
+        cpu_push(reg_P | 0x20); 
         reg_P |= FLAG_I;
         reg_PC = cpu_read_pointer(0xFFFA);
         cycles_to_run -= 7;
@@ -129,10 +118,10 @@ extern "C" {
 
 void engine_loop() {
     std::lock_guard<std::mutex> lock(engine_mutex);
-    
-    // Safety: Wait for ROM to be loaded
-    if (mapper.prg_rom[3][0] == 0) {
-        LOGE("Engine Error: PRG ROM not loaded before engine start.");
+
+    // Initial check for PRG data
+    if (mapper.prg_rom[0][0] == 0 && mapper.prg_rom[3][0] == 0) {
+        LOGE("Engine Error: PRG ROM not loaded.");
         is_running = false;
         return;
     }
@@ -141,7 +130,7 @@ void engine_loop() {
     mapper.reset();
 
     reg_PC = cpu_read_pointer(0xFFFC); 
-    LOGI("Engine: Reset vector pointing to $%04X", reg_PC);
+    LOGI("Engine: Starting at $%04X", reg_PC);
 
     while (is_running) {
         if (is_paused) { 
@@ -151,25 +140,20 @@ void engine_loop() {
 
         auto frame_start = std::chrono::steady_clock::now();
 
-        // 1. VBlank Logic
-        ppu.status |= 0x80; 
+        ppu.status |= 0x80; // Enter VBlank
         if (ppu.ctrl & 0x80) nmi_pending = true;
 
-        // 2. CPU Cycle Budget
         cycles_to_run += 29780; 
         while (cycles_to_run > 0 && is_running) {
             execute_instruction();
         }
 
-        // 3. Render and Synchronization
         {
             std::lock_guard<std::mutex> lock(buffer_mutex);
             ppu.render_frame(mapper, nes_palette);
         }
 
-        ppu.status &= ~0x80; // Clear VBlank
-
-        // Limit to ~60 FPS
+        ppu.status &= ~0x80; // Exit VBlank
         std::this_thread::sleep_until(frame_start + std::chrono::microseconds(16666));
     }
 }
@@ -189,25 +173,27 @@ Java_com_canc_dwa_MainActivity_nativeExtractRom(JNIEnv* env, jobject thiz, jstri
 
     uint8_t header[16]; 
     file.read((char*)header, 16);
-    if (memcmp(header, "NES\x1A", 4) != 0) return env->NewStringUTF("Error: Invalid Header");
+    if (memcmp(header, "NES\x1A", 4) != 0) {
+        env->ReleaseStringUTFChars(romPath, path);
+        return env->NewStringUTF("Error: Invalid iNES Header");
+    }
 
     uint8_t prg_banks = header[4];
     uint8_t chr_banks = header[5];
 
-    // Load PRG (Typically 64KB for MMC1 Dragon Warrior)
-    for (int i = 0; i < prg_banks && i < 8; i++) {
+    for (int i = 0; i < prg_banks && i < 4; i++) {
         file.read((char*)mapper.prg_rom[i], 16384);
     }
 
-    // Load CHR (Typically 8KB or 16KB)
     if (chr_banks > 0) {
-        file.read((char*)mapper.chr_rom[0], 8192);
-        if (chr_banks > 1) file.read((char*)mapper.chr_rom[1], 8192);
+        // CHR-ROM is loaded into the first 8KB of our banked CHR-RAM
+        file.read((char*)mapper.chr_rom[0], 4096);
+        file.read((char*)mapper.chr_rom[1], 4096);
     }
 
     file.close();
     env->ReleaseStringUTFChars(romPath, path);
-    LOGI("ROM Loaded Successfully: %d PRG, %d CHR", prg_banks, chr_banks);
+    LOGI("ROM Loaded: %d PRG, %d CHR banks", prg_banks, chr_banks);
     return env->NewStringUTF("Success");
 }
 
@@ -224,17 +210,22 @@ Java_com_canc_dwa_MainActivity_nativeUpdateSurface(JNIEnv* env, jobject thiz, jo
     AndroidBitmapInfo info; void* pixels;
     if (AndroidBitmap_getInfo(env, bitmap, &info) < 0) return;
     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) < 0) return;
-    
+
     {
         std::lock_guard<std::mutex> lock(buffer_mutex);
         memcpy(pixels, ppu.screen_buffer, 256 * 240 * 4);
     }
-    
+
     AndroidBitmap_unlockPixels(env, bitmap);
 }
 
+// Fixed Input Injection
 extern "C" JNIEXPORT void JNICALL
 Java_com_canc_dwa_MainActivity_injectInput(JNIEnv* e, jobject t, jint b, jboolean p) {
-    if (p) joypad_state |= (uint8_t)b; 
-    else joypad_state &= ~((uint8_t)b);
+    static uint8_t current_mask = 0;
+    if (p) current_mask |= (uint8_t)b; 
+    else current_mask &= ~((uint8_t)b);
+    
+    // Pass the combined mask to the atomic Controller object
+    joypad1.update_state(current_mask);
 }
