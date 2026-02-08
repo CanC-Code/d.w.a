@@ -10,7 +10,7 @@
 #define FLAG_C 0x01  // Carry
 #define FLAG_Z 0x02  // Zero
 #define FLAG_I 0x04  // Interrupt Disable
-#define FLAG_D 0x08  // Decimal (Disabled on NES)
+#define FLAG_D 0x08  // Decimal (Disabled on NES hardware)
 #define FLAG_B 0x10  // Break
 #define FLAG_U 0x20  // Unused
 #define FLAG_V 0x40  // Overflow
@@ -51,8 +51,7 @@ extern int64_t total_cycles;
 extern int32_t cycles_to_run; 
 
 /**
- * CRITICAL: Called by recompiled code to account for page-cross cycles
- * and branch-taken penalties.
+ * Account for instruction timing.
  */
 static inline void add_cycles(int n) {
     total_cycles += n;
@@ -63,9 +62,9 @@ static inline void add_cycles(int n) {
 extern uint8_t bus_read(uint16_t addr);
 extern void bus_write(uint16_t addr, uint8_t val);
 
-// --- STACK ---
-extern void push_stack(uint8_t val);
-extern uint8_t pop_stack();
+// --- STACK (Renamed to match recompiler expectations) ---
+extern void cpu_push(uint8_t val);
+extern uint8_t cpu_pop();
 
 // --- FLAG MANAGEMENT ---
 extern void update_nz(uint8_t val);
@@ -80,9 +79,14 @@ extern uint8_t cpu_lsr(uint8_t val);
 extern uint8_t cpu_rol(uint8_t val);
 extern uint8_t cpu_ror(uint8_t val);
 
+// --- ADDRESSING HELPERS (New for cycle accuracy) ---
+// These allow the recompiled code to track page-cross penalties
+extern uint16_t addr_abs_x(uint16_t base, bool* page_crossed);
+extern uint16_t addr_abs_y(uint16_t base, bool* page_crossed);
+
 // --- POINTER HELPERS ---
-// Modified to return if a page cross occurred for cycle accuracy
-extern uint16_t read_pointer(uint16_t addr);
+extern uint16_t cpu_read_pointer(uint16_t addr);
+extern uint16_t cpu_read_jmp_indirect(uint16_t addr); // Simulates 6502 page-wrap bug
 extern uint16_t read_pointer_indexed_y(uint16_t zp_addr, bool* page_crossed);
 extern uint16_t read_pointer_indexed_x(uint16_t zp_addr);
 
@@ -90,6 +94,12 @@ extern uint16_t read_pointer_indexed_x(uint16_t zp_addr);
 extern void power_on_reset();
 extern void nmi_handler();
 extern void irq_handler();
+
+/**
+ * The main execution bridge. Recompiled banks will implement 
+ * execute_at(uint16_t pc) to process instructions until 
+ * cycles_to_run is exhausted or a return occurs.
+ */
 extern void execute_instruction();
 
 #ifdef __cplusplus
