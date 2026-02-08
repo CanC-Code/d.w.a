@@ -4,20 +4,29 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+#include <atomic>
+#define ATOMIC_BOOL std::atomic<bool>
+extern "C" {
+#else
+#include <stdatomic.h>
+#define ATOMIC_BOOL _Atomic bool
+#endif
+
 /**
  * 6502 Status Flags
  */
 #define FLAG_C 0x01  // Carry
 #define FLAG_Z 0x02  // Zero
 #define FLAG_I 0x04  // Interrupt Disable
-#define FLAG_D 0x08  // Decimal (Disabled on NES hardware)
+#define FLAG_D 0x08  // Decimal (Ignored on NES, but status bit exists)
 #define FLAG_B 0x10  // Break
-#define FLAG_U 0x20  // Unused
+#define FLAG_U 0x20  // Unused (Always pushed as 1)
 #define FLAG_V 0x40  // Overflow
 #define FLAG_N 0x80  // Negative
 
 /**
- * NES Memory Mapped I/O
+ * NES Memory Mapped I/O Constants
  */
 #define PPU_CTRL   0x2000
 #define PPU_MASK   0x2001
@@ -32,16 +41,13 @@
 #define JOYPAD1    0x4016
 #define JOYPAD2    0x4017
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 // --- CPU ARCHITECTURE STATE ---
 extern uint16_t reg_PC;
 extern uint8_t reg_A, reg_X, reg_Y, reg_P, reg_S;
 
 // --- EMULATION STATE & INTERRUPTS ---
-extern bool is_running;      
+// Fixes the "redefinition with different type" error in native-lib.cpp
+extern ATOMIC_BOOL is_running;      
 extern bool nmi_pending;     
 extern bool irq_pending;     
 extern uint8_t joypad_state; 
@@ -49,6 +55,8 @@ extern uint8_t joypad_state;
 // --- TIMING ---
 extern int64_t total_cycles;  
 extern int32_t cycles_to_run; 
+
+
 
 static inline void add_cycles(int n) {
     total_cycles += n;
@@ -76,12 +84,13 @@ extern void cpu_lsr_impl(uint16_t addr, bool is_reg);
 extern void cpu_rol_impl(uint16_t addr, bool is_reg);
 extern void cpu_ror_impl(uint16_t addr, bool is_reg);
 
-// --- COMPATIBILITY WRAPPERS (Fixes BankXX.cpp errors) ---
-// These allow 'reg_A = cpu_asl(reg_A);' to still work.
-static inline uint8_t cpu_asl(uint8_t val) { cpu_asl_impl(0, true); return reg_A; }
-static inline uint8_t cpu_lsr(uint8_t val) { cpu_lsr_impl(0, true); return reg_A; }
-static inline uint8_t cpu_rol(uint8_t val) { cpu_rol_impl(0, true); return reg_A; }
-static inline uint8_t cpu_ror(uint8_t val) { cpu_ror_impl(0, true); return reg_A; }
+// --- COMPATIBILITY WRAPPERS ---
+// These allow recompiled code like 'reg_A = cpu_asl(reg_A);' to function
+// while directing logic to the unified shift implementation.
+static inline uint8_t cpu_asl(uint8_t val) { reg_A = val; cpu_asl_impl(0, true); return reg_A; }
+static inline uint8_t cpu_lsr(uint8_t val) { reg_A = val; cpu_lsr_impl(0, true); return reg_A; }
+static inline uint8_t cpu_rol(uint8_t val) { reg_A = val; cpu_rol_impl(0, true); return reg_A; }
+static inline uint8_t cpu_ror(uint8_t val) { reg_A = val; cpu_ror_impl(0, true); return reg_A; }
 
 // --- ADDRESSING HELPERS ---
 extern uint16_t addr_abs_x(uint16_t base, bool* page_crossed);
