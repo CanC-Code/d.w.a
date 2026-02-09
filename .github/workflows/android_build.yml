@@ -30,10 +30,6 @@ jobs:
           sudo apt-get install -y imagemagick
           sudo ln -s /usr/bin/convert /usr/bin/magick
 
-      - name: Execute Static Recompilation
-        run: |
-          mkdir -p app/src/main/cpp/recompiled
-          python3 runtime/asm_to_c.py
 
       # --- NEW STEP: Archive the generated C++ files for review ---
       - name: Upload Recompiled Source for Review
