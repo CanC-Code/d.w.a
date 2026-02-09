@@ -5,7 +5,7 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "DWA_PPU", __VA_ARGS__)
 
 // PPU Memory
-static uint8_t vram[0x800];        // 2KB nametable RAM (mirrored)
+static uint8_t vram[0x800];        // 2KB nametable RAM
 static uint8_t palette_ram[32];    // Palette RAM
 static uint8_t oam[256];           // Object Attribute Memory (sprites)
 
@@ -24,8 +24,9 @@ static uint8_t ppu_data_buffer = 0;// Read buffer
 static int scanline = 0;
 static int dot = 0;
 static uint64_t frame_count = 0;
+static bool prev_vblank_status = false;  // NEW: Track VBlank edge
 
-// External CHR-ROM access (provided by mapper)
+// External CHR-ROM access
 extern uint8_t mapper_read_chr(uint16_t addr);
 extern void mapper_write_chr(uint16_t addr, uint8_t value);
 
@@ -61,24 +62,32 @@ void ppu_reset() {
     scanline = 241;  // Start in VBlank
     dot = 0;
     frame_count = 0;
+    prev_vblank_status = true;
     LOGI("PPU reset");
 }
 
-// Read from VRAM (nametables, pattern tables, palette)
+// NEW: Check if PPU just entered VBlank (for NMI triggering)
+bool ppu_in_vblank() {
+    bool current_vblank = (ppu_status & 0x80) != 0;
+    bool just_entered = current_vblank && !prev_vblank_status;
+    prev_vblank_status = current_vblank;
+    
+    // Only trigger NMI if enabled in PPUCTRL
+    return just_entered && (ppu_ctrl & 0x80);
+}
+
+// Read from VRAM
 static uint8_t vram_read(uint16_t addr) {
-    addr &= 0x3FFF;  // Mirror $4000-$FFFF to $0000-$3FFF
+    addr &= 0x3FFF;
     
     if (addr < 0x2000) {
-        // Pattern tables (CHR-ROM/RAM)
         return mapper_read_chr(addr);
     } else if (addr < 0x3F00) {
-        // Nametables
-        uint16_t mirror_addr = addr & 0x7FF;  // Simple horizontal mirroring
+        uint16_t mirror_addr = addr & 0x7FF;
         return vram[mirror_addr];
     } else {
-        // Palette RAM
         addr &= 0x1F;
-        if (addr == 0x10) addr = 0x00;  // Mirrors
+        if (addr == 0x10) addr = 0x00;
         if (addr == 0x14) addr = 0x04;
         if (addr == 0x18) addr = 0x08;
         if (addr == 0x1C) addr = 0x0C;
@@ -115,6 +124,7 @@ uint8_t ppu_read_register(uint16_t addr) {
             uint8_t result = ppu_status;
             ppu_status &= 0x7F;  // Clear VBlank flag
             write_toggle = false;
+            prev_vblank_status = false;  // Reset edge detection
             return result;
         }
         case 0x2004:  // OAMDATA
@@ -130,7 +140,6 @@ uint8_t ppu_read_register(uint16_t addr) {
                 result = ppu_data_buffer;
             }
             
-            // Increment VRAM address
             vram_addr += (ppu_ctrl & 0x04) ? 32 : 1;
             vram_addr &= 0x3FFF;
             return result;
@@ -196,12 +205,10 @@ void ppu_write_register(uint16_t addr, uint8_t value) {
 void ppu_step() {
     dot++;
     
-    // End of scanline
     if (dot >= 341) {
         dot = 0;
         scanline++;
         
-        // End of frame
         if (scanline >= 262) {
             scanline = 0;
             frame_count++;
@@ -209,25 +216,20 @@ void ppu_step() {
         
         // VBlank start (scanline 241)
         if (scanline == 241) {
-            ppu_status |= 0x80;  // Set VBlank flag
-            
-            // Trigger NMI if enabled
-            if (ppu_ctrl & 0x80) {
-                // NMI would be triggered here (handled by CPU)
-            }
+            ppu_status |= 0x80;
         }
         
         // Pre-render scanline (261)
         if (scanline == 261) {
-            ppu_status &= 0x7F;  // Clear VBlank flag
+            ppu_status &= 0x7F;  // Clear VBlank
             ppu_status &= 0x5F;  // Clear sprite 0 hit and overflow
         }
     }
 }
 
-// Render a complete frame to the pixel buffer
+// Render a complete frame
 void ppu_render_frame(uint32_t* pixels) {
-    // Clear screen to backdrop color
+    // Clear to backdrop color
     uint32_t backdrop = nes_palette[palette_ram[0] & 0x3F];
     for (int i = 0; i < 256 * 240; i++) {
         pixels[i] = backdrop;
@@ -240,19 +242,15 @@ void ppu_render_frame(uint32_t* pixels) {
         
         for (int ty = 0; ty < 30; ty++) {
             for (int tx = 0; tx < 32; tx++) {
-                // Get tile index from nametable
                 uint16_t tile_addr = nametable_base | (ty << 5) | tx;
                 uint8_t tile_index = vram_read(tile_addr);
                 
-                // Get attribute byte (2x2 tile groups)
                 uint16_t attr_addr = nametable_base | 0x3C0 | ((ty >> 2) << 3) | (tx >> 2);
                 uint8_t attr_byte = vram_read(attr_addr);
                 
-                // Extract palette for this tile
                 int shift = ((ty & 2) << 1) | (tx & 2);
                 uint8_t palette_num = (attr_byte >> shift) & 0x03;
                 
-                // Render 8x8 tile
                 for (int py = 0; py < 8; py++) {
                     uint16_t tile_row = pattern_base | (tile_index << 4) | py;
                     uint8_t low_byte = vram_read(tile_row);
@@ -288,9 +286,9 @@ void ppu_render_frame(uint32_t* pixels) {
             uint8_t sprite_attr = oam[i * 4 + 2];
             uint8_t sprite_x = oam[i * 4 + 3];
             
-            if (sprite_y >= 0xEF) continue;  // Off-screen
+            if (sprite_y >= 0xEF) continue;
             
-            uint8_t palette_num = (sprite_attr & 0x03) + 4;  // Sprite palettes are 4-7
+            uint8_t palette_num = (sprite_attr & 0x03) + 4;
             bool flip_h = sprite_attr & 0x40;
             bool flip_v = sprite_attr & 0x80;
             
